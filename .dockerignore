@@ -1,0 +1,99 @@
+# .dockerignore file
+# Files and directories to exclude from Docker build context
+# This reduces build context size and speeds up builds
+
+# Version control
+.git
+.gitignore
+.github
+
+# Development
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build outputs
+target/
+*.build/
+dist/
+build/
+
+# Documentation
+*.md
+docs/
+
+# Test outputs
+test-results/
+coverage/
+*.log
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Node modules (if any)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python cache (if any)
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Docker
+docker-compose.override.yml
+Dockerfile.dev
+.dockerignore
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Archives
+*.tar
+*.tar.gz
+*.zip
+*.rar
+
+# Certificates (except for included examples)
+.certs/local/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Cache
+.cache/
+.gradle/
+.npm/
+.yarn/

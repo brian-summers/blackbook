@@ -1,0 +1,190 @@
+services:
+  # PostgreSQL Database Service - runs as unprivileged user internally
+  postgres:
+    # Pinned to 16 — postgres:alpine moved to 18+ which expects the volume at
+    # /var/lib/postgresql, not /var/lib/postgresql/data, and refuses to start
+    # against the old layout.
+    image: postgres:16-alpine
+    container_name: blackbook-postgres
+
+    # The official postgres image manages the postgres user itself (it starts
+    # as root to fix volume ownership then drops to UID 70). Forcing a custom
+    # UID via `user:` breaks data-dir permissions on a fresh volume.
+    
+    environment:
+      # Dynamic admin password - MUST be changed in production
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD:-default_password_changeme}
+      POSTGRES_USER: ${DB_ADMIN_USER:-blackbook_admin}
+      POSTGRES_DB: ${DB_NAME:-blackbook}
+    
+    
+    volumes:
+      # Database data persistence
+      - blackbook_db_data:/var/lib/postgresql/data
+      # PostgreSQL configuration for secure defaults
+      - ./config/postgres.conf:/etc/postgresql/postgresql.conf:ro
+      # Init script disabled — it uses psql :'var' substitutions that
+      # docker-entrypoint-initdb.d does not pass through, and it references
+      # roles/passwords the entrypoint does not set. Re-enable once the
+      # script is rewritten as a .sh wrapper that calls psql -v.
+      # - ./scripts/01-init-postgres.sql:/docker-entrypoint-initdb.d/01-init-postgres.sql:ro
+    
+    # Network configuration - only accessible from within Docker network
+    networks:
+      - blackbook_network
+    
+    # Resource limits for security and stability
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '1'
+          memory: 256M
+    
+    # Health check
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_ADMIN_USER:-blackbook_admin} -d ${DB_NAME:-blackbook}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Blackbook Application Service
+  blackbook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Build arguments for caching optimization
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+    
+    container_name: blackbook-app
+    
+    # Run as unprivileged user (defined in Dockerfile)
+    user: "1000:1000"
+    
+    # Do not run as privileged
+    privileged: false
+    
+    # Drop unnecessary Linux capabilities for security
+    cap_drop:
+      - ALL
+    # Only keep capabilities needed for network operations
+    cap_add:
+      - NET_BIND_SERVICE
+    
+    # Run the API server. HTTPS + mTLS are mandatory — the server auto-mints
+    # its own CA and server cert into the persistent volume on first boot.
+    command:
+      - server
+      - --bind
+      - 0.0.0.0:8443
+
+    environment:
+      DATABASE_URL: postgresql://${DB_ADMIN_USER:-blackbook_admin}:${DB_ADMIN_PASSWORD:-default_password_changeme}@postgres:5432/${DB_NAME:-blackbook}
+
+      RUST_LOG: ${RUST_LOG:-info}
+      RUST_BACKTRACE: 1
+
+      # Persistence dir — master key, CA, server cert, admin bundle live here.
+      BLACKBOOK_DATA_DIR: /opt/blackbook/data
+
+      # Comma-separated SAN list for the server cert. Add public hostnames
+      # before first boot if clients will connect by something other than
+      # localhost / 127.0.0.1 / blackbook / blackbook-app.
+      BLACKBOOK_SERVER_SANS: ${BLACKBOOK_SERVER_SANS:-localhost,127.0.0.1,blackbook,blackbook-app}
+
+      # Optional: seal the DEK with a passphrase (>=16 chars). When unset,
+      # the DEK is auto-generated and kept raw on the data volume.
+      # BLACKBOOK_MASTER_PASSPHRASE: "set-me-in-production-at-least-16-chars"
+    
+    ports:
+      # HTTPS API endpoint - available locally
+      - "127.0.0.1:8443:8443"
+    
+    volumes:
+      # Master key, DEK, CA + server cert, admin bundle.
+      - blackbook_data:/opt/blackbook/data
+      # Configuration files
+      - ./config/blackbook.env:/opt/blackbook/config/.env:ro
+    
+    # Network configuration - connected to blackbook network
+    networks:
+      - blackbook_network
+    
+    # Depends on PostgreSQL being ready
+    depends_on:
+      postgres:
+        condition: service_healthy
+    
+    # Resource limits for security and stability
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '1'
+          memory: 256M
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "/opt/blackbook/bin/blackbook", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Read-only filesystem for security (except necessary volumes)
+    read_only: true
+    
+    # Temporary filesystem for runtime
+    tmpfs:
+      - /tmp
+      - /run
+    
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Define custom network - internal only, no bridge to host
+networks:
+  blackbook_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.25.0.0/16
+    # Security: restrict external access
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"  # Inter-container communication enabled
+      com.docker.network.bridge.enable_ip_masquerade: "true"
+
+# Define volumes for data persistence.
+volumes:
+  blackbook_db_data:
+    driver: local
+    labels:
+      description: "PostgreSQL database data for Blackbook"
+      backup: "true"
+  blackbook_data:
+    driver: local
+    labels:
+      description: "Master key, DEK, CA, server cert, and admin bundle for Blackbook"
+      security: "critical"
+      backup: "true"
