@@ -1,0 +1,1144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blackbook · console</title>
+<style>
+  /* ---- theme -------------------------------------------------------------- */
+  :root{
+    --bg:#0d1117; --bg2:#0a0e14; --panel:#11161f; --panel2:#161c28;
+    --ink:#e6edf3; --dim:#8b98a9; --faint:#5b6675;
+    --line:#222c3a;
+    --blue:#6c8ebf; --green:#7bc47f; --purple:#b08cd6; --amber:#e0b252;
+    --red:#e06c75; --teal:#46b9a8; --cyan:#56b6c2;
+    --glow:0 0 0 1px #1d3a5f, 0 0 24px -6px #2b69b0;
+    --mono:"JetBrains Mono","SFMono-Regular",ui-monospace,"Cascadia Code",Consolas,monospace;
+    --sans:"Inter",system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;font-family:var(--sans);color:var(--ink);
+    background:
+      radial-gradient(1100px 600px at 78% -8%, #16243a 0%, transparent 55%),
+      radial-gradient(900px 500px at -6% 110%, #1a1430 0%, transparent 55%),
+      var(--bg);
+    display:flex;flex-direction:column;height:100vh;overflow:hidden;
+  }
+  /* ---- top bar ------------------------------------------------------------ */
+  header{
+    display:flex;align-items:center;gap:14px;padding:13px 20px;
+    border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,rgba(22,28,40,.9),rgba(13,17,23,.6));
+    backdrop-filter:blur(6px);
+  }
+  .brand{display:flex;align-items:center;gap:11px;font-weight:700;letter-spacing:.2px}
+  .brand .mark{
+    font-size:22px;filter:drop-shadow(0 0 10px #2b69b0aa);
+    animation:float 5s ease-in-out infinite;
+  }
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+  .brand b{font-size:16px}
+  .brand .sub{color:var(--faint);font-weight:500;font-size:12px;font-family:var(--mono)}
+  .spacer{flex:1}
+
+  /* view toggle */
+  .vtog{display:flex;gap:3px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:3px}
+  .vtog button{
+    cursor:pointer;border:0;background:transparent;color:var(--dim);font-family:var(--mono);
+    font-size:12.5px;font-weight:600;padding:6px 14px;border-radius:7px;transition:.18s;
+    display:flex;align-items:center;gap:6px;
+  }
+  .vtog button:hover{color:var(--ink)}
+  .vtog button.on{background:var(--panel2);color:var(--ink);box-shadow:inset 0 0 0 1px var(--line)}
+
+  /* compact context selectors in the header */
+  .ctx{display:flex;align-items:center;gap:8px}
+  .ctx select{
+    background:var(--panel);border:1px solid var(--line);border-radius:9px;color:var(--ink);
+    font-family:var(--mono);font-size:12px;padding:6px 10px;outline:0;cursor:pointer;max-width:170px;
+  }
+  .ctx select:focus{border-color:#2b69b0;box-shadow:var(--glow)}
+  .ctx .ck{font-family:var(--mono);font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.6px}
+
+  .pill{
+    display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;
+    padding:6px 12px;border-radius:999px;border:1px solid var(--line);
+    background:var(--panel);color:var(--dim);transition:.25s;
+  }
+  .pill .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);transition:.3s}
+  .pill.on{color:var(--green);border-color:#244b34}
+  .pill.on .dot{background:var(--green);box-shadow:0 0 10px var(--green);animation:pulse 2s infinite}
+  .pill.off{color:var(--red);border-color:#46262a}
+  .pill.off .dot{background:var(--red)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  .lockbtn{
+    cursor:pointer;font-family:var(--mono);font-size:12px;color:var(--dim);
+    padding:6px 12px;border-radius:999px;border:1px solid var(--line);background:var(--panel);
+    transition:.2s;white-space:nowrap;
+  }
+  .lockbtn:hover{color:var(--amber);border-color:#4a3c1f;background:var(--panel2)}
+
+  /* ---- layout ------------------------------------------------------------- */
+  main{flex:1;display:flex;min-height:0}
+  .view{flex:1;display:none;min-width:0;min-height:0}
+  .view.on{display:flex}
+
+  /* ====================  DASHBOARD VIEW  ==================== */
+  #dash{flex-direction:column;overflow:hidden}
+  .dashbar{
+    display:flex;align-items:center;gap:12px;padding:14px 22px 12px;border-bottom:1px solid var(--line);
+  }
+  .tabs{display:flex;gap:4px}
+  .tabs button{
+    cursor:pointer;border:1px solid transparent;background:transparent;color:var(--dim);
+    font-family:var(--mono);font-size:13px;font-weight:600;padding:7px 15px;border-radius:9px;
+    transition:.16s;display:flex;align-items:center;gap:7px;
+  }
+  .tabs button:hover{color:var(--ink);background:var(--panel)}
+  .tabs button.on{color:var(--ink);background:var(--panel2);border-color:var(--line)}
+  .tabs button .cnt{
+    font-size:11px;background:var(--panel);border:1px solid var(--line);border-radius:999px;
+    padding:0 7px;color:var(--dim);min-width:20px;text-align:center;
+  }
+  .tabs button.on .cnt{color:var(--blue);border-color:#2b4a6f}
+  .search{
+    flex:1;display:flex;align-items:center;gap:9px;background:var(--panel);border:1px solid var(--line);
+    border-radius:10px;padding:8px 13px;max-width:340px;transition:.18s;
+  }
+  .search:focus-within{border-color:#2b69b0;box-shadow:var(--glow)}
+  .search input{flex:1;background:transparent;border:0;outline:0;color:var(--ink);font-family:var(--mono);font-size:13px}
+  .search input::placeholder{color:var(--faint)}
+  .iconbtn{
+    cursor:pointer;background:var(--panel);border:1px solid var(--line);border-radius:9px;color:var(--dim);
+    font-family:var(--mono);font-size:13px;padding:8px 13px;transition:.16s;display:flex;align-items:center;gap:7px;white-space:nowrap;
+  }
+  .iconbtn:hover{color:var(--ink);border-color:#2b69b0;background:var(--panel2)}
+  .iconbtn.accent{color:#08121f;background:linear-gradient(135deg,#6c8ebf,#46b9a8);border:0;font-weight:700}
+  .iconbtn.accent:hover{filter:brightness(1.1)}
+
+  .listwrap{flex:1;overflow-y:auto;padding:16px 22px 28px}
+  .pane{display:none}
+  .pane.on{display:block}
+
+  /* a secret/file row card */
+  .item{
+    border:1px solid var(--line);border-radius:13px;margin-bottom:10px;background:linear-gradient(180deg,var(--panel),var(--bg2));
+    overflow:hidden;transition:border-color .16s,box-shadow .16s;
+  }
+  .item:hover{border-color:#2c3b50}
+  .item.open{border-color:#2b4a6f;box-shadow:0 8px 30px -16px #2b69b0}
+  .ihead{
+    display:flex;align-items:center;gap:14px;padding:14px 16px;cursor:pointer;user-select:none;
+  }
+  .ihead .caret{color:var(--faint);transition:transform .18s;font-size:12px;width:12px;flex:none}
+  .item.open .ihead .caret{transform:rotate(90deg);color:var(--blue)}
+  .ihead .ic{
+    display:grid;place-items:center;width:34px;height:34px;border-radius:9px;flex:none;font-size:16px;
+    background:var(--panel2);border:1px solid var(--line);
+  }
+  .iname{font-family:var(--mono);font-size:14px;color:var(--ink);font-weight:600;word-break:break-all}
+  .imeta{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px}
+  .badge{
+    font-family:var(--mono);font-size:10.5px;padding:2px 8px;border-radius:999px;
+    border:1px solid var(--line);color:var(--dim);background:var(--panel);letter-spacing:.3px;
+  }
+  .badge.k-server{color:var(--blue);border-color:#2b4a6f}
+  .badge.k-external{color:var(--purple);border-color:#43356b}
+  .badge.k-resident{color:var(--teal);border-color:#1f5249}
+  .badge.s-active{color:var(--green);border-color:#244b34}
+  .badge.s-exhausted{color:var(--red);border-color:#46262a}
+  .badge.rule{color:var(--amber);border-color:#4a3c1f}
+  .badge.mfa{color:var(--cyan);border-color:#1f4a52}
+  .badge.quorum{color:var(--purple);border-color:#43356b}
+  .igrow{flex:1;min-width:0}
+  .iupd{font-family:var(--mono);font-size:11px;color:var(--faint);white-space:nowrap}
+
+  .ibody{
+    border-top:1px solid var(--line);padding:0 16px;max-height:0;overflow:hidden;
+    transition:max-height .22s ease,padding .22s ease;
+  }
+  .item.open .ibody{max-height:520px;padding:16px;overflow:visible}
+  .kv{display:grid;grid-template-columns:120px 1fr;gap:6px 14px;font-size:12.5px}
+  .kv dt{color:var(--faint);font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  .kv dd{margin:0;color:var(--dim);font-family:var(--mono);word-break:break-all}
+  .reveal{margin-top:15px}
+  .secretbox{
+    display:flex;align-items:stretch;gap:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;
+    background:var(--bg2);margin-top:7px;
+  }
+  .secretbox .val{
+    flex:1;padding:11px 13px;font-family:var(--mono);font-size:13px;color:var(--green);
+    white-space:pre-wrap;word-break:break-all;min-height:20px;
+  }
+  .secretbox .val.hidden{color:var(--faint);letter-spacing:2px}
+  .secretbox .copy{
+    cursor:pointer;border:0;border-left:1px solid var(--line);background:var(--panel);color:var(--dim);
+    font-family:var(--mono);font-size:12px;padding:0 14px;transition:.15s;
+  }
+  .secretbox .copy:hover{background:var(--panel2);color:var(--ink)}
+  .actrow{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
+  .actrow button{
+    cursor:pointer;font-family:var(--mono);font-size:12px;padding:8px 14px;border-radius:9px;transition:.16s;
+    border:1px solid var(--line);background:var(--panel);color:var(--dim);display:flex;align-items:center;gap:6px;
+  }
+  .actrow button:hover{color:var(--ink);border-color:#2b69b0;background:var(--panel2)}
+  .actrow button.reveal-btn{color:#08121f;background:linear-gradient(135deg,#7bc47f,#46b9a8);border:0;font-weight:700}
+  .actrow button.reveal-btn:hover{filter:brightness(1.1)}
+  .actrow button.danger:hover{color:var(--red);border-color:#46262a}
+  .revealerr{margin-top:10px;color:var(--red);font-family:var(--mono);font-size:12px;white-space:pre-wrap}
+
+  .empty{
+    text-align:center;padding:70px 20px;color:var(--faint);font-family:var(--mono);font-size:13px;
+  }
+  .empty .big{font-size:38px;margin-bottom:14px;opacity:.5}
+  .loading{text-align:center;padding:50px;color:var(--amber);font-family:var(--mono);font-size:13px}
+  .loading .spin{animation:blink 1s steps(1) infinite}
+
+  /* ====================  TERMINAL VIEW  ==================== */
+  #term{min-width:0}
+  .console{flex:1;display:flex;flex-direction:column;min-width:0}
+  #out{
+    flex:1;overflow-y:auto;padding:20px 24px;font-family:var(--mono);font-size:13.5px;
+    line-height:1.62;scroll-behavior:smooth;
+  }
+  .row{margin:2px 0;white-space:pre-wrap;word-break:break-word;animation:in .18s ease}
+  @keyframes in{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+  .cmd{color:var(--ink)}
+  .cmd .ps{color:var(--purple);user-select:none}
+  .ok{color:var(--green)}
+  .err{color:var(--red)}
+  .muted{color:var(--faint)}
+  .info{color:var(--cyan)}
+  .banner{color:var(--blue)}
+  .tag{color:var(--amber)}
+  .sep{color:var(--faint);opacity:.5}
+  .promptbar{
+    border-top:1px solid var(--line);padding:12px 18px;
+    background:linear-gradient(180deg,transparent,rgba(10,14,20,.6));
+  }
+  .pwrap{
+    display:flex;align-items:center;gap:10px;background:var(--panel);
+    border:1px solid var(--line);border-radius:12px;padding:11px 14px;transition:.2s;
+  }
+  .pwrap:focus-within{border-color:#2b69b0;box-shadow:var(--glow)}
+  .pwrap .ps{color:var(--purple);font-family:var(--mono);font-weight:700;user-select:none}
+  #cmd{
+    flex:1;background:transparent;border:0;outline:0;color:var(--ink);
+    font-family:var(--mono);font-size:14px;caret-color:var(--blue);
+  }
+  #cmd::placeholder{color:var(--faint)}
+  .run{
+    cursor:pointer;border:0;border-radius:9px;padding:8px 16px;font-family:var(--mono);
+    font-size:13px;font-weight:700;color:#08121f;
+    background:linear-gradient(135deg,#6c8ebf,#46b9a8);transition:.18s;
+  }
+  .run:hover{filter:brightness(1.12);box-shadow:0 4px 18px -6px #46b9a8aa}
+  .run:active{transform:translateY(1px)}
+  .hints{display:flex;gap:10px;margin:7px 4px 0;font-size:11px;color:var(--faint);font-family:var(--mono);flex-wrap:wrap}
+  .hints kbd{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 6px;color:var(--dim)}
+  .compl{display:flex;flex-wrap:wrap;gap:6px;margin:8px 4px 0;min-height:0}
+  .compl span{
+    font-family:var(--mono);font-size:12px;color:var(--blue);background:var(--panel);
+    border:1px solid var(--line);border-radius:7px;padding:3px 9px;cursor:pointer;transition:.15s;
+  }
+  .compl span:hover{color:var(--ink);border-color:#2b69b0;background:var(--panel2)}
+  .compl span.sel{color:#08121f;background:var(--blue);border-color:var(--blue)}
+  .spin{display:inline-block;color:var(--amber);animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:.25}}
+
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:#1d2532;border-radius:8px;border:2px solid var(--bg)}
+  ::-webkit-scrollbar-thumb:hover{background:#27313f}
+
+  /* ---- command palette (⌘K) ---------------------------------------------- */
+  .palbtn{
+    cursor:pointer;font-family:var(--mono);font-size:11px;color:var(--dim);
+    border:1px solid var(--line);background:var(--panel);border-radius:7px;padding:2px 8px;
+    display:inline-flex;align-items:center;gap:6px;transition:.15s;
+  }
+  .palbtn:hover{color:var(--ink);border-color:#2b69b0;background:var(--panel2)}
+  .palbtn kbd{background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:0 5px;color:var(--blue);font-size:10px}
+  .palette{
+    width:640px;max-width:92vw;background:var(--panel2);border:1px solid #2b4a6f;border-radius:14px;
+    box-shadow:0 30px 80px -24px #000, var(--glow);overflow:hidden;display:flex;flex-direction:column;
+    max-height:70vh;animation:in .16s ease;
+  }
+  .pal-search{display:flex;align-items:center;gap:11px;padding:14px 16px;border-bottom:1px solid var(--line)}
+  .pal-search .mg{color:var(--blue);font-size:15px}
+  .pal-search input{flex:1;background:transparent;border:0;outline:0;color:var(--ink);font-family:var(--mono);font-size:15px}
+  .pal-search input::placeholder{color:var(--faint)}
+  .pal-search kbd{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:2px 7px;color:var(--faint);font-family:var(--mono);font-size:11px}
+  .pal-list{flex:1;overflow-y:auto;padding:7px}
+  .pal-item{
+    display:flex;align-items:baseline;gap:12px;padding:9px 12px;border-radius:9px;cursor:pointer;
+    border:1px solid transparent;transition:background .1s;
+  }
+  .pal-item:hover{background:var(--panel)}
+  .pal-item.sel{background:var(--panel);border-color:#2b4a6f;box-shadow:inset 2px 0 0 var(--blue)}
+  .pal-item .pal-path{font-family:var(--mono);font-size:13.5px;color:var(--ink);font-weight:600;white-space:nowrap}
+  .pal-item.sel .pal-path{color:var(--blue)}
+  .pal-item .pal-about{font-size:12px;color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pal-item .pal-grp{
+    font-family:var(--mono);font-size:10px;color:var(--purple);border:1px solid #43356b;
+    border-radius:999px;padding:1px 7px;flex:none;
+  }
+  .pal-empty{padding:26px;text-align:center;color:var(--faint);font-family:var(--mono);font-size:13px}
+  .pal-foot{
+    border-top:1px solid var(--line);padding:9px 16px;display:flex;align-items:center;gap:8px;
+    font-family:var(--mono);font-size:11px;color:var(--faint);
+  }
+  .pal-foot .live{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 9px var(--green);animation:pulse 2.4s infinite}
+  .pal-foot .keys{margin-left:auto;display:flex;gap:10px}
+  .pal-foot .keys kbd{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:0 5px;color:var(--dim)}
+
+  /* ---- modal (shared) ----------------------------------------------------- */
+  .modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;
+    background:rgba(5,8,12,.7);backdrop-filter:blur(3px);z-index:20}
+  .modal.top{align-items:flex-start;padding-top:11vh}
+  .modal.show{display:flex;animation:in .2s ease}
+  .card{background:var(--panel2);border:1px solid var(--line);border-radius:16px;padding:24px;width:380px;
+    box-shadow:0 24px 60px -20px #000;max-height:88vh;overflow-y:auto}
+  .card.wide{width:440px}
+  .card h2{margin:0 0 4px;font-size:16px}
+  .card p{margin:0 0 16px;color:var(--dim);font-size:12.5px;line-height:1.5}
+  .card p code,.card label code{font-family:var(--mono);font-size:11.5px;color:var(--blue);background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:0 4px}
+  .card .grid2{display:flex;gap:12px}
+  .card .grid2 > div{flex:1}
+  .card select{cursor:pointer}
+  .card input:disabled,.card .flagrow label:has(input:disabled){opacity:.4;cursor:not-allowed}
+  .card label{display:block;font-size:11px;color:var(--faint);font-family:var(--mono);margin:12px 0 5px;text-transform:uppercase;letter-spacing:.6px}
+  .card input,.card textarea,.card select{width:100%;background:var(--panel);border:1px solid var(--line);border-radius:9px;
+    padding:10px 12px;color:var(--ink);font-family:var(--mono);font-size:13px;outline:0}
+  .card textarea{resize:vertical;min-height:74px}
+  .card input:focus,.card textarea:focus,.card select:focus{border-color:#2b69b0;box-shadow:var(--glow)}
+  .card .flagrow{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}
+  .card .flagrow label{display:inline-flex;align-items:center;gap:6px;margin:0;text-transform:none;
+    letter-spacing:0;color:var(--dim);font-size:12px;cursor:pointer;border:1px solid var(--line);
+    border-radius:8px;padding:6px 10px;background:var(--panel)}
+  .card .flagrow input{width:auto}
+  .card .actions{display:flex;gap:8px;margin-top:18px}
+  .card button{flex:1;cursor:pointer;border:0;border-radius:9px;padding:10px;font-family:var(--mono);
+    font-size:13px;font-weight:700}
+  .card .save{background:linear-gradient(135deg,#6c8ebf,#46b9a8);color:#08121f}
+  .card .cancel{background:var(--panel);color:var(--dim);border:1px solid var(--line)}
+  .card .err{margin-top:10px;color:var(--red);font-family:var(--mono);font-size:12px;white-space:pre-wrap}
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="mark">🕮</span>
+      <b>Blackbook</b>
+      <span class="sub">console</span>
+    </div>
+
+    <div class="vtog" id="vtog">
+      <button data-view="dash" class="on">▦ Dashboard</button>
+      <button data-view="term">❯ Terminal</button>
+    </div>
+
+    <div class="spacer"></div>
+
+    <div class="ctx">
+      <span class="ck">profile</span>
+      <select id="selProfile" title="Active credential profile"></select>
+      <span class="ck">domain</span>
+      <select id="selDomain" title="Target domain"></select>
+    </div>
+
+    <div class="lockbtn" id="lockbtn" title="Set passphrases for this session">🔑 passphrases</div>
+    <div class="pill" id="status"><span class="dot"></span><span id="statustxt">checking…</span></div>
+  </header>
+
+  <main>
+    <!-- ================= DASHBOARD ================= -->
+    <section class="view on" id="dash">
+      <div class="dashbar">
+        <div class="tabs" id="tabs">
+          <button data-tab="secrets" class="on">🔑 Secrets <span class="cnt" id="cntSecrets">0</span></button>
+          <button data-tab="files">🗂️ Files <span class="cnt" id="cntFiles">0</span></button>
+        </div>
+        <div class="search">
+          <span style="color:var(--faint)">⌕</span>
+          <input id="filter" placeholder="filter by name…" autocomplete="off" spellcheck="false">
+        </div>
+        <button class="iconbtn accent" id="newSecret">＋ New secret</button>
+        <button class="iconbtn" id="refreshBtn" title="Reload">⟳ Refresh</button>
+      </div>
+
+      <div class="listwrap">
+        <div class="pane on" id="paneSecrets"></div>
+        <div class="pane" id="paneFiles"></div>
+      </div>
+    </section>
+
+    <!-- ================= TERMINAL ================= -->
+    <section class="view" id="term">
+      <section class="console">
+        <div id="out"></div>
+        <div class="promptbar">
+          <div class="pwrap">
+            <span class="ps">bbk&nbsp;❯</span>
+            <input id="cmd" autocomplete="off" spellcheck="false"
+                   placeholder="type a command — e.g. ls   ·   get my-secret   ·   --help">
+            <button class="run" id="runbtn">run ▸</button>
+          </div>
+          <div class="compl" id="compl"></div>
+          <div class="hints">
+            <span class="palbtn" id="palBtn">⌘ commands <kbd>⌘K</kbd></span>
+            <span><kbd>Enter</kbd> run</span>
+            <span><kbd>Tab</kbd> complete</span>
+            <span><kbd>↑</kbd><kbd>↓</kbd> history</span>
+            <span><kbd>clear</kbd> wipe screen</span>
+            <span class="muted">runs the local <b>blackbook</b> CLI — every command &amp; flag, always in sync</span>
+          </div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <!-- command palette (⌘K) -->
+  <div class="modal top" id="paletteModal">
+    <div class="palette">
+      <div class="pal-search">
+        <span class="mg">⌕</span>
+        <input id="palInput" placeholder="Search commands — e.g. put, file, grant, tunnel…" autocomplete="off" spellcheck="false">
+        <kbd>esc</kbd>
+      </div>
+      <div class="pal-list" id="palList"></div>
+      <div class="pal-foot">
+        <span class="live"></span> walked from the live CLI — always in sync
+        <span class="keys"><kbd>↑↓</kbd> move · <kbd>⏎</kbd> insert</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- passphrase modal -->
+  <div class="modal" id="modal">
+    <div class="card">
+      <h2>🔑 Session passphrases</h2>
+      <p>Held only in this tab and sent per-command via env vars — never stored, never on the command line.</p>
+      <label>Profile passphrase&nbsp;·&nbsp;$BLACKBOOK_PASSPHRASE</label>
+      <input type="password" id="pp_profile" placeholder="unlocks the encrypted profile">
+      <label>External passphrase&nbsp;·&nbsp;$BLACKBOOK_EXTERNAL_PASSPHRASE</label>
+      <input type="password" id="pp_external" placeholder="for passphrase-sealed external items">
+      <div class="actions">
+        <button class="cancel" id="ppcancel">cancel</button>
+        <button class="save" id="ppsave">save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- new-secret modal -->
+  <div class="modal" id="putModal">
+    <div class="card wide">
+      <h2>＋ New secret</h2>
+      <p>Stored in domain <b id="putDomain">default</b>. Read-only by default — every <code>put</code> option below.</p>
+      <label>Name</label>
+      <input id="put_name" placeholder="api-key" autocomplete="off" spellcheck="false">
+      <label>Value</label>
+      <textarea id="put_value" placeholder="sk_live_…" spellcheck="false"></textarea>
+
+      <label>Encryption</label>
+      <select id="put_enc">
+        <option value="server">Server-side — blackbook holds the encrypted value (default)</option>
+        <option value="managed">Client-side · managed key — server can't read it, no passphrase</option>
+        <option value="passphrase">Client-side · passphrase — portable, Argon2id user key</option>
+      </select>
+      <div id="put_pp_wrap" style="display:none">
+        <label>External passphrase</label>
+        <input type="password" id="put_pp" placeholder="sealed with Argon2id — sent via env, never on the command line">
+      </div>
+
+      <label>Policy flags</label>
+      <div class="flagrow">
+        <label><input type="checkbox" id="put_overwrite"> overwrite</label>
+        <label><input type="checkbox" id="put_immutable"> immutable</label>
+        <label><input type="checkbox" id="put_mfa"> mfa-required</label>
+        <label><input type="checkbox" id="put_dor"> delete-on-read</label>
+        <label title="rejected for client-side secrets — the server can't re-key what it can't read"><input type="checkbox" id="put_ror"> rotate-on-read</label>
+        <label><input type="checkbox" id="put_preserve"> preserve-on-cleanup</label>
+      </div>
+
+      <div class="grid2">
+        <div>
+          <label>Max reads</label>
+          <input id="put_maxreads" type="number" min="1" placeholder="∞ (unlimited)">
+        </div>
+        <div>
+          <label>Quorum K (K-of-N)</label>
+          <input id="put_quorum" type="number" min="1" placeholder="none">
+        </div>
+      </div>
+      <label>Signatories <span style="text-transform:none;color:var(--faint)">— comma-separated, required when quorum is set</span></label>
+      <input id="put_sigs" placeholder="bob,carol" autocomplete="off" spellcheck="false">
+
+      <div class="err" id="putErr" style="display:none"></div>
+      <div class="actions">
+        <button class="cancel" id="putCancel">cancel</button>
+        <button class="save" id="putSave">store secret</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const out = $('#out'), inp = $('#cmd'), compl = $('#compl');
+const pass = { profile:'', external:'' };
+let history = [], hpos = -1, busy = false, comp = [], comSel = -1;
+let ctx = { profile:null, domain:null };
+let cache = { secrets:[], files:[] };
+let activeTab = 'secrets';
+
+const esc = s => (s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+
+// ===========================================================================
+//  VIEW SWITCHING
+// ===========================================================================
+function setView(v){
+  $$('#vtog button').forEach(b=>b.classList.toggle('on', b.dataset.view===v));
+  $('#dash').classList.toggle('on', v==='dash');
+  $('#term').classList.toggle('on', v==='term');
+  if (v==='dash') loadDashboard();
+  if (v==='term') inp.focus();
+}
+$$('#vtog button').forEach(b=> b.onclick = ()=> setView(b.dataset.view));
+
+// ===========================================================================
+//  CONTEXT (profile + domain selectors)
+// ===========================================================================
+function ctxParams(extra){
+  const p = new URLSearchParams();
+  if (ctx.profile) p.set('profile', ctx.profile);
+  if (ctx.domain)  p.set('domain', ctx.domain);
+  if (pass.profile) p.set('passphrase', pass.profile);
+  if (extra) for (const k in extra) p.set(k, extra[k]);
+  return p.toString();
+}
+
+async function loadProfiles(){
+  try{
+    const j = await (await fetch('/api/ui/profiles')).json();
+    const sel = $('#selProfile'); sel.innerHTML='';
+    (j.profiles||[]).forEach(name=>{
+      const o = document.createElement('option');
+      o.value=name; o.textContent=name; sel.appendChild(o);
+    });
+    ctx.profile = j.active || (j.profiles && j.profiles[0]) || null;
+    if (ctx.profile) sel.value = ctx.profile;
+    if (!j.profiles || !j.profiles.length){
+      const o=document.createElement('option'); o.textContent='(no profiles)'; sel.appendChild(o);
+    }
+  }catch(e){}
+}
+// Determine the profile's own user domain (e.g. ~admin) via whoami, so the
+// dashboard defaults to where flag-less CLI commands would land — not just the
+// first domain in the list.
+async function userDomain(){
+  try{
+    const line = (ctx.profile?`-P ${shq(ctx.profile)} `:'')+'whoami';
+    const r=await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({line, profile_passphrase:pass.profile, external_passphrase:pass.external})});
+    const j=await r.json();
+    const m=(j.stdout||'').match(/user domain:\s*(\S+)/);
+    return m ? m[1] : null;
+  }catch(e){ return null; }
+}
+
+async function loadDomains(){
+  const sel = $('#selDomain');
+  try{
+    const j = await (await fetch('/api/ui/domains?'+ctxParams())).json();
+    sel.innerHTML='';
+    const doms = (j.ok && j.domains && j.domains.length) ? j.domains : ['default'];
+    doms.forEach(name=>{
+      const o=document.createElement('option'); o.value=name; o.textContent=name; sel.appendChild(o);
+    });
+    if (ctx.domain && doms.includes(ctx.domain)){
+      sel.value = ctx.domain;                 // keep an explicit prior choice
+    } else {
+      // Prefer the profile's own user domain, else default, else first listed.
+      const ud = await userDomain();
+      ctx.domain = (ud && doms.includes(ud)) ? ud
+                 : (doms.includes('default') ? 'default' : doms[0]);
+      sel.value = ctx.domain;
+    }
+  }catch(e){
+    sel.innerHTML='<option value="default">default</option>'; ctx.domain='default';
+  }
+}
+$('#selProfile').onchange = async e=>{
+  ctx.profile = e.target.value; ctx.domain=null;
+  await loadDomains(); refreshStatus(); loadDashboard();
+};
+$('#selDomain').onchange = e=>{ ctx.domain=e.target.value; loadDashboard(); };
+
+// ===========================================================================
+//  DASHBOARD: secrets + files
+// ===========================================================================
+$$('#tabs button').forEach(b=> b.onclick = ()=>{
+  activeTab = b.dataset.tab;
+  $$('#tabs button').forEach(x=>x.classList.toggle('on', x===b));
+  $('#paneSecrets').classList.toggle('on', activeTab==='secrets');
+  $('#paneFiles').classList.toggle('on', activeTab==='files');
+  applyFilter();
+});
+
+async function loadDashboard(){
+  await Promise.all([loadSecrets(), loadFiles()]);
+}
+
+async function loadSecrets(){
+  const pane = $('#paneSecrets');
+  pane.innerHTML = '<div class="loading"><span class="spin">▰▰▰</span> loading secrets…</div>';
+  try{
+    const j = await (await fetch('/api/ui/secrets?'+ctxParams())).json();
+    if (!j.ok){ pane.innerHTML = errBox(j.error, true); cache.secrets=[]; $('#cntSecrets').textContent='0'; return; }
+    cache.secrets = (j.data && j.data.resources) || [];
+    $('#cntSecrets').textContent = cache.secrets.length;
+    renderSecrets();
+  }catch(e){ pane.innerHTML = errBox(String(e)); }
+}
+async function loadFiles(){
+  const pane = $('#paneFiles');
+  pane.innerHTML = '<div class="loading"><span class="spin">▰▰▰</span> loading files…</div>';
+  try{
+    const j = await (await fetch('/api/ui/files?'+ctxParams())).json();
+    if (!j.ok){ pane.innerHTML = errBox(j.error, true); cache.files=[]; $('#cntFiles').textContent='0'; return; }
+    cache.files = (j.data && j.data.files) || [];
+    $('#cntFiles').textContent = cache.files.length;
+    renderFiles();
+  }catch(e){ pane.innerHTML = errBox(String(e)); }
+}
+
+function errBox(msg, passphrase){
+  const m = esc(msg||'request failed');
+  let hint = '';
+  if (passphrase && /passphrase|encrypted|unlock/i.test(msg||'')){
+    hint = '<div style="margin-top:12px"><button class="iconbtn" onclick="openPassModal(\'profile\')">🔑 Enter passphrase</button></div>';
+  }
+  return `<div class="empty"><div class="big">⚠</div>${m}${hint}</div>`;
+}
+
+function fmtSize(n){
+  n = +n||0;
+  if (n<1024) return n+' B';
+  if (n<1048576) return (n/1024).toFixed(1)+' KB';
+  return (n/1048576).toFixed(1)+' MB';
+}
+function fmtDate(s){
+  if (!s) return '—';
+  // server emits RFC3339-ish; show date + HH:MM
+  const d = new Date(s);
+  if (isNaN(d)) return s;
+  return d.toLocaleString(undefined,{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+
+// build the rule/flag badges for a resource
+function flagBadges(r){
+  const f = r.flags || {};
+  const b = [];
+  if (f.mfa_required)        b.push('<span class="badge mfa">mfa</span>');
+  if (f.delete_on_read)      b.push('<span class="badge rule">burn-after-read</span>');
+  if (f.max_reads!=null)     b.push(`<span class="badge rule">reads ${r.read_count||0}/${f.max_reads}</span>`);
+  if (f.rotate_on_read)      b.push('<span class="badge rule">rotate-on-read</span>');
+  if (f.no_overwrite)        b.push('<span class="badge rule">immutable</span>');
+  if (f.preserve_on_cleanup) b.push('<span class="badge rule">preserved</span>');
+  if (r.threshold_k!=null)   b.push(`<span class="badge quorum">quorum ${r.threshold_k}-of-${r.signatory_count||r.threshold_k}</span>`);
+  return b.join('');
+}
+
+function renderSecrets(){
+  const pane = $('#paneSecrets');
+  if (!cache.secrets.length){
+    pane.innerHTML = '<div class="empty"><div class="big">🔑</div>No secrets in this domain yet.<br>Use <b>＋ New secret</b> to add one.</div>';
+    return;
+  }
+  pane.innerHTML = cache.secrets.map((r,i)=>{
+    const kind = r.external ? 'external' : 'server';
+    const status = r.exhausted_at ? 'exhausted' : 'active';
+    const reqMfa = r.flags && r.flags.mfa_required;
+    return `
+    <div class="item" data-name="${esc(r.resource_name)}" data-i="${i}">
+      <div class="ihead" onclick="toggleItem(this)">
+        <span class="caret">▶</span>
+        <span class="ic">${r.external?'🔐':'🔑'}</span>
+        <div class="igrow">
+          <div class="iname">${esc(r.resource_name)}</div>
+          <div class="imeta">
+            <span class="badge k-${kind}">${kind}</span>
+            <span class="badge s-${status}">${status}</span>
+            ${flagBadges(r)}
+          </div>
+        </div>
+        <span class="iupd">${fmtDate(r.updated_at)}</span>
+      </div>
+      <div class="ibody">
+        <dl class="kv">
+          <dt>id</dt><dd>${esc(r.resource_id)}</dd>
+          <dt>kind</dt><dd>${kind}${r.external?' (client-side encrypted)':''}</dd>
+          <dt>created</dt><dd>${fmtDate(r.created_at)}</dd>
+          <dt>updated</dt><dd>${fmtDate(r.updated_at)}</dd>
+          <dt>reads</dt><dd>${r.read_count||0}${r.flags&&r.flags.max_reads!=null?(' / '+r.flags.max_reads):''}</dd>
+        </dl>
+        <div class="reveal" id="reveal-${i}"></div>
+        <div class="actrow">
+          <button class="reveal-btn" onclick="revealSecret(${i})">👁 Reveal value</button>
+          <button onclick="copyName(${i})">⧉ Copy name</button>
+          <button class="danger" onclick="deleteSecret(${i})">🗑 Delete</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+  applyFilter();
+}
+
+function renderFiles(){
+  const pane = $('#paneFiles');
+  if (!cache.files.length){
+    pane.innerHTML = '<div class="empty"><div class="big">🗂️</div>No files in this domain yet.</div>';
+    return;
+  }
+  pane.innerHTML = cache.files.map((f,i)=>{
+    let kind = f.external==='key' ? 'external' : (f.external==='resident' ? 'resident' : 'server');
+    const status = f.exhausted_at ? 'exhausted' : 'active';
+    return `
+    <div class="item" data-name="${esc(f.name)}" data-i="${i}">
+      <div class="ihead" onclick="toggleItem(this)">
+        <span class="caret">▶</span>
+        <span class="ic">📄</span>
+        <div class="igrow">
+          <div class="iname">${esc(f.name)}</div>
+          <div class="imeta">
+            <span class="badge k-${kind}">${kind}</span>
+            <span class="badge s-${status}">${status}</span>
+            <span class="badge">${fmtSize(f.size)}</span>
+            ${f.mime_type?`<span class="badge">${esc(f.mime_type)}</span>`:''}
+            ${flagBadges(f)}
+          </div>
+        </div>
+        <span class="iupd">${fmtDate(f.updated_at)}</span>
+      </div>
+      <div class="ibody">
+        <dl class="kv">
+          <dt>id</dt><dd>${esc(f.id)}</dd>
+          <dt>owner</dt><dd>${esc(f.owner)}</dd>
+          <dt>size</dt><dd>${fmtSize(f.size)} (${f.size} bytes)</dd>
+          <dt>sha3-256</dt><dd>${esc((f.content_hash||'').slice(0,32))}…</dd>
+          <dt>created</dt><dd>${fmtDate(f.created_at)}</dd>
+          <dt>reads</dt><dd>${f.read_count||0}${f.flags&&f.flags.max_reads!=null?(' / '+f.flags.max_reads):''}</dd>
+        </dl>
+        <div class="actrow">
+          <button onclick="downloadFile(${i})">⬇ Download (terminal)</button>
+          <button onclick="copyName(${i},'file')">⧉ Copy name</button>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+  applyFilter();
+}
+
+function applyFilter(){
+  const q = $('#filter').value.trim().toLowerCase();
+  const pane = activeTab==='secrets' ? $('#paneSecrets') : $('#paneFiles');
+  pane.querySelectorAll('.item').forEach(el=>{
+    const name = (el.dataset.name||'').toLowerCase();
+    el.style.display = (!q || name.includes(q)) ? '' : 'none';
+  });
+}
+$('#filter').addEventListener('input', applyFilter);
+
+function toggleItem(head){ head.parentElement.classList.toggle('open'); }
+
+// ---- reveal a secret value ----
+async function revealSecret(i){
+  const r = cache.secrets[i];
+  const box = $('#reveal-'+i);
+  box.innerHTML = '<div class="loading" style="padding:14px;text-align:left"><span class="spin">▰▰▰</span> reading…</div>';
+  try{
+    const body = {
+      name: r.resource_name,
+      profile: ctx.profile, domain: ctx.domain,
+      passphrase: pass.profile, external_passphrase: pass.external,
+    };
+    const j = await (await fetch('/api/ui/reveal',{
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+    })).json();
+    if (j.ok){
+      const id = 'val-'+i;
+      box.innerHTML = `
+        <label style="font-size:11px;color:var(--faint);font-family:var(--mono);text-transform:uppercase;letter-spacing:.5px">value</label>
+        <div class="secretbox">
+          <div class="val" id="${id}">${esc(j.value)}</div>
+          <button class="copy" onclick="copyVal('${id}',this)">⧉ copy</button>
+        </div>`;
+    } else {
+      const stderr = (j.stderr||j.error||'').trim();
+      box.innerHTML = `<div class="revealerr">✗ ${esc(stderr||'could not reveal')}</div>`;
+      maybePromptPassphrase(stderr);
+    }
+  }catch(e){ box.innerHTML = `<div class="revealerr">✗ ${esc(String(e))}</div>`; }
+}
+function copyVal(id, btn){
+  const t = $('#'+id).textContent;
+  navigator.clipboard.writeText(t).then(()=>{ const o=btn.textContent; btn.textContent='✓ copied'; setTimeout(()=>btn.textContent=o,1200); });
+}
+function copyName(i, kind){
+  const name = (kind==='file'?cache.files[i].name:cache.secrets[i].resource_name);
+  navigator.clipboard.writeText(name);
+}
+function deleteSecret(i){
+  const name = cache.secrets[i].resource_name;
+  if (!confirm(`Delete secret "${name}"? This cannot be undone.`)) return;
+  // route through the terminal command so audit + ACL behave identically
+  runDashCmd(`rm ${shq(name)} -y`).then(()=>loadSecrets());
+}
+function downloadFile(i){
+  const name = cache.files[i].name;
+  setView('term');
+  inp.value = `file get ${shq(name)}`;
+  inp.focus();
+}
+function shq(s){ return /[^\w.\-\/@]/.test(s) ? `'${s.replace(/'/g,"'\\''")}'` : s; }
+
+// run a command silently with current ctx (used by dashboard delete / put).
+// `extPass`, when given, overrides the session external passphrase for this one
+// call — it goes to the child via env ($BLACKBOOK_EXTERNAL_PASSPHRASE), never
+// on argv, so a new external-passphrase secret can be sealed without exposure.
+async function runDashCmd(line, extPass){
+  const full = (ctx.profile?`-P ${shq(ctx.profile)} `:'') + (ctx.domain?`-D ${shq(ctx.domain)} `:'') + line;
+  const ext = (extPass!=null && extPass!=='') ? extPass : pass.external;
+  const r = await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({line:full, profile_passphrase:pass.profile, external_passphrase:ext})});
+  return r.json();
+}
+
+$('#refreshBtn').onclick = ()=> loadDashboard();
+
+// ---- new secret modal (full `put` surface) ----
+function putReset(){
+  $('#put_name').value=''; $('#put_value').value='';
+  $('#put_enc').value='server'; $('#put_pp').value='';
+  ['put_overwrite','put_immutable','put_mfa','put_dor','put_ror','put_preserve']
+    .forEach(id=>$('#'+id).checked=false);
+  $('#put_maxreads').value=''; $('#put_quorum').value=''; $('#put_sigs').value='';
+  syncEnc();
+  $('#putErr').style.display='none';
+}
+// Reflect the encryption choice: show the passphrase field for passphrase mode,
+// and disable rotate-on-read for any client-side mode (the server can't re-key
+// what it can't read — the CLI rejects the combo).
+function syncEnc(){
+  const enc = $('#put_enc').value;
+  $('#put_pp_wrap').style.display = enc==='passphrase' ? 'block' : 'none';
+  const external = enc!=='server';
+  const ror = $('#put_ror');
+  ror.disabled = external;
+  if (external) ror.checked = false;
+}
+$('#put_enc').onchange = syncEnc;
+
+$('#newSecret').onclick = ()=>{
+  $('#putDomain').textContent = ctx.domain||'default';
+  putReset();
+  $('#putModal').classList.add('show'); $('#put_name').focus();
+};
+$('#putCancel').onclick = ()=> $('#putModal').classList.remove('show');
+$('#putModal').onclick = e=>{ if(e.target===$('#putModal')) $('#putModal').classList.remove('show'); };
+
+$('#putSave').onclick = async ()=>{
+  const name = $('#put_name').value.trim();
+  const val  = $('#put_value').value;
+  const enc  = $('#put_enc').value;
+  const pp   = $('#put_pp').value;
+  const maxreads = $('#put_maxreads').value.trim();
+  const quorum   = $('#put_quorum').value.trim();
+  const sigs     = $('#put_sigs').value.trim().replace(/\s*,\s*/g, ',').replace(/^,|,$/g,'');
+
+  if (!name){ showPutErr('name is required'); return; }
+  if (val===''){ showPutErr('value is required'); return; }
+  if (enc==='passphrase' && !pp){ showPutErr('an external passphrase is required for passphrase encryption'); return; }
+  if (quorum && !sigs){ showPutErr('signatories are required when a quorum is set'); return; }
+
+  let line = `put ${shq(name)} ${shq(val)}`;
+  if (enc==='managed')          line += ' --external-key';
+  else if (enc==='passphrase')  line += ' --external-passphrase-env';   // value via env, not argv
+  if ($('#put_overwrite').checked) line += ' --overwrite';
+  if ($('#put_immutable').checked) line += ' --no-overwrite';
+  if ($('#put_mfa').checked)       line += ' --mfa-required';
+  if ($('#put_dor').checked)       line += ' --delete-on-read';
+  if ($('#put_ror').checked)       line += ' --rotate-on-read';
+  if ($('#put_preserve').checked)  line += ' --preserve-on-cleanup';
+  if (maxreads) line += ` --max-reads ${shq(maxreads)}`;
+  if (quorum)   line += ` --quorum ${shq(quorum)} --signatories ${shq(sigs)}`;
+
+  $('#putSave').textContent='storing…';
+  const j = await runDashCmd(line, enc==='passphrase' ? pp : null);
+  $('#putSave').textContent='store secret';
+  if (j.ok){ $('#putModal').classList.remove('show'); loadSecrets(); }
+  else { showPutErr((j.stderr||'failed').trim()); maybePromptPassphrase(j.stderr); }
+};
+function showPutErr(m){ const e=$('#putErr'); e.textContent='✗ '+m; e.style.display='block'; }
+
+// ===========================================================================
+//  TERMINAL (unchanged behavior, now context-aware)
+// ===========================================================================
+function line(text, cls){
+  const d = document.createElement('div'); d.className='row '+(cls||'');
+  d.textContent=text; out.appendChild(d); out.scrollTop=out.scrollHeight; return d;
+}
+function rawline(html, cls){
+  const d = document.createElement('div'); d.className='row '+(cls||'');
+  d.innerHTML=html; out.appendChild(d); out.scrollTop=out.scrollHeight; return d;
+}
+function paint(text, stream){
+  text.split('\n').forEach((ln, i, arr) => {
+    if (i === arr.length-1 && ln === '') return;
+    let cls = stream==='err' ? 'err' : '';
+    if (!cls){
+      if (/^─+|^-{6,}/.test(ln)) cls='sep';
+      else if (/\b(stored|updated|deleted|granted|registered|uploaded|unlocked|Logged in|approved|revoked|added|created|ok)\b/i.test(ln)) cls='ok';
+      else if (/\b(Error|error|denied|forbidden|failed|invalid|not permitted|exhausted)\b/.test(ln)) cls='err';
+      else if (/^(NAME|CLIENT|ID|VERB|Global|Verb)\b/.test(ln) || /\bRULES\b|\bSTATUS\b|\bKIND\b/.test(ln)) cls='info';
+      else if (/Blackbook|web console/i.test(ln)) cls='banner';
+    }
+    let h = esc(ln).replace(/\[(external[^\]]*|resident[^\]]*)\]/g,'<span class="tag">[$1]</span>');
+    rawline(h || '&nbsp;', cls);
+  });
+}
+async function execute(rawline_){
+  let cmd = rawline_.trim();
+  if (!cmd) return;
+  if (busy) return;
+  if (cmd === 'clear'){ out.innerHTML=''; inp.value=''; clearCompl(); return; }
+  history.unshift(cmd); hpos = -1;
+  rawline('<span class="ps">bbk ❯ </span>' + cmd.replace(/&/g,'&amp;').replace(/</g,'&lt;'), 'cmd');
+  inp.value=''; clearCompl();
+  busy = true;
+  const sp = rawline('<span class="spin">▰▰▰</span> <span class="muted">running…</span>');
+  try{
+    const r = await fetch('/run', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ line: cmd, profile_passphrase: pass.profile, external_passphrase: pass.external })});
+    const j = await r.json();
+    sp.remove();
+    if (j.stdout) paint(j.stdout, 'out');
+    if (j.stderr) paint(j.stderr, 'err');
+    if (!j.stdout && !j.stderr) line(j.ok ? '✓ done' : ('✗ exit '+j.code), j.ok?'ok':'err');
+    if (!j.ok) maybePromptPassphrase(j.stderr);
+  }catch(e){ sp.remove(); line('✗ '+e, 'err'); }
+  busy = false; inp.focus();
+}
+let compTimer=null;
+async function refreshCompl(){
+  const v = inp.value;
+  if (!v.trim()){ clearCompl(); return; }
+  try{
+    const r = await fetch('/complete',{method:'POST',headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({line:v})});
+    const j = await r.json();
+    comp = (j.candidates||[]).slice(0,14); comSel=-1; renderCompl();
+  }catch(e){ clearCompl(); }
+}
+function renderCompl(){
+  compl.innerHTML='';
+  comp.forEach((c,i)=>{
+    const s=document.createElement('span'); s.textContent=c;
+    if(i===comSel) s.className='sel';
+    s.onclick=()=>applyCompl(c);
+    compl.appendChild(s);
+  });
+}
+function clearCompl(){ comp=[]; comSel=-1; compl.innerHTML=''; }
+function applyCompl(c){
+  const v=inp.value; const parts = v.split(/(\s+)/);
+  if (/\s$/.test(v) || v===''){ inp.value = v + c + ' '; }
+  else { parts[parts.length-1] = c; inp.value = parts.join('') + ' '; }
+  clearCompl(); inp.focus();
+}
+inp.addEventListener('keydown', e=>{
+  if (e.key==='Enter'){ e.preventDefault(); execute(inp.value); }
+  else if (e.key==='Tab'){
+    e.preventDefault();
+    if (comp.length===0){ refreshCompl(); return; }
+    if (comp.length===1){ applyCompl(comp[0]); return; }
+    comSel = (comSel+1) % comp.length; renderCompl();
+  }
+  else if (e.key==='ArrowUp'){
+    if (comp.length && comSel>0){ e.preventDefault(); comSel--; renderCompl(); return; }
+    e.preventDefault();
+    if (hpos < history.length-1){ hpos++; inp.value = history[hpos]; }
+  }
+  else if (e.key==='ArrowDown'){
+    if (comp.length){ e.preventDefault(); comSel=Math.min(comSel+1,comp.length-1); renderCompl(); return; }
+    e.preventDefault();
+    if (hpos>0){ hpos--; inp.value=history[hpos]; } else { hpos=-1; inp.value=''; }
+  }
+  else { clearCompl(); }
+});
+let liveTimer=null;
+inp.addEventListener('input', ()=>{ clearTimeout(liveTimer); liveTimer=setTimeout(refreshCompl,140); });
+$('#runbtn').onclick = ()=>execute(inp.value);
+
+// ===========================================================================
+//  COMMAND PALETTE (⌘K / Ctrl-K) — replaces the old sidebar. Fed by the live
+//  clap command tree (/api/ui/commands), so it never drifts from the CLI.
+// ===========================================================================
+let palCommands = [];   // full catalog {path, about, leaf, group}
+let palFiltered = [];   // current filtered view
+let palSel = 0;
+
+async function loadCommands(){
+  try{
+    const j = await (await fetch('/api/ui/commands')).json();
+    palCommands = j.commands || [];
+  }catch(e){ palCommands = []; }
+}
+
+// subsequence fuzzy score; -1 = no match, higher = better (contiguity bonus)
+function fuzzy(q, s){
+  if (!q) return 0;
+  q = q.toLowerCase(); s = (s||'').toLowerCase();
+  let qi=0, score=0, last=-2;
+  for (let i=0;i<s.length && qi<q.length;i++){
+    if (s[i]===q[qi]){ score += (i===last+1?3:1) + (i===0?2:0); last=i; qi++; }
+  }
+  return qi===q.length ? score : -1;
+}
+
+function renderPalette(){
+  const q = $('#palInput').value.trim();
+  if (!q){
+    palFiltered = palCommands.slice();
+  } else {
+    palFiltered = palCommands
+      .map(c=>{
+        const sp = fuzzy(q, c.path), sa = fuzzy(q, c.about);
+        const score = (sp<0 && sa<0) ? -1 : Math.max(sp*4, sa);  // weight path matches
+        return {c, score};
+      })
+      .filter(x=>x.score>=0)
+      .sort((a,b)=> b.score - a.score)
+      .map(x=>x.c);
+  }
+  if (palSel >= palFiltered.length) palSel = palFiltered.length-1;
+  if (palSel < 0) palSel = 0;
+  const list = $('#palList');
+  if (!palFiltered.length){ list.innerHTML = '<div class="pal-empty">no commands match</div>'; return; }
+  list.innerHTML = palFiltered.map((c,i)=>`
+    <div class="pal-item ${i===palSel?'sel':''}" data-i="${i}">
+      <span class="pal-path">${esc(c.path)}</span>
+      <span class="pal-about">${esc(c.about)}</span>
+      ${c.leaf?'':'<span class="pal-grp">group</span>'}
+    </div>`).join('');
+  const sel = list.querySelector('.pal-item.sel');
+  if (sel) sel.scrollIntoView({block:'nearest'});
+}
+
+async function openPalette(){
+  if (!palCommands.length) await loadCommands();
+  $('#paletteModal').classList.add('show');
+  $('#palInput').value=''; palSel=0; renderPalette();
+  $('#palInput').focus();
+}
+function closePalette(){ $('#paletteModal').classList.remove('show'); inp.focus(); }
+
+// Choosing a command drops it into the terminal input (it never auto-runs, so
+// you can review/edit args first), switches to the terminal, and immediately
+// surfaces the next tokens via tab-completion.
+function choosePalette(i){
+  const c = palFiltered[i];
+  if (!c) return;
+  closePalette();
+  setView('term');
+  inp.value = c.path + ' ';
+  inp.focus();
+  refreshCompl();
+}
+
+$('#palBtn').onclick = openPalette;
+$('#palInput').addEventListener('input', ()=>{ palSel=0; renderPalette(); });
+$('#palInput').addEventListener('keydown', e=>{
+  if (e.key==='ArrowDown'){ e.preventDefault(); palSel=Math.min(palSel+1, palFiltered.length-1); renderPalette(); }
+  else if (e.key==='ArrowUp'){ e.preventDefault(); palSel=Math.max(palSel-1, 0); renderPalette(); }
+  else if (e.key==='Enter'){ e.preventDefault(); choosePalette(palSel); }
+  else if (e.key==='Escape'){ e.preventDefault(); closePalette(); }
+});
+$('#palList').addEventListener('click', e=>{
+  const item = e.target.closest('.pal-item');
+  if (item) choosePalette(+item.dataset.i);
+});
+$('#paletteModal').onclick = e=>{ if (e.target===$('#paletteModal')) closePalette(); };
+
+// Global ⌘K / Ctrl-K opens the palette from anywhere (incl. the dashboard).
+document.addEventListener('keydown', e=>{
+  if ((e.metaKey || e.ctrlKey) && (e.key==='k' || e.key==='K')){
+    e.preventDefault();
+    if ($('#paletteModal').classList.contains('show')) closePalette(); else openPalette();
+  }
+});
+
+// ===========================================================================
+//  PASSPHRASE MODAL (shared)
+// ===========================================================================
+function openPassModal(focus){
+  $('#pp_profile').value=pass.profile; $('#pp_external').value=pass.external;
+  $('#modal').classList.add('show');
+  $(focus==='external'?'#pp_external':'#pp_profile').focus();
+}
+$('#lockbtn').onclick=()=>openPassModal('profile');
+$('#ppcancel').onclick=()=>$('#modal').classList.remove('show');
+$('#ppsave').onclick=()=>{
+  pass.profile=$('#pp_profile').value; pass.external=$('#pp_external').value;
+  $('#modal').classList.remove('show'); updateLock(); refreshStatus();
+  if ($('#dash').classList.contains('on')) loadDashboard();
+};
+$('#modal').onclick=e=>{ if(e.target===$('#modal')) $('#modal').classList.remove('show'); };
+function updateLock(){ $('#lockbtn').innerHTML = (pass.profile||pass.external) ? '🔓 passphrases set' : '🔑 passphrases'; }
+
+function maybePromptPassphrase(stderr){
+  const s = (stderr||'').toLowerCase();
+  const needProfile  = /profile passphrase required|set \$blackbook_passphrase|this profile is encrypted/.test(s);
+  const needExternal = /external passphrase required|set \$blackbook_external_passphrase|passphrase-sealed/.test(s);
+  if (!needProfile && !needExternal) return false;
+  const which = needExternal && !needProfile ? 'external' : 'profile';
+  setTimeout(()=>openPassModal(which), 250);
+  return true;
+}
+
+// ===========================================================================
+//  STATUS
+// ===========================================================================
+async function refreshStatus(){
+  try{
+    const line = (ctx.profile?`-P ${shq(ctx.profile)} `:'')+'whoami';
+    const r=await fetch('/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({line, profile_passphrase:pass.profile, external_passphrase:pass.external})});
+    const j=await r.json();
+    const pill=$('#status'), txt=$('#statustxt');
+    if(j.ok && /auth:/.test(j.stdout)){
+      const m=j.stdout.match(/^(\S+)\s*\(([^)]+)\)/);
+      pill.className='pill on'; txt.textContent = m ? (m[1]+' · '+m[2]) : 'connected';
+    } else { pill.className='pill off'; txt.textContent='locked / not logged in'; }
+  }catch(e){ $('#status').className='pill off'; $('#statustxt').textContent='offline'; }
+}
+
+// boot
+rawline('  🕮  <span class="banner">Blackbook</span> <span class="muted">console — Dashboard for everyday use, Terminal for the full CLI.</span>');
+rawline('  <span class="muted">Try</span> <span class="ok">ls</span><span class="muted">,</span> <span class="ok">whoami</span><span class="muted">, or</span> <span class="ok">--help</span><span class="muted">.</span>');
+rawline('&nbsp;');
+
+(async function boot(){
+  await loadProfiles();
+  await loadDomains();
+  updateLock();
+  loadCommands();      // preload the palette catalog (non-blocking)
+  refreshStatus();
+  loadDashboard();
+  setInterval(refreshStatus, 15000);
+})();
+</script>
+</body>
+</html>

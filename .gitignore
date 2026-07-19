@@ -1,4 +1,32 @@
+# Build artifacts
 /target
+# Committed-by-accident local symlink to the built binary.
+/blackbook.exe
+
+# Real runtime env — copied from .env.example / config/blackbook.env and filled
+# with real passwords. NEVER commit. (.env.example IS tracked as the template.)
+.env
+.env.local
+.env.*.local
+
+# Issued credential bundles — these carry a live bearer token + client key.
+# (first-run admin-bundle.json, and any `client create -o <name>.json`.)
 admin*
 user*.json
-/config
+*-bundle.json
+
+# Master-key secret (keyfile / passphrase) for the DEK provider, and the
+# Postgres TLS material — never commit. Provided at runtime via volume/secret.
+/secrets
+
+# Agent / editor state — local to a machine, not part of the distribution.
+/.claude/
+/.vscode/
+/.idea/
+
+# Internal design/history notes — not user-facing documentation.
+/_archive/
+
+# MemPalace per-project files
+mempalace.yaml
+entities.json

@@ -19,6 +19,11 @@
 use reqwest::{Client, Identity};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use zeroize::Zeroize;
+
+/// The tunnel relay WebSocket type — reqwest-websocket reuses the mTLS reqwest
+/// client (client cert + pinned CA) for the upgrade, so no separate TLS config.
+pub type TunnelWs = reqwest_websocket::WebSocket;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -75,7 +80,7 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 // Session: on-disk record
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Session {
     pub server: String,
     /// Bearer token. Required in practice — the server rejects any request
@@ -95,6 +100,33 @@ pub struct Session {
     /// `None` for legacy plaintext profiles created before Phase 2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cmk: Option<String>,
+}
+
+/// Redacting `Debug` so a session can never spill the bearer token, private
+/// key, or client master key into logs/panics — only their presence is shown.
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mark = |o: &Option<String>| if o.is_some() { "<redacted>" } else { "None" };
+        f.debug_struct("Session")
+            .field("server", &self.server)
+            .field("token", &mark(&self.token))
+            .field("cert_pem", &self.cert_pem.as_ref().map(|_| "<cert>"))
+            .field("key_pem", &mark(&self.key_pem))
+            .field("ca_pem", &self.ca_pem.as_ref().map(|_| "<ca>"))
+            .field("cmk", &mark(&self.cmk))
+            .finish()
+    }
+}
+
+/// Wipe the secret-bearing fields (token, private key, client master key) when
+/// a `Session` is dropped, so credentials don't linger in freed heap for the
+/// life of the process. Certificates are public and left as-is.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(t) = self.token.as_mut() { t.zeroize(); }
+        if let Some(k) = self.key_pem.as_mut() { k.zeroize(); }
+        if let Some(c) = self.cmk.as_mut() { c.zeroize(); }
+    }
 }
 
 impl Session {
@@ -236,7 +268,7 @@ impl Session {
             if env.v >= 2 {
                 // 1) cached KEK from the agent (no prompt, no Argon2id re-run).
                 if let Some(kek) = crate::credstore::agent_get(profile) {
-                    if let Ok(inner) = env.open_with_kek(&kek) {
+                    if let Ok(inner) = env.open_with_kek(kek.as_slice()) {
                         return Ok(serde_json::from_slice(&inner)?);
                     }
                     // Stale/rotated KEK: fall through to passphrase.
@@ -246,9 +278,9 @@ impl Session {
                 let pass = crate::credstore::resolve_passphrase(
                     None, &format!("Passphrase for profile '{profile}': "), false)?;
                 let kek = env.derive_kek(&pass)?;
-                let inner = env.open_with_kek(&kek)?;
+                let inner = env.open_with_kek(kek.as_slice())?;
                 let _ = crate::credstore::agent_store(
-                    profile, &kek, crate::credstore::DEFAULT_AGENT_TTL_SECS);
+                    profile, kek.as_slice(), crate::credstore::DEFAULT_AGENT_TTL_SECS);
                 return Ok(serde_json::from_slice(&inner)?);
             }
         }
@@ -285,7 +317,9 @@ impl Session {
     /// active. This is the Phase 2 login path — credentials are never written
     /// to disk in the clear.
     pub fn save_encrypted(&self, profile: &str, passphrase: &str) -> Result<PathBuf> {
-        let inner = serde_json::to_vec(self)?;
+        // The serialized session is the credential bundle in the clear; wipe it
+        // once it has been sealed into the on-disk envelope.
+        let inner = zeroize::Zeroizing::new(serde_json::to_vec(self)?);
         let env = crate::credstore::seal_profile(passphrase, &inner)?;
         let kek = env.derive_kek(passphrase)?;
         let path = Self::path_for(profile)?;
@@ -293,27 +327,16 @@ impl Session {
         fs::write(&path, serde_json::to_vec_pretty(&env)?)?;
         Self::harden(&path)?;
         let _ = crate::credstore::agent_store(
-            profile, &kek, crate::credstore::DEFAULT_AGENT_TTL_SECS);
+            profile, kek.as_slice(), crate::credstore::DEFAULT_AGENT_TTL_SECS);
         Self::write_active_pointer(profile)?;
         Ok(path)
     }
 
-    /// Save into the active profile and mark it active (plaintext — legacy /
-    /// internal use only; the login path uses [`save_encrypted`]).
-    pub fn save(&self) -> Result<PathBuf> {
-        self.save_named(&active_profile())
-    }
-
-    /// Save into a named profile as plaintext and persist it as the active
-    /// pointer. Retained for back-compat; new logins use [`save_encrypted`].
-    pub fn save_named(&self, profile: &str) -> Result<PathBuf> {
-        let path = Self::path_for(profile)?;
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
-        fs::write(&path, serde_json::to_vec_pretty(self)?)?;
-        Self::harden(&path)?;
-        Self::write_active_pointer(profile)?;
-        Ok(path)
-    }
+    // NOTE: the former plaintext `save()` / `save_named()` writers were removed
+    // as a hardening measure — they wrote the bearer token and private key to
+    // disk in the clear. All credential persistence now goes through
+    // `save_encrypted` (Argon2id + AES-256-GCM). Pre-existing plaintext
+    // `session.json` files are still *read* for back-compat.
 
     /// Best-effort `0600` on POSIX; no-op elsewhere.
     fn harden(path: &std::path::Path) -> Result<()> {
@@ -352,7 +375,10 @@ impl Session {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-pub struct Whoami { pub id: String, pub name: String, pub role: String, pub auth_method: String }
+pub struct Whoami {
+    pub id: String, pub name: String, pub role: String, pub auth_method: String,
+    #[serde(default)] pub user_domain: Option<String>,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct StoreResponse {
@@ -375,7 +401,7 @@ pub struct DeleteResponse { pub deleted: bool, pub resource_id: String, pub dele
 
 /// Resource policy flags as returned in list views. Mirrors
 /// `auth::ResourceFlags`; all optional so older servers still deserialize.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ResourceFlagsView {
     #[serde(default)] pub mfa_required: bool,
     #[serde(default)] pub delete_on_read: bool,
@@ -385,7 +411,7 @@ pub struct ResourceFlagsView {
     #[serde(default)] pub no_overwrite: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ResourceSummary {
     pub resource_id: String, pub resource_name: String,
     pub created_at: String, pub updated_at: String,
@@ -407,7 +433,7 @@ pub struct ResourceSummary {
     pub signatory_count: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct ListResources { pub resources: Vec<ResourceSummary>, pub count: usize }
 
 #[derive(Debug, Deserialize)]
@@ -428,6 +454,7 @@ pub struct NewClient {
     pub token: String,
     pub cert_pem: String, pub key_pem: String,
     pub expires_at: String,
+    #[serde(default)] pub user_domain: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,6 +481,9 @@ pub struct AclSummary {
     pub not_before: Option<String>,
     pub max_uses: Option<i32>,
     pub use_count: i32,
+    #[serde(default)] pub rate_max: Option<i32>,
+    #[serde(default)] pub rate_period_secs: Option<i32>,
+    #[serde(default)] pub schedule: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -470,7 +500,7 @@ pub struct AuditEntry {
 #[derive(Debug, Deserialize)]
 pub struct AuditList { pub entries: Vec<AuditEntry>, pub count: usize }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct FileSummary {
     pub id: String,
     pub name: String,
@@ -495,7 +525,7 @@ pub struct FileSummary {
     pub signatory_count: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct FileList { pub files: Vec<FileSummary>, pub count: usize }
 
 #[derive(Debug, Deserialize)]
@@ -650,6 +680,9 @@ pub struct GrantOpts {
     pub expires_at: Option<String>,
     pub not_before: Option<String>,
     pub max_uses: Option<i32>,
+    pub rate_max: Option<i32>,
+    pub rate_period_secs: Option<i32>,
+    pub schedule: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -721,6 +754,36 @@ impl BlackbookClient {
     pub fn domain(&self) -> &str { &self.domain }
     pub fn with_mfa(mut self, code: impl Into<String>) -> Self {
         self.mfa = Some(code.into()); self
+    }
+
+    /// Offer a tunnel to `target`; returns the new tunnel id.
+    pub async fn tunnel_offer(&self, target: &str) -> Result<String> {
+        let body = serde_json::json!({ "target": target });
+        let resp = self.req(reqwest::Method::POST, "/api/v1/tunnels").json(&body).send().await?;
+        let v: serde_json::Value = self.handle(resp).await?;
+        v.get("tunnel_id").and_then(|x| x.as_str()).map(|s| s.to_string())
+            .ok_or_else(|| ClientError::Api { status: 500, message: "no tunnel_id in response".into() })
+    }
+
+    /// List tunnels this client offered or is the target of.
+    pub async fn tunnel_list(&self) -> Result<serde_json::Value> {
+        let resp = self.req(reqwest::Method::GET, "/api/v1/tunnels").send().await?;
+        self.handle(resp).await
+    }
+
+    /// Open the tunnel relay WebSocket for `tunnel_id` by upgrading the existing
+    /// mTLS reqwest client — so the client cert + pinned CA come for free, the
+    /// same posture as every REST call. The bearer token rides an Authorization
+    /// header set before the upgrade.
+    pub async fn tunnel_connect_ws(&self, tunnel_id: &str) -> Result<TunnelWs> {
+        use reqwest_websocket::RequestBuilderExt as _;
+        let url = format!("{}/api/v1/tunnels/{}/ws", self.server, tunnel_id);
+        let mut rb = self.http.request(reqwest::Method::GET, &url);
+        if let Some(t) = &self.token { rb = rb.bearer_auth(t); }
+        let resp = rb.upgrade().send().await
+            .map_err(|e| ClientError::TlsConfig(format!("tunnel ws connect: {e}")))?;
+        resp.into_websocket().await
+            .map_err(|e| ClientError::TlsConfig(format!("tunnel ws upgrade: {e}")))
     }
 
     async fn handle<T: serde::de::DeserializeOwned>(&self, resp: reqwest::Response) -> Result<T> {
@@ -1086,6 +1149,9 @@ impl BlackbookClient {
             "expires_at":      opts.expires_at,
             "not_before":      opts.not_before,
             "max_uses":        opts.max_uses,
+            "rate_max":        opts.rate_max,
+            "rate_period_secs": opts.rate_period_secs,
+            "schedule":        opts.schedule,
         });
         let resp = self.req(reqwest::Method::POST, "/api/v1/acl").json(&body).send().await?;
         self.handle(resp).await
@@ -1113,6 +1179,28 @@ impl BlackbookClient {
     /// `{ok: false, verified_through: N, first_bad_id: M, reason: "…"}`.
     pub async fn audit_verify(&self) -> Result<serde_json::Value> {
         let resp = self.req(reqwest::Method::GET, "/api/v1/audit/verify").send().await?;
+        self.handle(resp).await
+    }
+
+    /// Archive old audit rows to a compressed, encrypted, chain-verifiable file
+    /// on the server's data volume. One of `keep_last`/`before` is required.
+    pub async fn audit_archive(&self, keep_last: Option<i64>, before: Option<&str>, prune: bool)
+        -> Result<serde_json::Value> {
+        let mut qs: Vec<(String, String)> = vec![("prune".into(), prune.to_string())];
+        if let Some(k) = keep_last { qs.push(("keep_last".into(), k.to_string())); }
+        if let Some(b) = before { qs.push(("before".into(), b.to_string())); }
+        let resp = self.req(reqwest::Method::POST, "/api/v1/audit/archive").query(&qs).send().await?;
+        self.handle(resp).await
+    }
+
+    pub async fn audit_archive_verify(&self, file: &str) -> Result<serde_json::Value> {
+        let url = format!("/api/v1/audit/archive/verify?file={}", urlencoding_simple(file));
+        let resp = self.req(reqwest::Method::GET, &url).send().await?;
+        self.handle(resp).await
+    }
+
+    pub async fn audit_archives(&self) -> Result<serde_json::Value> {
+        let resp = self.req(reqwest::Method::GET, "/api/v1/audit/archives").send().await?;
         self.handle(resp).await
     }
 }

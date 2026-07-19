@@ -239,8 +239,8 @@ pub async fn acl_check(
     // anymore. Pull every candidate grant that matches everything *but* the
     // pattern, then decrypt + match in Rust. Candidate set is small per
     // (client, domain, action) so this is fine.
-    let candidates: Vec<(String, Vec<u8>)> = sqlx::query_as(
-        "SELECT a.id, a.pattern_enc
+    let candidates: Vec<(String, Vec<u8>, Option<String>, Option<i32>, Option<i32>, i32, Option<NaiveDateTime>)> = sqlx::query_as(
+        "SELECT a.id, a.pattern_enc, a.schedule, a.rate_max, a.rate_period_secs, a.rate_count, a.rate_window_start
          FROM blackbook_acl a
          WHERE a.domain_id = $1
            AND (
@@ -257,14 +257,20 @@ pub async fn acl_check(
     )
     .bind(domain_id).bind(&client.id).bind(action_bit(action))
     .fetch_all(db).await?;
-    for (id, pattern_enc) in candidates {
+    for (id, pattern_enc, schedule, rate_max, rate_period, rate_count, rate_window) in candidates {
         let pattern = match crate::blackbook_core::aead_open(&pattern_enc, metadata_enc_key) {
             Ok(b) => match String::from_utf8(b) { Ok(s) => s, Err(_) => continue },
             Err(_) => continue,
         };
-        if sql_like_match(&pattern, resource_name) {
-            return Ok(AclDecision::Allowed(id));
+        if !sql_like_match(&pattern, resource_name) { continue; }
+        let now = Utc::now().naive_utc();
+        // Cron-style allowed-access window. A malformed schedule fails closed.
+        if let Some(sched) = &schedule {
+            if !cron_window_matches(sched, &now).unwrap_or(false) { continue; }
         }
+        // Per-rule fixed-window rate limit.
+        if !rate_ok(rate_max, rate_period, rate_count, rate_window, now) { continue; }
+        return Ok(AclDecision::Allowed(id));
     }
     Ok(AclDecision::Denied)
 }
@@ -303,13 +309,91 @@ pub fn sql_like_match(pattern: &str, text: &str) -> bool {
     j == p.len()
 }
 
-/// Best-effort: bump the ACL row's `use_count` after a successful action.
+/// Whether `now` falls inside the access window described by a 5-field cron
+/// expression (`minute hour day-of-month month day-of-week`), interpreted as a
+/// **mask**: access is permitted whenever each field of `now` is a member of the
+/// corresponding field's allowed set. So `* 9-17 * * 1-5` = weekdays 09:00–17:59.
+/// Supports `*`, `a`, `a-b`, lists `a,b,c`, and steps `*/n` / `a-b/n`. Day-of-week
+/// is Sunday=0 (7 also accepted as Sunday). A malformed expression returns an
+/// error (the caller treats it as "deny", failing closed).
+pub fn cron_window_matches(expr: &str, now: &NaiveDateTime) -> Result<bool, String> {
+    use chrono::{Datelike, Timelike};
+    let f: Vec<&str> = expr.split_whitespace().collect();
+    if f.len() != 5 {
+        return Err(format!("cron schedule must have 5 fields, got {}", f.len()));
+    }
+    let dow = now.weekday().num_days_from_sunday(); // 0=Sun..6=Sat
+    Ok(cron_field(f[0], now.minute(), 0, 59)?
+        && cron_field(f[1], now.hour(), 0, 23)?
+        && cron_field(f[2], now.day(), 1, 31)?
+        && cron_field(f[3], now.month(), 1, 12)?
+        && (cron_field(f[4], dow, 0, 6)? || (dow == 0 && cron_field(f[4], 7, 0, 7)?)))
+}
+
+fn cron_field(field: &str, val: u32, min: u32, max: u32) -> Result<bool, String> {
+    for term in field.split(',') {
+        let (range, step) = match term.split_once('/') {
+            Some((r, s)) => (r, s.parse::<u32>().map_err(|_| format!("bad step '{s}'"))?),
+            None => (term, 1),
+        };
+        if step == 0 { return Err("step may not be 0".into()); }
+        let (lo, hi) = if range == "*" {
+            (min, max)
+        } else if let Some((a, b)) = range.split_once('-') {
+            (a.parse().map_err(|_| format!("bad range '{range}'"))?,
+             b.parse().map_err(|_| format!("bad range '{range}'"))?)
+        } else {
+            let v: u32 = range.parse().map_err(|_| format!("bad value '{range}'"))?;
+            (v, v)
+        };
+        if val >= lo && val <= hi && (val - lo) % step == 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Fixed-window rate check: given a rule's limit and current window state, is
+/// another access allowed *now*? `None` for `max`/`period` means "no limit".
+pub fn rate_ok(
+    rate_max: Option<i32>, rate_period_secs: Option<i32>,
+    rate_count: i32, window_start: Option<NaiveDateTime>, now: NaiveDateTime,
+) -> bool {
+    let (Some(max), Some(period)) = (rate_max, rate_period_secs) else { return true };
+    if max <= 0 || period <= 0 { return true; }
+    match window_start {
+        // No window yet, or the current window has fully elapsed → fresh budget.
+        None => true,
+        Some(ws) => {
+            if now.signed_duration_since(ws) >= Duration::seconds(period as i64) {
+                true
+            } else {
+                rate_count < max
+            }
+        }
+    }
+}
+
+/// Best-effort: bump the ACL row's `use_count` after a successful action, and
+/// advance the fixed-window rate counter (rolling the window if it elapsed).
 pub async fn acl_record_use(db: &PgPool, decision: &AclDecision) {
     if let AclDecision::Allowed(id) = decision {
         if let Err(e) = sqlx::query(
-            "UPDATE blackbook_acl SET use_count = use_count + 1 WHERE id = $1",
+            "UPDATE blackbook_acl SET
+               use_count = use_count + 1,
+               rate_window_start = CASE
+                 WHEN rate_period_secs IS NULL THEN rate_window_start
+                 WHEN rate_window_start IS NULL
+                   OR rate_window_start + (rate_period_secs * INTERVAL '1 second') <= CURRENT_TIMESTAMP
+                 THEN CURRENT_TIMESTAMP ELSE rate_window_start END,
+               rate_count = CASE
+                 WHEN rate_period_secs IS NULL THEN rate_count
+                 WHEN rate_window_start IS NULL
+                   OR rate_window_start + (rate_period_secs * INTERVAL '1 second') <= CURRENT_TIMESTAMP
+                 THEN 1 ELSE rate_count + 1 END
+             WHERE id = $1",
         ).bind(id).execute(db).await {
-            log::warn!("ACL use_count bump failed for {id}: {e}");
+            log::warn!("ACL use_count/rate bump failed for {id}: {e}");
         }
     }
 }
@@ -566,6 +650,8 @@ pub async fn bootstrap_admin_if_needed(
     .bind(&cert.fingerprint)
     .execute(db)
     .await?;
+    // The admin gets a private user domain too, like any other client.
+    let _ = ensure_user_domain(db, metadata_enc_key, name_index_key, &id, "admin").await?;
     Ok(Some((token, cert)))
 }
 
@@ -579,6 +665,61 @@ pub enum AuthOpError {
     Crypto(#[from] crate::blackbook_core::CryptoError),
     #[error("totp: {0}")]
     Totp(String),
+    #[error("{0}")]
+    Invalid(String),
+}
+
+/// Prefix marking a private, per-client "user domain". Reserved: regular
+/// domain names must not start with it. Each client gets `~<name>` as a private
+/// namespace they fully administer.
+pub const USER_DOMAIN_PREFIX: &str = "~";
+
+/// The user-domain name for a client.
+pub fn user_domain_name(client_name: &str) -> String {
+    format!("{USER_DOMAIN_PREFIX}{client_name}")
+}
+
+/// Create the client's private user domain (`~<name>`) if absent and make the
+/// client its in-domain admin, so it has full features there. Idempotent.
+/// Returns the user-domain name. Shared by `create_client` and the admin
+/// bootstrap so every identity gets one consistently.
+pub async fn ensure_user_domain(
+    db: &PgPool, metadata_enc_key: &[u8], name_index_key: &[u8],
+    client_id: &str, client_name: &str,
+) -> Result<String, AuthOpError> {
+    let dname = user_domain_name(client_name);
+    let name_id = crate::server::domain_name_id_hex(name_index_key, &dname);
+    // Find or create the domain.
+    let existing: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM blackbook_domains WHERE name_id = $1 AND archived_at IS NULL",
+    ).bind(&name_id).fetch_optional(db).await?;
+    let domain_id = match existing {
+        Some((id,)) => id,
+        None => {
+            let id = Id::new(12).encode();
+            let name_enc = crate::blackbook_core::aead_seal(dname.as_bytes(), metadata_enc_key)
+                .map_err(AuthOpError::Crypto)?;
+            let desc_enc = crate::blackbook_core::aead_seal(
+                format!("Private user domain for {client_name}").as_bytes(), metadata_enc_key)
+                .map_err(AuthOpError::Crypto)?;
+            sqlx::query(
+                "INSERT INTO blackbook_domains (id, name_enc, name_id, description_enc)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (name_id) DO NOTHING",
+            ).bind(&id).bind(&name_enc).bind(&name_id).bind(&desc_enc)
+            .execute(db).await?;
+            // Re-read in case a concurrent create won the ON CONFLICT race.
+            let (id,): (String,) = sqlx::query_as(
+                "SELECT id FROM blackbook_domains WHERE name_id = $1",
+            ).bind(&name_id).fetch_one(db).await?;
+            id
+        }
+    };
+    // Make the client an admin of its own domain (full features).
+    sqlx::query(
+        "INSERT INTO blackbook_domain_members (domain_id, client_id, role)
+         VALUES ($1, $2, 'admin') ON CONFLICT (domain_id, client_id) DO UPDATE SET role = 'admin'",
+    ).bind(&domain_id).bind(client_id).execute(db).await?;
+    Ok(dname)
 }
 
 pub async fn create_client(
@@ -590,6 +731,11 @@ pub async fn create_client(
     role: &str,
     ttl_days: Option<i64>,
 ) -> Result<NewClient, AuthOpError> {
+    // Reserve the user-domain prefix so a client can't shadow the namespace.
+    if name.starts_with(USER_DOMAIN_PREFIX) {
+        return Err(AuthOpError::Invalid(format!(
+            "client name may not start with '{USER_DOMAIN_PREFIX}' (reserved for private user domains)")));
+    }
     let token = generate_token();
     let token_hash = hash_token(&token);
     let id = Id::new(16).encode();
@@ -628,12 +774,16 @@ pub async fn create_client(
         ).bind(&domain_id).bind(&id).execute(db).await;
     }
 
+    // Give the client its own private, fully-administered user domain (`~name`).
+    let user_domain = ensure_user_domain(db, metadata_enc_key, name_index_key, &id, name).await?;
+
     Ok(NewClient {
         id, name: name.to_string(), role: role.to_string(),
         token,
         cert_pem: cert.cert_pem,
         key_pem: cert.key_pem,
         expires_at: expires_dt.to_rfc3339(),
+        user_domain,
     })
 }
 
@@ -674,6 +824,7 @@ pub async fn rotate_client(
     .await?;
 
     Ok(Some(NewClient {
+        user_domain: user_domain_name(&name),
         id, name: name.to_string(), role,
         token,
         cert_pem: cert.cert_pem,
@@ -798,11 +949,62 @@ pub struct NewClient {
     pub cert_pem: String,
     pub key_pem: String,
     pub expires_at: String,
+    /// The client's private user domain (`~<name>`), which it fully administers.
+    #[serde(default)]
+    pub user_domain: String,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ResourceFlags, compute_audit_hash, sql_like_match};
+    use super::{ResourceFlags, compute_audit_hash, sql_like_match, cron_window_matches, rate_ok};
+    use chrono::{NaiveDate, NaiveDateTime};
+
+    fn dt(s: &str) -> NaiveDateTime {
+        NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()
+    }
+
+    #[test]
+    fn cron_business_hours_window() {
+        // "* 9-17 * * 1-5" = weekdays 09:00–17:59.
+        let sched = "* 9-17 * * 1-5";
+        assert!(cron_window_matches(sched, &dt("2026-06-19 10:30:00")).unwrap());  // Fri 10:30
+        assert!(cron_window_matches(sched, &dt("2026-06-19 17:59:00")).unwrap());  // Fri 17:59
+        assert!(!cron_window_matches(sched, &dt("2026-06-19 18:00:00")).unwrap()); // Fri 18:00 (out)
+        assert!(!cron_window_matches(sched, &dt("2026-06-19 08:59:00")).unwrap()); // Fri 08:59 (out)
+        assert!(!cron_window_matches(sched, &dt("2026-06-20 10:30:00")).unwrap()); // Sat (out)
+    }
+
+    #[test]
+    fn cron_steps_lists_and_sunday() {
+        assert!(cron_window_matches("*/15 * * * *", &dt("2026-06-19 10:30:00")).unwrap()); // 30 % 15 == 0
+        assert!(!cron_window_matches("*/15 * * * *", &dt("2026-06-19 10:31:00")).unwrap());
+        assert!(cron_window_matches("0 0 1,15 * *", &dt("2026-06-15 00:00:00")).unwrap()); // 15th midnight
+        // Sunday accepted as both 0 and 7.
+        assert!(cron_window_matches("* * * * 0", &dt("2026-06-21 12:00:00")).unwrap()); // Sun
+        assert!(cron_window_matches("* * * * 7", &dt("2026-06-21 12:00:00")).unwrap());
+    }
+
+    #[test]
+    fn cron_malformed_is_error() {
+        assert!(cron_window_matches("only four fields here", &dt("2026-06-19 10:00:00")).is_err());
+        assert!(cron_window_matches("* * * * *", &dt("2026-06-19 10:00:00")).unwrap()); // always
+    }
+
+    #[test]
+    fn rate_fixed_window() {
+        let now = dt("2026-06-19 12:00:00");
+        // No limit configured.
+        assert!(rate_ok(None, None, 999, Some(now), now));
+        // 5 per 60s: within budget.
+        assert!(rate_ok(Some(5), Some(60), 4, Some(now), now));
+        // At the cap inside the window → denied.
+        assert!(!rate_ok(Some(5), Some(60), 5, Some(now), now));
+        // At the cap but the window has elapsed → fresh budget.
+        let later = now + chrono::Duration::seconds(61);
+        assert!(rate_ok(Some(5), Some(60), 5, Some(now), later));
+        // No window yet → allowed.
+        assert!(rate_ok(Some(1), Some(60), 0, None, now));
+    }
 
     #[test]
     fn glob_basic_semantics() {

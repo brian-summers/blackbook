@@ -13,9 +13,8 @@
 //! than RSA, smaller than RSA, mature in every TLS 1.3 stack.
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
-    SanType,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 use sha3::{Digest, Sha3_256};
 use std::sync::Arc;
@@ -31,7 +30,7 @@ pub const ADMIN_CLIENT_TTL_DAYS: i64 = 365;
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
     #[error("rcgen: {0}")]
-    Rcgen(#[from] rcgen::RcgenError),
+    Rcgen(#[from] rcgen::Error),
     #[error("invalid PEM: {0}")]
     Pem(String),
 }
@@ -40,71 +39,57 @@ pub type Result<T> = std::result::Result<T, TlsError>;
 
 /// A CA usable for issuing new leaf certs.
 pub struct Ca {
-    /// The CA's signing Certificate object — used as the "signer" argument to
-    /// rcgen's `serialize_pem_with_signer`.
-    pub cert: Certificate,
+    /// The signing material (CA DN + key-usages + private key) used to sign
+    /// leaf certs via rcgen 0.14's `CertificateParams::signed_by`.
+    issuer: Issuer<'static, KeyPair>,
     /// PEM that goes to clients so they can verify the server's cert chain.
     pub cert_pem: String,
     /// PEM of the CA's private key. Stays on the server.
     pub key_pem: String,
 }
 
+/// The CA's certificate parameters (DN, CA constraint, key-usages, validity).
+/// Shared by `generate` (which self-signs them) and `from_pem` (which rebuilds
+/// the same issuer DN so the chain keeps validating).
+fn ca_params() -> Result<CertificateParams> {
+    let mut params = CertificateParams::new(Vec::<String>::new())?;
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "Blackbook Root CA");
+    dn.push(DnType::OrganizationName, "Blackbook");
+    params.distinguished_name = dn;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let (nb, na) = lifetime(CA_LIFETIME_DAYS);
+    params.not_before = nb;
+    params.not_after = na;
+    Ok(params)
+}
+
 impl Ca {
     /// Generate a brand-new self-signed CA.
     pub fn generate() -> Result<Self> {
-        let mut params = CertificateParams::new(vec!["Blackbook Root CA".to_string()]);
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "Blackbook Root CA");
-        dn.push(DnType::OrganizationName, "Blackbook");
-        params.distinguished_name = dn;
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.alg = &PKCS_ECDSA_P256_SHA256;
-        params.key_usages = vec![
-            KeyUsagePurpose::KeyCertSign,
-            KeyUsagePurpose::CrlSign,
-            KeyUsagePurpose::DigitalSignature,
-        ];
-        let (nb, na) = lifetime(CA_LIFETIME_DAYS);
-        params.not_before = nb;
-        params.not_after = na;
-
-        let cert = Certificate::from_params(params)?;
-        let cert_pem = cert.serialize_pem()?;
-        let key_pem = cert.serialize_private_key_pem();
-        Ok(Self { cert, cert_pem, key_pem })
+        let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+        let params = ca_params()?;
+        let cert = params.self_signed(&key_pair)?;
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+        let issuer = Issuer::new(params, key_pair);
+        Ok(Self { issuer, cert_pem, key_pem })
     }
 
-    /// Reconstruct an in-memory CA from saved PEMs so we can keep issuing
-    /// child certs after a restart.
-    ///
-    /// rcgen 0.12 doesn't have a `from_ca_cert_pem` constructor, so we
-    /// rebuild `CertificateParams` with the same DN we always use and load
-    /// the saved key pair. The resulting `Certificate` is only used as a
-    /// signer (`serialize_pem_with_signer`); we never serialize the CA's
-    /// own PEM again — that stays as the bytes from disk so clients keep
-    /// validating against the same trust anchor.
+    /// Reconstruct an in-memory CA from saved PEMs so we can keep issuing child
+    /// certs after a restart. We rebuild the issuer from the same DN/key-usages
+    /// we always use plus the saved key pair; the stored `cert_pem` bytes stay
+    /// the trust anchor clients validate against.
     pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self> {
         let key_pair = KeyPair::from_pem(key_pem)?;
-        let mut params = CertificateParams::new(vec!["Blackbook Root CA".to_string()]);
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "Blackbook Root CA");
-        dn.push(DnType::OrganizationName, "Blackbook");
-        params.distinguished_name = dn;
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        params.alg = &PKCS_ECDSA_P256_SHA256;
-        params.key_usages = vec![
-            KeyUsagePurpose::KeyCertSign,
-            KeyUsagePurpose::CrlSign,
-            KeyUsagePurpose::DigitalSignature,
-        ];
-        let (nb, na) = lifetime(CA_LIFETIME_DAYS);
-        params.not_before = nb;
-        params.not_after = na;
-        params.key_pair = Some(key_pair);
-
-        let cert = Certificate::from_params(params)?;
+        let issuer = Issuer::new(ca_params()?, key_pair);
         Ok(Self {
-            cert,
+            issuer,
             cert_pem: cert_pem.to_string(),
             key_pem: key_pem.to_string(),
         })
@@ -124,33 +109,23 @@ pub struct CertBundle {
 /// Issue a server certificate signed by the CA, with the given SANs (host
 /// names / IPs that clients will try to connect to).
 pub fn issue_server_cert(ca: &Ca, sans: &[String]) -> Result<CertBundle> {
-    let san_entries: Vec<SanType> = sans
-        .iter()
-        .map(|s| {
-            if let Ok(ip) = s.parse::<std::net::IpAddr>() {
-                SanType::IpAddress(ip)
-            } else {
-                SanType::DnsName(s.clone())
-            }
-        })
-        .collect();
-    let mut params = CertificateParams::new(sans.to_vec());
-    params.subject_alt_names = san_entries;
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+    // rcgen 0.14's `new` parses each SAN string into IpAddress / DnsName for us.
+    let mut params = CertificateParams::new(sans.to_vec())?;
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, sans.first().cloned().unwrap_or_else(|| "blackbook-server".into()));
     dn.push(DnType::OrganizationName, "Blackbook");
     params.distinguished_name = dn;
     params.is_ca = IsCa::NoCa;
-    params.alg = &PKCS_ECDSA_P256_SHA256;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let (nb, na) = lifetime(SERVER_LIFETIME_DAYS);
     params.not_before = nb;
     params.not_after = na;
 
-    let cert = Certificate::from_params(params)?;
-    let cert_pem = cert.serialize_pem_with_signer(&ca.cert)?;
-    let key_pem = cert.serialize_private_key_pem();
+    let cert = params.signed_by(&key_pair, &ca.issuer)?;
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
     let fingerprint = fingerprint_pem(&cert_pem)?;
     Ok(CertBundle { cert_pem, key_pem, fingerprint })
 }
@@ -158,22 +133,22 @@ pub fn issue_server_cert(ca: &Ca, sans: &[String]) -> Result<CertBundle> {
 /// Issue a client certificate. CN encodes the client name; later the server's
 /// mTLS handshake reads that CN out of the peer cert and uses it as identity.
 pub fn issue_client_cert(ca: &Ca, client_name: &str, ttl_days: i64) -> Result<CertBundle> {
-    let mut params = CertificateParams::new(vec![]);
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+    let mut params = CertificateParams::new(Vec::<String>::new())?;
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, client_name);
     dn.push(DnType::OrganizationName, "Blackbook");
     params.distinguished_name = dn;
     params.is_ca = IsCa::NoCa;
-    params.alg = &PKCS_ECDSA_P256_SHA256;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let (nb, na) = lifetime(ttl_days);
     params.not_before = nb;
     params.not_after = na;
 
-    let cert = Certificate::from_params(params)?;
-    let cert_pem = cert.serialize_pem_with_signer(&ca.cert)?;
-    let key_pem = cert.serialize_private_key_pem();
+    let cert = params.signed_by(&key_pair, &ca.issuer)?;
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
     let fingerprint = fingerprint_pem(&cert_pem)?;
     Ok(CertBundle { cert_pem, key_pem, fingerprint })
 }

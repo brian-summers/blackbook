@@ -21,6 +21,24 @@ target/
 dist/
 build/
 
+# Secrets — provided at RUNTIME via volume mounts / docker secrets, never baked
+# into an image layer (master keyfile, Postgres CA + server/client keys).
+secrets/
+
+# Issued credential bundles carry a LIVE bearer token + client private key.
+# `COPY . .` would otherwise pull them into the builder layer — exclude them.
+admin*
+*-bundle.json
+user*.json
+
+# Agent/tooling state — never needed to build.
+mempalace.yaml
+entities.json
+_archive/
+
+# Agent/session state
+.claude/
+
 # Documentation
 *.md
 docs/

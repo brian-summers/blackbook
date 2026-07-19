@@ -12,23 +12,72 @@ services:
     # UID via `user:` breaks data-dir permissions on a fresh volume.
     
     environment:
-      # Dynamic admin password - MUST be changed in production
-      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD:-default_password_changeme}
+      # Superuser — reserved for init / break-glass, NOT used by the app.
+      # Dev defaults; override via ./.env (copy config/blackbook.env). Production
+      # passwords: `openssl rand -base64 32`.
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD:-blackbook_dev_admin_change_me}
       POSTGRES_USER: ${DB_ADMIN_USER:-blackbook_admin}
       POSTGRES_DB: ${DB_NAME:-blackbook}
-    
-    
+      # Least-privilege application role created by the init hook and used by the
+      # app at runtime (see scripts/01-blackbook-roles.sh).
+      DB_USER: ${DB_USER:-blackbook_app}
+      DB_PASSWORD: ${DB_PASSWORD:-blackbook_dev_app_change_me}
+      # Optional read-only backup role (created only if a password is given).
+      BACKUP_PASSWORD: ${BACKUP_PASSWORD:-}
+
+    # Install TLS certs with postgres-owned strict perms (bind-mounted certs keep
+    # the host owner, which Postgres rejects), then hand off to the stock
+    # entrypoint. Invoked via bash so an exec bit isn't required on the mount.
+    entrypoint: ["bash", "/usr/local/bin/blackbook-postgres-entrypoint.sh"]
+    # Actually load our hardened config (previously postgres.conf was mounted but
+    # never loaded — Postgres used its built-in defaults).
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+
     volumes:
-      # Database data persistence
+      # Database data persistence (Docker-managed volume — not on the drive).
       - blackbook_db_data:/var/lib/postgresql/data
-      # PostgreSQL configuration for secure defaults
-      - ./config/postgres.conf:/etc/postgresql/postgresql.conf:ro
-      # Init script disabled — it uses psql :'var' substitutions that
-      # docker-entrypoint-initdb.d does not pass through, and it references
-      # roles/passwords the entrypoint does not set. Re-enable once the
-      # script is rewritten as a .sh wrapper that calls psql -v.
-      # - ./scripts/01-init-postgres.sql:/docker-entrypoint-initdb.d/01-init-postgres.sql:ro
-    
+      # Hardened server config + auth rules (loaded via the command above).
+      #
+      # All binds below use long-form `create_host_path: false`. Their sources
+      # live in the project dir on the removable drive; if the drive is detached
+      # when dockerd tries to start this container, Docker must ERROR instead of
+      # its default behavior of mkdir -p-ing (as root) the missing source paths,
+      # which forges root-owned ghost dirs on the /run tmpfs and breaks the
+      # drive's automount.
+      - type: bind
+        source: ./config/postgres.conf
+        target: /etc/postgresql/postgresql.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config/pg_hba.conf
+        target: /etc/postgresql/pg_hba.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      # One-time least-privilege role bootstrap (runs on a fresh data volume).
+      - type: bind
+        source: ./scripts/01-blackbook-roles.sh
+        target: /docker-entrypoint-initdb.d/01-blackbook-roles.sh
+        read_only: true
+        bind:
+          create_host_path: false
+      # Root entrypoint wrapper + read-only TLS material (generate first with
+      # ./scripts/generate-postgres-certs.sh).
+      - type: bind
+        source: ./scripts/postgres-entrypoint.sh
+        target: /usr/local/bin/blackbook-postgres-entrypoint.sh
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/postgres
+        target: /etc/postgresql/certs-src
+        read_only: true
+        bind:
+          create_host_path: false
+
     # Network configuration - only accessible from within Docker network
     networks:
       - blackbook_network
@@ -51,8 +100,12 @@ services:
       retries: 5
       start_period: 10s
     
-    # Restart policy
-    restart: unless-stopped
+    # Restart policy. Deliberately NOT `unless-stopped`/`always`: those make
+    # dockerd auto-start this container at every boot — including when the USB
+    # drive is detached — which is precisely what triggers the ghost-path
+    # forging. `on-failure` restarts after an in-session crash but is NOT
+    # auto-started by the daemon at startup.
+    restart: on-failure
     
     logging:
       driver: "json-file"
@@ -80,10 +133,22 @@ services:
     # Drop unnecessary Linux capabilities for security
     cap_drop:
       - ALL
-    # Only keep capabilities needed for network operations
+    # Only keep what we need: bind a privileged port, and lock secret pages
+    # into RAM (IPC_LOCK) so the in-memory master key can't be paged to swap.
     cap_add:
       - NET_BIND_SERVICE
-    
+      - IPC_LOCK
+
+    # Raise the locked-memory limit so the server's `mlockall()` (in
+    # harden_process) succeeds — the default RLIMIT_MEMLOCK is far too small to
+    # cover the resident set, so without this mlockall fails and secret pages
+    # remain swappable. -1 = unlimited; locked pages still count against the
+    # 512M cgroup limit below, which is ample for this service.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
     # Run the API server. HTTPS + mTLS are mandatory — the server auto-mints
     # its own CA and server cert into the persistent volume on first boot.
     command:
@@ -92,7 +157,11 @@ services:
       - 0.0.0.0:8443
 
     environment:
-      DATABASE_URL: postgresql://${DB_ADMIN_USER:-blackbook_admin}:${DB_ADMIN_PASSWORD:-default_password_changeme}@postgres:5432/${DB_NAME:-blackbook}
+      # Connect as the least-privilege application role over mutual TLS: the app
+      # verifies Postgres against its CA (sslmode=verify-full) AND presents its
+      # own client certificate (sslcert/sslkey), so both ends are authenticated
+      # on top of the SCRAM password. The superuser is NOT used.
+      DATABASE_URL: "postgresql://${DB_USER:-blackbook_app}:${DB_PASSWORD:-blackbook_dev_app_change_me}@postgres:5432/${DB_NAME:-blackbook}?sslmode=verify-full&sslrootcert=/opt/blackbook/certs/pg-ca.crt&sslcert=/opt/blackbook/certs/pg-client.crt&sslkey=/opt/blackbook/certs/pg-client.key"
 
       RUST_LOG: ${RUST_LOG:-info}
       RUST_BACKTRACE: 1
@@ -105,20 +174,60 @@ services:
       # localhost / 127.0.0.1 / blackbook / blackbook-app.
       BLACKBOOK_SERVER_SANS: ${BLACKBOOK_SERVER_SANS:-localhost,127.0.0.1,blackbook,blackbook-app}
 
-      # Optional: seal the DEK with a passphrase (>=16 chars). When unset,
-      # the DEK is auto-generated and kept raw on the data volume.
-      # BLACKBOOK_MASTER_PASSPHRASE: "set-me-in-production-at-least-16-chars"
-    
+      # Master-DEK provider (REQUIRED — the server refuses to start without one).
+      # The outermost key is never stored raw on disk; it is produced at boot
+      # from one of these and only a salt / wrapped-blob is persisted.
+      #
+      # Default below: a *keyfile* provider. A random DEK is generated once and
+      # stored on the data volume only in wrapped form; the keyfile that unwraps
+      # it is delivered as a Docker secret on a tmpfs mount (/run/secrets), i.e.
+      # OFF the persistent data volume. Generate it once before first boot:
+      #     mkdir -p secrets && openssl rand 32 > secrets/master_keyfile
+      BLACKBOOK_MASTER_KEYFILE: /run/secrets/bbk_master_keyfile
+      #
+      # Alternative: a user passphrase instead of a keyfile (comment out the
+      # keyfile line above). Prefer the _FILE form so it isn't in the process
+      # environment; >=16 chars.
+      #   BLACKBOOK_MASTER_PASSPHRASE_FILE: /run/secrets/bbk_master_passphrase
+
+    # The keyfile/passphrase secret — mounted read-only at /run/secrets/<name>
+    # (tmpfs), never written to the persistent volume.
+    secrets:
+      - bbk_master_keyfile
+
     ports:
       # HTTPS API endpoint - available locally
       - "127.0.0.1:8443:8443"
     
     volumes:
-      # Master key, DEK, CA + server cert, admin bundle.
+      # Master key (wrapped), CA + server cert, admin bundle (Docker-managed
+      # volume — not on the drive).
       - blackbook_data:/opt/blackbook/data
-      # Configuration files
-      - ./config/blackbook.env:/opt/blackbook/config/.env:ro
-    
+      # Postgres CA (public) + the app's own client cert/key for mutual TLS.
+      # The key is owned by the host operator (uid 1000) — the same uid the
+      # blackbook container runs as — so the read-only mount is readable.
+      # create_host_path: false — sources are on the removable drive; error out
+      # instead of forging root-owned ghost dirs on the /run tmpfs when it's
+      # detached (which breaks the drive's automount).
+      - type: bind
+        source: ./secrets/postgres/ca.crt
+        target: /opt/blackbook/certs/pg-ca.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/postgres/client.crt
+        target: /opt/blackbook/certs/pg-client.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets/postgres/client.key
+        target: /opt/blackbook/certs/pg-client.key
+        read_only: true
+        bind:
+          create_host_path: false
+
     # Network configuration - connected to blackbook network
     networks:
       - blackbook_network
@@ -146,8 +255,12 @@ services:
       retries: 3
       start_period: 10s
     
-    # Restart policy
-    restart: unless-stopped
+    # Restart policy. Deliberately NOT `unless-stopped`/`always`: those make
+    # dockerd auto-start this container at every boot — including when the USB
+    # drive is detached — which is precisely what triggers the ghost-path
+    # forging. `on-failure` restarts after an in-session crash but is NOT
+    # auto-started by the daemon at startup.
+    restart: on-failure
     
     # Read-only filesystem for security (except necessary volumes)
     read_only: true
@@ -175,6 +288,17 @@ networks:
       com.docker.network.bridge.enable_icc: "true"  # Inter-container communication enabled
       com.docker.network.bridge.enable_ip_masquerade: "true"
 
+# Master-key secret. Lives on the host (outside the data volume) and is mounted
+# into the container on a tmpfs at /run/secrets — so a copy of the data volume
+# alone cannot unwrap the DEK. Generate it once before first `up`:
+#     mkdir -p secrets && openssl rand 32 > secrets/master_keyfile && chmod 600 secrets/master_keyfile
+# Keep it OUT of version control (add `secrets/` to .gitignore) and back it up
+# separately from the data volume — losing it makes the data unrecoverable.
+secrets:
+  bbk_master_keyfile:
+    file: ./secrets/master_keyfile
+    # For Swarm / external KMS instead of a local file, use:  external: true
+
 # Define volumes for data persistence.
 volumes:
   blackbook_db_data:
@@ -185,6 +309,6 @@ volumes:
   blackbook_data:
     driver: local
     labels:
-      description: "Master key, DEK, CA, server cert, and admin bundle for Blackbook"
+      description: "Master key (wrapped), CA, server cert, and admin bundle for Blackbook"
       security: "critical"
       backup: "true"

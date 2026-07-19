@@ -25,10 +25,21 @@ A secrets engine you run as a Docker container and drive from a CLI. Holds strin
 ## Quick start
 
 ```powershell
+# One-time: create the master keyfile that protects the DEK. It stays OFF the
+# data volume (mounted as a Docker secret) — without it the wrapped DEK can't be
+# opened, so back it up separately. The server refuses to start without a
+# provider (this keyfile, or BLACKBOOK_MASTER_PASSPHRASE).
+mkdir secrets; openssl rand 32 > secrets/master_keyfile
+
+# One-time: generate the TLS material for the server↔Postgres channel. The app
+# connects to Postgres over TLS 1.3 and verifies it against this CA.
+./scripts/generate-postgres-certs.sh
+
 docker compose up -d
 
 # First start writes a complete admin bundle (server + token + cert + key + ca)
-# to the data volume. Grab it; the token is also echoed once at WARN level.
+# to the data volume. Grab it (the bundle file is the only place the token
+# appears — it is NOT logged).
 docker cp blackbook-app:/opt/blackbook/data/admin-bundle.json .
 
 # Build & install the CLI on the host (requires perl on Windows for openssl-sys).
@@ -64,6 +75,118 @@ blackbook profile ls                  # '*' marks the active profile
 blackbook put api-key sk_live_rotated --overwrite
 ```
 
+## Shell completion
+
+Tab-complete commands, flags, and local values (profiles, domains, resident
+files). Everything is computed locally from clap's command tree and `~/.bbk` —
+no network call, nothing sent to the server.
+
+```powershell
+# One-off for the current session:
+blackbook completions powershell | Out-String | Invoke-Expression
+
+# Persist it — add that line to your $PROFILE:
+Add-Content $PROFILE 'blackbook completions powershell | Out-String | Invoke-Expression'
+```
+
+```bash
+# bash / zsh / fish:
+source <(blackbook completions bash)
+source <(blackbook completions zsh)
+blackbook completions fish | source
+```
+
+Then e.g. `blackbook -P <Tab>` lists your profiles, `blackbook file get <Tab>`
+lists resident files on this machine, and `blackbook file put --<Tab>` lists
+every flag.
+
+## Web console 🕮
+
+A browser front-end that **is** the CLI. `blackbook web` serves one self-contained
+local page and runs your commands by re-invoking `blackbook` — so every command,
+flag, and future feature is inherited automatically, with no separate API to keep
+in sync. Dark by default, with command colorization, sidebar quick-actions, command
+history, and `Tab` completion (reusing the same `__complete` engine as the shell).
+
+```powershell
+blackbook web                      # → http://127.0.0.1:8088
+blackbook web --bind 127.0.0.1:9000
+```
+
+It runs as whoever launched it — the same trust level as a terminal — and drives
+your local profiles/agent exactly as the CLI does. Passphrases set in the page's
+🔑 dialog are kept only in the tab and passed to each command via environment
+variables (`$BLACKBOOK_PASSPHRASE` / `$BLACKBOOK_EXTERNAL_PASSPHRASE`), never on
+the command line. The long-running `server` and nested `web` commands are refused.
+Bind to loopback (the default) unless you intend to expose it.
+
+## Secure tunnels 🔌
+
+A tunnel is an **end-to-end-encrypted channel between two clients**, relayed by
+the blackbook server but unreadable to it. The server acts as a *trusted
+introducer*: it authenticates both ends over mTLS and tells each peer the
+other's client name + certificate fingerprint, then relays opaque frames. The
+two clients run an authenticated key exchange and prove identity to each other
+**using their existing client certificates** — so the server positively
+identifies the parties, yet cannot read or modify the inner traffic.
+
+How the four properties hold:
+
+- **End-to-end secured** — ephemeral **X25519** ECDH → HKDF-SHA256 → per-direction
+  **AES-256-GCM** with counter nonces. Forward secrecy; tamper and replay are
+  detected. The server never sees an ephemeral private key, so it can't derive
+  the session key.
+- **Server as trusted intermediary** — it pairs the two mTLS-authenticated
+  parties and vouches each peer's name + fingerprint while relaying frames.
+- **Positive mutual identification via existing credentials** — each side signs
+  the session (bound to both ephemeral keys + its own name/fingerprint) with its
+  **client-certificate private key** (ECDSA P-256). The peer verifies that
+  signature against the vouched fingerprint. The server holds no client private
+  key, so it cannot forge this — identity is cryptographic, not "the server says
+  so." A wrong key or a forged fingerprint is rejected at the handshake.
+- **Server can't decrypt or modify** — it only ever handles AEAD frames; GCM
+  catches any tampering.
+
+It carries arbitrary **TCP or UDP** via local port-forwarding (ssh -L style),
+multiplexing many streams over the one channel — no TUN device or admin rights.
+
+```powershell
+# On the machine that can reach the target service (e.g. bob's host):
+blackbook -P bob tunnel accept --from alice
+
+# On alice's machine: forward a local port to bob, who dials the target.
+blackbook -P alice tunnel forward bob --listen 127.0.0.1:5432 --to 10.0.0.5:5432
+#   → anything hitting 127.0.0.1:5432 is E2E-encrypted to bob, who connects to
+#     10.0.0.5:5432 and pipes it back. Add --udp for UDP.
+
+blackbook tunnel ls    # tunnels you offered or are the target of
+```
+
+The relay is ephemeral (in-memory; no DB row) and reuses the existing
+HTTPS+mTLS endpoint via a WebSocket upgrade — no new ports, privileges, or
+external VPN software.
+
+## User domains
+
+Every client gets a **private, fully-featured domain of its own** at creation,
+named `~<client>` (e.g. `~alice`). The client is the *admin* of this domain, so
+it has full features there — secrets, files, ACLs, K-of-N, the lot — without any
+admin having to grant anything. The `~` prefix is reserved: regular domain and
+client names can't start with it.
+
+On `login`, a fresh profile's **default domain is set to its user domain**, so
+commands land in your own private namespace with no `-D` needed. An explicit
+`domain use` always wins, and `-D` / `$BLACKBOOK_DOMAIN` override per command.
+Resolution order: `-D` → `$BLACKBOOK_DOMAIN` → saved `domain use` → user domain
+(from login) → `default`.
+
+```powershell
+blackbook whoami                 # shows e.g. "user domain: ~alice"
+blackbook put api-key sk_xxx     # lands in ~alice (no -D needed)
+blackbook -D default put k v     # opt out per-command; everyone still shares `default`
+blackbook domain use engineering # or switch your default elsewhere
+```
+
 ## Domains, ACLs, time + use bounds
 
 ```powershell
@@ -73,7 +196,7 @@ blackbook domain create engineering
 # Same name "api-key" can exist in two domains, isolated.
 blackbook --domain engineering put api-key sk_eng_only
 
-# Provision alice; she auto-joins `default`, then add to engineering as a user.
+# Provision alice; she auto-joins `default` AND gets her private `~alice` domain.
 blackbook client create alice --out alice.json
 blackbook domain add-member engineering alice
 
@@ -148,33 +271,52 @@ it can never decrypt. Decryption needs the client key factor *and* the
 server-held envelope (released only after the normal authorization gates), so
 neither side can recover the plaintext alone.
 
-**Two key modes**, chosen automatically:
+Client-side storage is the product of **two independent axes** — choose them
+separately:
 
-- **CMK (default, no passphrase).** With nothing extra specified, the data key
-  is wrapped under the profile's **Client Master Key** — the rotation-stable
-  key sealed inside your passphrase-encrypted profile (see *Encrypted-at-rest
-  credentials*). So your existing profile passphrase transitively protects
-  external data, with no second passphrase to manage. Because the CMK is
-  carried forward across re-logins, rotating your auth token/cert (`client
-  rotate`) never orphans CMK-sealed data.
-- **Passphrase (explicit).** Supply `--external-passphrase` /
-  `$BLACKBOOK_EXTERNAL_PASSPHRASE` and the data key is wrapped under
-  `Argon2id(passphrase, salt)` instead. Decoupled from the local profile, so
-  the item is portable to any machine that knows the passphrase.
+**Axis 1 — key source** (who holds the wrapping key):
+
+- **`--external-key` (`-e`) — managed.** The data key is wrapped under the
+  profile's **Client Master Key** — the rotation-stable key sealed inside your
+  passphrase-encrypted profile (see *Encrypted-at-rest credentials*). No second
+  passphrase to manage; your profile passphrase transitively protects the data.
+  The CMK is carried forward across re-logins, so `client rotate` never orphans
+  the data.
+- **`--external-passphrase` — user-supplied.** The data key is wrapped under
+  `Argon2id(passphrase, salt)` instead — decoupled from the profile, portable to
+  any machine that knows the passphrase. **Requested on every read** and never
+  cached: each access resolves it as flag → `$BLACKBOOK_EXTERNAL_PASSPHRASE` →
+  interactive no-echo prompt, so a bare `get` with nothing configured asks for
+  it rather than failing. (Managed-key items never prompt.)
+
+**Axis 2 — data location** (where the ciphertext lives):
+
+- **default — in blackbook.** The opaque envelope is stored server-side
+  (it still can't read it). Available for secrets *and* files.
+- **`--external-data` (`-E`, files only) — resident.** The ciphertext stays on
+  *this client*; the server keeps only a manifest + its half of a split key.
+  Mutual custody — neither side can decrypt alone. (A secret has no on-disk
+  home, so `--external-data` is rejected for secrets.)
+
+**`--external`** is the shorthand for both axes at once: managed key + resident
+data (for a secret, where residency doesn't apply, it means managed-key,
+data-in-blackbook). The legacy `--resident` is an alias for `--external-data`.
 
 ```powershell
-# Default: no passphrase needed — uses the profile's CMK.
-blackbook put --external my-secret some-secret-value
-blackbook get my-secret          # fetched + decrypted locally → some-secret-value
+# Secret, managed key (no passphrase), stored in blackbook:
+blackbook put --external-key my-secret some-secret-value      # [external-key/managed]
+blackbook get my-secret                                        # decrypts locally, no prompt
 
-# Explicit passphrase (portable, Argon2id):
-$env:BLACKBOOK_EXTERNAL_PASSPHRASE = "correct horse battery staple"
-blackbook put --external shared-secret value      # → [external/passphrase]
-blackbook get shared-secret                        # needs the same passphrase
+# Secret, user passphrase (portable, Argon2id):
+blackbook put --external-passphrase pp shared-secret value    # [external-key/passphrase]
+blackbook get shared-secret                                    # prompts for the passphrase
 
-# Files work the same way (the on-disk blob is the client's ciphertext):
-blackbook file put ./report.pdf --name report --external          # CMK by default
-blackbook file get report ./out.pdf
+# File, the four key×data quadrants:
+blackbook file put ./r.pdf -n r --external-key                 # managed key, in blackbook
+blackbook file put ./r.pdf -n r --external-passphrase pp       # user key,    in blackbook
+blackbook file put ./r.pdf -n r --external-data                # managed key, resident
+blackbook file put ./r.pdf -n r --external-data --external-passphrase pp  # user key, resident
+blackbook file get r ./out.pdf
 
 # External composes with every policy flag and K-of-N — the server still gates
 # release; the client still needs its key. e.g. burn-after-one-read:
@@ -321,15 +463,19 @@ subcommand, before or after it):
 |---|---|
 | `login BUNDLE [-s SERVER]` | Log in from a bundle JSON (`client create` output or first-run `admin-bundle.json`; `-` for stdin). Prompts for a passphrase (or reads `$BLACKBOOK_PASSPHRASE`) and saves an **encrypted** profile **named after the authenticated identity** (override with `-P`), then leaves it unlocked and active. `-s` overrides the bundle's server URL. The bundle carries the full credential set (server + token + cert + key + ca) — the server rejects anything less. |
 | `unlock [-t MINUTES]` / `lock` | Cache the active profile's derived unlock key in the local agent for `-t` minutes (default 15) so commands don't re-prompt / clear that cached key. Passphrase from `$BLACKBOOK_PASSPHRASE` or an interactive prompt. |
-| `logout`, `whoami` | Forget the active profile's session (also clears its cached unlock key) / inspect identity (`auth: mtls+token`). |
+| `passphrase [--old P] [--new P]` | Change the passphrase that encrypts the active profile. The credential bundle is re-sealed locally under the new passphrase; the embedded **client master key is preserved**, so every CMK-sealed external item still decrypts. Old/new come from flags → `$BLACKBOOK_OLD_PASSPHRASE`/`$BLACKBOOK_NEW_PASSPHRASE` → prompts. |
+| `completions [SHELL]` | Print a shell completion script (`powershell` (default) / `bash` / `zsh` / `fish`). Tab-completes commands, subcommands, and flags; also completes **real values** for `-P/--profile` (your profiles), `-D/--domain` (known domains), and `file get/rm` (resident files this machine holds). All local — no network, nothing sent to the server. |
+| `logout`, `whoami` | Forget the active profile's session (also clears its cached unlock key) / inspect identity (`auth: mtls+token`, and your private `user domain: ~<name>`). |
 | `profile ls` / `profile use NAME` / `profile show [NAME]` / `profile rm NAME [-y]` | List (active marked `*`) / switch the persisted default / inspect / delete a profile. |
-| `put NAME VALUE [-o/--overwrite] [-i/--no-overwrite] [-e/--external] [--external-passphrase P] [-M/--mfa-required] [-d/--delete-on-read] [-n/--max-reads N] [-r/--rotate-on-read] [-p/--preserve-on-cleanup] [-q/--quorum K -s/--signatories a,b,c]` | Store a secret with optional policy flags + threshold. Read-only by default (409 unless `-o`). `-i` immutable. `-e` encrypts client-side (server can't read it). With no passphrase, `-e` uses the profile's CMK (`[external/CMK]`); supplying `--external-passphrase`/`$BLACKBOOK_EXTERNAL_PASSPHRASE` switches to Argon2id (`[external/passphrase]`). |
+| `put NAME VALUE [-o/--overwrite] [-i/--no-overwrite] [-e/--external-key] [--external-passphrase P] [--external] [-M/--mfa-required] [-d/--delete-on-read] [-n/--max-reads N] [-r/--rotate-on-read] [-p/--preserve-on-cleanup] [-q/--quorum K -s/--signatories a,b,c]` | Store a secret with optional policy flags + threshold. Read-only by default (409 unless `-o`). `-i` immutable. Client-side encryption (server can't read it): `-e/--external-key` uses the profile's managed CMK (`[external-key/managed]`); `--external-passphrase`/`$BLACKBOOK_EXTERNAL_PASSPHRASE` uses an Argon2id user key (`[external-key/passphrase]`). `--external` is shorthand (= managed key for a secret). `--external-data` is files-only (a secret has no on-disk home) and errors with a clear message. |
 | `cleanup` | Admin only. Delete tombstoned **secrets and files** (`max_reads` hit, crypto/blob scrubbed) in the current domain. Resources flagged `preserve_on_cleanup` are kept. |
-| `get NAME [-r/--request-id ID] [-w/--wait] [--wait-timeout S] [--external-passphrase P]` | Read; if threshold-gated, returns 412 + request id on first call. Pass `-r` once K approvals are in, or `-w` to block (one call) until approved. External secrets are decrypted locally — CMK-sealed ones need no passphrase; passphrase-sealed ones need `--external-passphrase`/`$BLACKBOOK_EXTERNAL_PASSPHRASE`. |
+| `get NAME [-r/--request-id ID] [-w/--wait] [--wait-timeout S] [--external-passphrase P]` | Read; if threshold-gated, returns 412 + request id on first call. Pass `-r` once K approvals are in, or `-w` to block (one call) until approved. External secrets are decrypted locally — CMK-sealed ones need no passphrase; **passphrase-sealed ones request the passphrase on every read** (`--external-passphrase` → `$BLACKBOOK_EXTERNAL_PASSPHRASE` → interactive no-echo prompt). The passphrase is never cached, so each access re-requests it unless a flag/env supplies it. |
 | `ls`, `rm NAME [-y]` | List / delete secrets (max 500). `ls` shows each secret's **KIND** (`server` vs `external` client-side), **STATUS** (active / exhausted), and a **RULES** summary of enforced policy — e.g. `mfa, max-reads 2/5, immutable, quorum 2-of-3`. |
-| `file put PATH [-n/--name N] [-t/--mime M] [-o/--overwrite] [-i/--no-overwrite] [-e/--external] [-E/--resident] [-c/--server-copy] [--shred] [--external-passphrase P] [-M/--mfa-required] [-d/--delete-on-read] [-R/--max-reads N] [-r/--rotate-on-read] [-p/--preserve-on-cleanup] [-q/--quorum K -s/--signatories a,b,c]` | Upload a file (max 64 MiB). Same policy surface as `put`. `-e` external-key (ciphertext in blackbook, client holds the key). `-E` **resident** (ciphertext stays on this machine under `~/.bbk/resident`; blackbook holds a manifest + its half of a split key — mutual custody); `-c` also keeps an opaque server backup, `--shred` deletes the original plaintext. `-e`/`-E` mutually exclusive. Note `-R` for max-reads (`-r` is rotate-on-read). |
+| `rekey NAME [--old-external-passphrase P] [-e/--external-key] [--external-passphrase P]` | Change the client-side key on an external secret without changing its value: decrypt locally with the current key, re-encrypt under the new one (`-e` managed CMK, or `--external-passphrase` for a new user key), store back. Covers passphrase→passphrase, managed→passphrase, and passphrase→managed. Policy flags (MFA, max-reads, K-of-N…) are preserved. |
+| `file put PATH [-n/--name N] [-t/--mime M] [-o/--overwrite] [-i/--no-overwrite] [-e/--external-key] [--external-passphrase P] [-E/--external-data] [--external] [-c/--server-copy] [--shred] [-M/--mfa-required] [-d/--delete-on-read] [-R/--max-reads N] [-r/--rotate-on-read] [-p/--preserve-on-cleanup] [-q/--quorum K -s/--signatories a,b,c]` | Upload a file (max 64 MiB). Same policy surface as `put`, plus the two client-side axes. **Key:** `-e/--external-key` (managed CMK) or `--external-passphrase` (Argon2id user key). **Data:** default = ciphertext in blackbook; `-E/--external-data` (alias `--resident`) keeps it **resident** on this machine under `~/.bbk/resident` (server holds only a manifest + its half of a split key — mutual custody). `--external` = managed + resident. `-c/--server-copy` also keeps an opaque server backup; `--shred` deletes the original plaintext (both require `--external-data`). Note `-R` for max-reads (`-r` is rotate-on-read). |
 | `file get NAME [PATH\|-] [-r/--request-id ID] [-w/--wait] [--wait-timeout S] [--external-passphrase P]` / `file ls` / `file rm NAME [-y]` / `file rotate NAME` | Download (pass `-r` once a K-of-N file request is approved, or `-w` to block) / list / delete / DEK rotation. External-key and resident files decrypt locally; a resident `get` fetches the server's key half (gated) and recombines it with the local stash. `file ls` shows each file's **KIND** (`server` / `external-key` / `resident`, marked `(exhausted)` when tombstoned) and the same **RULES** summary as `ls`. |
-| `client create NAME [-r/--role admin\|user] [-t/--ttl-days N] [-o/--out PATH]` | Provision; new clients auto-join `default`. Role defaults to `user`. `--ttl-days` defaults to 30 for `user`, 365 for `admin`. |
+| `file rekey NAME [--old-external-passphrase P] [-e/--external-key] [--external-passphrase P]` | Change the client-side key on an external/resident file. For an **external-key** file: decrypt, re-wrap, re-upload the envelope. For a **resident** file: only the local stash's wrapped client-half is rewritten — the ciphertext and the server's key-half are untouched, so there's no re-upload (must run where the stash lives). |
+| `client create NAME [-r/--role admin\|user] [-t/--ttl-days N] [-o/--out PATH]` | Provision; new clients auto-join `default` **and get a private, fully-administered user domain `~NAME`** (which their next `login` adopts as the default domain). Names starting with `~` are rejected. Role defaults to `user`. `--ttl-days` defaults to 30 for `user`, 365 for `admin`. |
 | `client rotate NAME [-t/--ttl-days N] [-o/--out PATH]` | Reissue token+cert; the old ones stop working immediately. |
 | `client ls` / `client revoke NAME [-y]` | Admin. `revoke` prompts for confirmation unless `-y`/`--yes`. |
 | `acl grant SUBJECT PATTERN [-c/--create] [-r/--read] [-u/--update] [-d/--delete] [-D/--domain D] [-e/--expires-at TS] [-b/--not-before TS] [-x/--max-uses N]` | `SUBJECT` is a client name; prefix `@` for a group (domain members). The rule's domain comes from the global `-D/--domain` (default `default`). At least one action flag is required. **Global admin or an admin of that domain.** |
@@ -345,6 +491,8 @@ subcommand, before or after it):
 | `grants ls` / `grants rm ID [-y]` | List advance grants you issued or benefit from / revoke one (issuing signatory or admin). |
 | `audit [-n/--limit N]` / `audit -v/--verify` | Admin. `-v` recomputes the hash chain and reports the first tampered/deleted/reordered row (if any). |
 | `server [-b/--bind ADDR]` / `health` | Server mode / DB ping. Root flags: `-d/--database-url`, `-L/--log-level`. |
+| `web [-b/--bind ADDR]` | Launch the web console (default `127.0.0.1:8088`) — a local browser front-end that drives this CLI by re-invoking `blackbook`. No separate API; every command/flag stays in sync. Dark UI, colorized output, sidebar actions, history, `Tab` completion. |
+| `tunnel forward PEER -l/--listen ADDR -t/--to ADDR [-u/--udp]` / `tunnel accept [-f/--from NAME] [--wait-timeout S]` / `tunnel ls` | **End-to-end-encrypted tunnel between two clients**, relayed but unreadable by the server (see [Secure tunnels](#secure-tunnels-)). `forward` binds a local TCP/UDP port and pipes each connection to PEER, who (running `accept`) dials `--to`. Peers are mutually authenticated by their existing client certs (ephemeral X25519 + ECDSA-signed handshake → AES-256-GCM); the server vouches identities and relays opaque frames only. `accept` waits for an offer addressed to you (optionally restricted `--from` a named offerer). |
 
 ## Architecture (post Phase D)
 
@@ -373,7 +521,7 @@ subcommand, before or after it):
            ▼                                               ▼
 ┌────────────────────────────┐                ┌───────────────────────────────┐
 │   PostgreSQL                │                │  /opt/blackbook/data/         │
-│   blackbook_domains          │                │  ├─ dek + dek.mode           │
+│   blackbook_domains          │                │  ├─ dek.meta (salt|wrapped)  │
 │   blackbook_domain_members   │                │  ├─ master.bbkey             │
 │   blackbook_clients          │                │  ├─ ca.crt + ca.key          │
 │      ↳ totp_secret_enc       │                │  ├─ server.crt + server.key  │
@@ -432,19 +580,33 @@ ACL action bits: `create=1, read=2, update=4, delete=8`.
 | Env var | Required | Purpose |
 |---|---|---|
 | `DATABASE_URL` | yes (server) | Postgres connection string |
-| `BLACKBOOK_DATA_DIR` | no | Where master key / CA / DEK / admin bundle live (default `/opt/blackbook/data`) |
+| `BLACKBOOK_DATA_DIR` | no | Where master key / CA / admin bundle live (default `/opt/blackbook/data`) |
 | `BLACKBOOK_SERVER_SANS` | no | Comma-separated SAN list for the server cert (default `localhost,127.0.0.1,blackbook,blackbook-app`) |
-| `BLACKBOOK_MASTER_PASSPHRASE` | no, ≥16 chars | If set, DEK is `scrypt(passphrase, salt)` — only salt on disk. Otherwise DEK is a raw key on the data volume. The chosen mode is recorded in `dek.mode` on the volume; starting the server with a mismatched mode (e.g., passphrase after a raw-DEK init or vice versa) causes an immediate startup failure. Re-encrypting requires a manual stop/decrypt/re-encrypt/restart cycle. |
+| **`BLACKBOOK_MASTER_KEYFILE`** | one master-key provider is **required** | Path to a keyfile (kept **off** the data volume, e.g. a Docker secret on tmpfs). A random DEK is generated once and stored on the data volume only *wrapped* under `KEK = SHA3-256(keyfile)`; the plaintext DEK is never written. Generate the keyfile once: `openssl rand 32 > secrets/master_keyfile`. |
+| **`BLACKBOOK_MASTER_PASSPHRASE`** / `…_FILE` | one master-key provider is **required**, ≥16 chars | User-supplied secret. `DEK = Argon2id(passphrase, salt)`; only the salt is persisted. Prefer the `_FILE` form (a path, e.g. a Docker secret) so the passphrase isn't in the process environment. |
 | `RUST_LOG` | no | Log filter |
+
+> **The master DEK is never stored raw on disk.** The server requires exactly one provider above (keyfile *or* passphrase) and **refuses to start** without one. Only a salt or a wrapped-DEK blob lands on the data volume (`dek.meta`); the plaintext DEK is derived/unwrapped in memory at every boot. A copy of the data volume alone is therefore not decryptable. Legacy volumes that still hold a raw `dek`/`dek.mode` are migrated to a provider automatically on first boot (the master key is re-encrypted and the raw DEK securely erased). Switching providers, or losing the keyfile/passphrase, makes the data unrecoverable — back the secret up separately from the volume.
+
+### Database (Postgres) security
+
+The server↔Postgres link is hardened (run `./scripts/generate-postgres-certs.sh` once before first boot):
+
+- **Mutual TLS 1.3.** The app connects with `sslmode=verify-full` (pinning Postgres to the CA in `secrets/postgres/`) **and presents its own client certificate**; `config/pg_hba.conf` requires `clientcert=verify-full` + SCRAM, so both ends are cryptographically authenticated and plaintext TCP is **refused**.
+- **Least-privilege application role.** The app connects as `blackbook_app` (created by `scripts/01-blackbook-roles.sh`), which can manage only its own objects in the one database — it **cannot** create roles or databases, replicate, or bypass RLS. The superuser is reserved for break-glass. `PUBLIC` connect is revoked.
+- **Config is actually loaded.** `config/postgres.conf` is applied via `-c config_file=…` (it was previously mounted but ignored), enabling `ssl`, SCRAM, and connection logging.
+- DB credentials come from `./.env` (copy `config/blackbook.env`); generate strong values with `openssl rand -base64 32`. The dev defaults are clearly marked and must be changed for production.
 
 ## Known limitations / future work
 
-- **True client-side Shamir shares.** The threshold gate today is server-mediated: the DEK stays whole and the server enforces the policy. Same operational guarantee as long as the server is in the trust boundary. Splitting the DEK into client-encrypted shares (one per signatory, encrypted under their X25519 public key) is the next defense-in-depth slice and unlocks the *server-compromise* threat model.
-- **Master DEK rotation** isn't a one-shot CLI command yet. Today: stop server, decrypt master with old DEK, re-encrypt with new DEK, restart. A safe automated path needs a two-DEK overlap design.
-- **Postgres TLS**: server↔Postgres is plain inside the Docker network. Acceptable for single-host; worth adding mTLS to Postgres for production network isolation.
-- **Audit-log retention**: the chain grows unbounded and there's no archival/rotation path yet. Verification cost is linear in row count.
-- **Audit-log retention**: even encrypted, the chain grows unbounded with no archival/rotation path. Verification cost is linear in row count.
-- **No rate limiting**: there's no per-client throttle on any endpoint yet.
+- **True client-side Shamir shares.** The threshold gate today is server-mediated: the DEK stays whole and the server enforces the policy. Same operational guarantee as long as the server is in the trust boundary. Splitting the DEK into client-encrypted shares (one per signatory, encrypted under their X25519 public key) is the next defense-in-depth slice and unlocks the *server-compromise* threat model. **This is the one remaining item from the original roadmap.**
+- **Audit-log verification cost is linear** in the number of *live* rows. Archival (below) bounds that set, but a single `audit --verify` still recomputes the whole live chain; there is no incremental/checkpointed verifier yet.
+
+### Recently shipped (previously listed here as future work)
+
+- **Per-client rate limiting** — a loose per-identity token bucket (keyed by mTLS CN, IP fallback) sheds load from a single flooding client without throttling normal use. Configurable via `BLACKBOOK_NET_RATE_PER_SEC` / `BLACKBOOK_NET_BURST` (`0` disables). See [`src/net_ratelimit.rs`](src/net_ratelimit.rs).
+- **Audit-log archival / rotation** — `blackbook audit --archive [--keep-last N | --before TS] [--prune]` exports the oldest rows to a compressed, AES-256-GCM-encrypted, independently hash-chain-verifiable file on the data volume, records a chain anchor, and (with `--prune`) bounds the live table. Verify an archive end-to-end with `audit --verify-archive FILE`; list them with `audit --list-archives`. See [`src/audit_archive.rs`](src/audit_archive.rs).
+- **Master DEK rotation** — `blackbook rekey-dek` re-wraps the master key under a freshly generated DEK for the current provider, in one command (the master key material itself is unchanged, so all data stays readable). A legacy raw-DEK volume is still migrated to a provider automatically on first boot.
 
 ## Source layout
 
@@ -454,8 +616,23 @@ src/
 ├── server.rs          ─ HTTPS + mTLS server, all endpoints
 ├── client.rs          ─ HTTP client, rustls config, session file
 ├── auth.rs            ─ FromRequest extractor, ACL check, audit, MFA, ResourceFlags
-├── persistence.rs     ─ DEK + master + CA + server cert load/init
+├── credstore.rs       ─ encrypted-at-rest credential profiles (Argon2id → AES-GCM)
+├── persistence.rs     ─ DEK provider (keyfile/passphrase), master + CA + server cert load/init/rekey
 ├── tls.rs             ─ rcgen-based CA + cert issuance, CN extraction
-└── blackbook_core.rs  ─ PrimaryKey, SecondaryKey + Kdf, WrappedKey, BlackbookKey,
-                         AES-GCM envelopes, scrypt, AsymmetricKey
+├── blackbook_core.rs  ─ PrimaryKey, SecondaryKey + Kdf, WrappedKey, BlackbookKey,
+│                        AES-GCM envelopes, scrypt, AsymmetricKey
+├── net_ratelimit.rs   ─ per-client token-bucket rate limiter (anti-DoS)
+├── audit_archive.rs   ─ encrypted, compressed, chain-verifiable audit-log archives
+├── presentation.rs    ─ randomart / braille fingerprint rendering (display only)
+├── webui.rs (+webui/) ─ local browser console that re-invokes the CLI (no shell)
+├── tunnel_crypto.rs   ─ X25519 + HKDF + ECDSA handshake, per-direction AES-GCM frames
+├── tunnel_relay.rs    ─ server-side opaque frame relay (pairs two mTLS peers)
+└── tunnel_client.rs   ─ client tunnel: local TCP/UDP port-forward over the channel
 ```
+
+## License
+
+Blackbook is licensed under the **GNU Affero General Public License v3.0 only**
+(`AGPL-3.0-only`). See [LICENSE](LICENSE). Because it is designed to be run as a
+network service, the AGPL's network-use clause applies: if you offer a modified
+Blackbook to users over a network, you must offer them its source.

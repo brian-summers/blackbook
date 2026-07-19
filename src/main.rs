@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, CommandFactory};
+use zeroize::Zeroizing;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Pool;
 use sqlx::Postgres;
@@ -8,9 +9,16 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub mod blackbook_core;
+mod audit_archive;
+mod net_ratelimit;
+mod presentation;
 mod server;
 mod client;
 mod credstore;
+mod webui;
+mod tunnel_crypto;
+mod tunnel_relay;
+mod tunnel_client;
 pub mod auth;
 pub mod persistence;
 pub mod tls;
@@ -81,8 +89,23 @@ enum Commands {
         #[arg(short, long, default_value = "127.0.0.1:8443")]
         bind: String,
     },
+    /// Launch the web console — a browser front-end that drives this CLI.
+    /// It serves one local page and runs your commands by re-invoking
+    /// `blackbook`, so every command and flag stays in sync automatically.
+    Web {
+        /// Address to bind (loopback by default — it's a local convenience).
+        #[arg(short, long, default_value = "127.0.0.1:8088")]
+        bind: String,
+    },
     /// Database connectivity ping (used by Docker healthcheck).
     Health,
+
+    /// Rotate the master DEK: re-wrap the master key under a freshly generated
+    /// DEK from the current provider (the master key itself is unchanged).
+    /// Server-side maintenance — needs the same BLACKBOOK_DATA_DIR and master
+    /// key provider env as the server. Safe to run while the server is up; to
+    /// adopt a *new* keyfile, generate it, run this, then restart.
+    RekeyDek,
 
     /// Log in from a credential bundle and save it as a profile.
     ///
@@ -113,11 +136,39 @@ enum Commands {
     },
     /// Clear the active profile's cached unlock key from the agent.
     Lock,
+    /// Change the passphrase that encrypts the active profile (the credential
+    /// bundle is re-sealed locally; the embedded client master key is preserved
+    /// so all external data still decrypts). Old/new come from flags, or
+    /// $BLACKBOOK_OLD_PASSPHRASE / $BLACKBOOK_NEW_PASSPHRASE, or prompts.
+    Passphrase {
+        /// Current passphrase (else env/prompt).
+        #[arg(long)] old: Option<String>,
+        /// New passphrase (else env/prompt, confirmed when prompted).
+        #[arg(long)] new: Option<String>,
+    },
     /// Manage credential profiles (multiple identities).
     #[command(subcommand)]
     Profile(ProfileCmd),
     /// Print the current authenticated identity.
     Whoami,
+
+    /// Print a shell completion script. Source it (or add to your profile) to
+    /// get tab-completion of commands, flags, and — for profiles, domains, and
+    /// resident files — their actual values. Defaults to PowerShell.
+    Completions {
+        /// Target shell: powershell | bash | zsh | fish.
+        #[arg(default_value = "powershell")]
+        shell: String,
+    },
+    /// Internal: emit completion candidates for the current command line.
+    /// Called by the generated completion scripts; not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__complete")]
+    Complete {
+        /// The words typed so far (the full command line, argv-style).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        words: Vec<String>,
+    },
 
     /// Store a new secret. Returns 409 if a secret with this name already
     /// exists; use --overwrite to intentionally replace it.
@@ -145,13 +196,25 @@ enum Commands {
         /// Make this secret immutable: once created it can never be overwritten,
         /// even with --overwrite. Delete it first to replace it.
         #[arg(short = 'i', long)] no_overwrite: bool,
-        /// Client-side ("external") encryption: encrypt the value locally so
-        /// the server stores only an opaque envelope it can never decrypt.
-        /// Needs a passphrase (--external-passphrase or $BLACKBOOK_EXTERNAL_PASSPHRASE).
-        #[arg(short = 'e', long)] external: bool,
-        /// Passphrase for --external (never sent to the server). Prefer the
-        /// $BLACKBOOK_EXTERNAL_PASSPHRASE env var to keep it off the cmdline.
+        /// Client-side encryption under the profile's managed key (CMK): the
+        /// server stores only an opaque envelope it can never decrypt.
+        #[arg(short = 'e', long = "external-key")] external_key: bool,
+        /// Client-side encryption under a user-supplied passphrase (Argon2id),
+        /// never sent to the server. Prefer $BLACKBOOK_EXTERNAL_PASSPHRASE to
+        /// keep it off the command line. Implies client-side encryption.
         #[arg(long)] external_passphrase: Option<String>,
+        /// Alias: managed-key client-side encryption (same as --external-key
+        /// for secrets, since a secret's data always lives in blackbook).
+        #[arg(long)] external: bool,
+        /// Not available for secrets (data residency is files-only); rejected
+        /// with a clear message. Present so the error is explicit, not "unknown
+        /// flag".
+        #[arg(long, hide = true)] external_data: bool,
+        /// Opt into passphrase-mode client-side encryption, sourcing the
+        /// passphrase from $BLACKBOOK_EXTERNAL_PASSPHRASE instead of an argv
+        /// value (so it never appears on the command line). Equivalent to
+        /// `--external-passphrase <value>`. Used by the web console.
+        #[arg(long, hide = true)] external_passphrase_env: bool,
     },
     /// Print a secret's value to stdout. If the secret has a K-of-N policy
     /// and you don't already have an approved request, the server returns
@@ -171,17 +234,41 @@ enum Commands {
         #[arg(long)] external_passphrase: Option<String>,
     },
     /// List secrets visible to the current client.
-    Ls,
+    Ls {
+        /// Output as JSON (used by the web console's structured API).
+        #[arg(long)] json: bool,
+    },
     /// Delete a secret.
     Rm {
         name: String,
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Change the client-side key on an external secret: decrypt it locally with
+    /// its current key and re-encrypt under a new one, then store it back. Use
+    /// `--old-external-passphrase` to supply the current passphrase, and the
+    /// target-key flags (`--external-key` for the managed CMK, or
+    /// `--external-passphrase` for a new user passphrase). Only the wrapping key
+    /// changes — the secret value is unchanged.
+    Rekey {
+        name: String,
+        /// Current passphrase, if the secret is passphrase-sealed (else env/prompt).
+        #[arg(long)] old_external_passphrase: Option<String>,
+        /// Re-wrap under the profile's managed key (CMK).
+        #[arg(short = 'e', long = "external-key")] external_key: bool,
+        /// Re-wrap under this new user passphrase (Argon2id).
+        #[arg(long)] external_passphrase: Option<String>,
+    },
 
     /// Manage encrypted files.
     #[command(subcommand)]
     File(FileCmd),
+
+    /// Secure end-to-end tunnels between two clients (the server relays opaque
+    /// frames but cannot read or modify them; peers are positively identified
+    /// to each other by their existing client certificates).
+    #[command(subcommand)]
+    Tunnel(TunnelCmd),
 
     /// Manage API clients (admin only).
     #[command(subcommand)]
@@ -219,11 +306,62 @@ enum Commands {
         /// chain and report the first broken row (if any).
         #[arg(short = 'v', long)]
         verify: bool,
+        /// Archive the oldest audit rows to a compressed, encrypted,
+        /// chain-verifiable file on the server's data volume. Combine with
+        /// --keep-last or --before, and optionally --prune.
+        #[arg(long)]
+        archive: bool,
+        /// With --archive: keep the N most recent rows live (archive the rest).
+        #[arg(long)]
+        keep_last: Option<i64>,
+        /// With --archive: archive rows older than this timestamp
+        /// (RFC3339 or `YYYY-MM-DD[ HH:MM:SS]`).
+        #[arg(long)]
+        before: Option<String>,
+        /// With --archive: delete the archived rows from the DB (a chain
+        /// anchor is recorded so `--verify` still works on what remains).
+        #[arg(long)]
+        prune: bool,
+        /// Verify a named archive file's hash chain end to end.
+        #[arg(long, value_name = "FILE")]
+        verify_archive: Option<String>,
+        /// List archive files on the server's data volume.
+        #[arg(long)]
+        list_archives: bool,
     },
     /// Purge tombstoned secrets (whose `max_reads` was hit and whose crypto
     /// material has already been scrubbed) in the current domain. Secrets
     /// stored with `--preserve-on-cleanup` are kept. Admin only.
     Cleanup,
+}
+
+#[derive(Subcommand)]
+enum TunnelCmd {
+    /// Listener side: offer a tunnel to PEER, bind a local port, and forward
+    /// each connection to the peer, who relays it to TARGET. ssh -L style.
+    /// e.g. `tunnel forward bob --listen 127.0.0.1:5432 --to 10.0.0.5:5432`
+    Forward {
+        /// Peer client name to tunnel to (must be online to `accept`).
+        peer: String,
+        /// Local address to bind (host:port).
+        #[arg(short = 'l', long)] listen: String,
+        /// Address the peer should dial for each connection (host:port).
+        #[arg(short = 't', long = "to")] target: String,
+        /// Forward UDP instead of TCP.
+        #[arg(short = 'u', long)] udp: bool,
+    },
+    /// Target side: wait for a tunnel offer addressed to you and serve the
+    /// peer's dial requests (connecting to whatever host:port they ask for).
+    /// Run this on the machine that can reach the target service.
+    Accept {
+        /// Only accept an offer from this client name (else accept any offerer
+        /// who targeted you).
+        #[arg(short = 'f', long)] from: Option<String>,
+        /// Seconds to wait for an offer before giving up (default 300).
+        #[arg(long, default_value_t = 300)] wait_timeout: u64,
+    },
+    /// List tunnels you offered or are the target of.
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -255,23 +393,30 @@ enum FileCmd {
         #[arg(short = 'p', long)] preserve_on_cleanup: bool,
         /// Make this file immutable: never overwritable, even with --overwrite.
         #[arg(short = 'i', long)] no_overwrite: bool,
-        /// Client-side ("external") encryption: encrypt the file locally so the
-        /// server stores only ciphertext it can never decrypt. With no
-        /// passphrase the profile's CMK is used; --external-passphrase upgrades
-        /// to Argon2id.
-        #[arg(short = 'e', long)] external: bool,
-        /// Passphrase for --external/--resident (never sent to the server).
+        /// Managed-key client-side encryption (CMK), data stored in blackbook:
+        /// the server keeps only an opaque envelope it can never decrypt.
+        #[arg(short = 'e', long = "external-key")] external_key: bool,
+        /// User-supplied passphrase (Argon2id) instead of the managed key.
+        /// Never sent to the server; prefer $BLACKBOOK_EXTERNAL_PASSPHRASE.
         #[arg(long)] external_passphrase: Option<String>,
-        /// Resident: keep the encrypted file on *this machine* (under ~/.bbk),
-        /// uploading only a manifest + the server's half of the split file key.
-        /// Reading requires both this client AND the server. Mutually exclusive
-        /// with --external.
-        #[arg(short = 'E', long)] resident: bool,
-        /// With --resident, also keep an encrypted backup copy server-side
+        /// Data residency: keep the encrypted file on *this machine* (under
+        /// ~/.bbk), uploading only a manifest + the server's half of the split
+        /// file key. Reading needs both this client AND the server. Combine
+        /// with --external-passphrase for a user key; default key is managed.
+        #[arg(short = 'E', long = "external-data", visible_alias = "resident")] external_data: bool,
+        /// Shorthand for managed key + data residency
+        /// (= --external-key --external-data).
+        #[arg(long)] external: bool,
+        /// With --external-data, also keep an encrypted backup copy server-side
         /// (still unreadable by the server).
         #[arg(short = 'c', long)] server_copy: bool,
-        /// With --resident, delete the original plaintext file after stashing.
+        /// With --external-data, delete the original plaintext file after stashing.
         #[arg(long)] shred: bool,
+        /// Opt into passphrase-mode client-side encryption, sourcing the
+        /// passphrase from $BLACKBOOK_EXTERNAL_PASSPHRASE instead of an argv
+        /// value. Equivalent to `--external-passphrase <value>`. Used by the
+        /// web console.
+        #[arg(long, hide = true)] external_passphrase_env: bool,
     },
     /// Download a file. Output defaults to ./<name> (or `-` for stdout).
     Get {
@@ -288,11 +433,28 @@ enum FileCmd {
         #[arg(long)] external_passphrase: Option<String>,
     },
     /// List files visible to the current client.
-    Ls,
+    Ls {
+        /// Output as JSON (used by the web console's structured API).
+        #[arg(long)] json: bool,
+    },
     /// Delete a file.
     Rm { name: String, #[arg(short = 'y', long)] yes: bool },
     /// Re-encrypt a file under a new per-file DEK.
     Rotate { name: String },
+    /// Change the client-side key on an external/resident file. Decrypts with
+    /// the current key and re-wraps under a new one. For an external-key file
+    /// the re-sealed envelope is re-uploaded; for a resident file only the
+    /// local stash's wrapped client-half is rewritten (no re-upload — the
+    /// ciphertext and the server's key-half are untouched).
+    Rekey {
+        name: String,
+        /// Current passphrase, if the file is passphrase-sealed (else env/prompt).
+        #[arg(long)] old_external_passphrase: Option<String>,
+        /// Re-wrap under the profile's managed key (CMK).
+        #[arg(short = 'e', long = "external-key")] external_key: bool,
+        /// Re-wrap under this new user passphrase (Argon2id).
+        #[arg(long)] external_passphrase: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -343,6 +505,12 @@ enum AclCmd {
         #[arg(short = 'b', long)] not_before: Option<String>,
         /// Cap on use count (use `--max-uses 1` for one-shot grants).
         #[arg(short = 'x', long)] max_uses: Option<i32>,
+        /// Rate limit as `N/PERIOD`, e.g. `10/1h`, `5/30m`, `100/1d`, `2/90s`.
+        /// At most N authorizations per window (fixed window).
+        #[arg(long)] rate: Option<String>,
+        /// Cron-style allowed-access window (5 fields, mask semantics), e.g.
+        /// "* 9-17 * * 1-5" = weekdays 9am–6pm. Access outside it is denied.
+        #[arg(long)] schedule: Option<String>,
     },
     Ls,
     Revoke { id: String },
@@ -563,7 +731,15 @@ impl Database {
                 max_uses         INTEGER,
                 use_count        INTEGER NOT NULL DEFAULT 0,
                 granted_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                granted_by       TEXT REFERENCES blackbook_clients(id)
+                granted_by       TEXT REFERENCES blackbook_clients(id),
+                -- Per-rule rate limit ("rate_max accesses per rate_period_secs")
+                -- and a fixed-window counter. NULL period = no rate limit.
+                rate_max         INTEGER,
+                rate_period_secs INTEGER,
+                rate_count       INTEGER NOT NULL DEFAULT 0,
+                rate_window_start TIMESTAMP,
+                -- Cron-style allowed-access window (5 fields). NULL = always.
+                schedule         TEXT
             )"#,
         ).execute(&self.pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_acl_client_id ON blackbook_acl(client_id)")
@@ -590,6 +766,20 @@ impl Database {
             .execute(&self.pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_audit_id ON blackbook_audit(id)")
             .execute(&self.pool).await?;
+        // Chain anchors: when old audit rows are archived-and-pruned, the
+        // `row_hash` of the last pruned row is recorded here so live-chain
+        // verification resumes from it instead of genesis (otherwise the first
+        // surviving row's prev_hash would look "broken"). The latest anchor
+        // (highest archived_through_id) is the current chain start.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS blackbook_audit_anchors (
+                id                  BIGSERIAL PRIMARY KEY,
+                archived_through_id BIGINT NOT NULL,
+                final_row_hash      CHAR(64) NOT NULL,
+                archive_file        TEXT NOT NULL,
+                created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )"#,
+        ).execute(&self.pool).await?;
 
         // File blobs: encrypted on disk under per-file DEK. The row's
         // friendly name/MIME/size are AEAD ciphertext; the integrity hash is
@@ -802,20 +992,163 @@ fn resolve_external_passphrase_opt(explicit: Option<String>) -> Option<String> {
     None
 }
 
-/// Choose the seal key for a `put`: an explicit passphrase wins; otherwise use
-/// the session's CMK. Errors only if neither is available (legacy profile with
-/// no CMK and no passphrase).
-fn ext_key_for_put(session: &client::Session, explicit: Option<String>) -> Result<ExtKey> {
+/// Resolve the passphrase needed to *read* a passphrase-sealed external item.
+/// Resolution order: `--external-passphrase` → `$BLACKBOOK_EXTERNAL_PASSPHRASE`
+/// → interactive no-echo prompt. The prompt is what makes the password
+/// "requested on every access": a read with neither flag nor env var set asks
+/// for it rather than failing. The passphrase is never cached — each read
+/// re-derives the key — so it is genuinely requested each time when no
+/// ambient source is configured. Errors only when there is no TTY to prompt on
+/// (e.g. piped automation) and no flag/env was supplied.
+fn resolve_external_passphrase_for_read(explicit: Option<String>) -> Result<String> {
     if let Some(p) = resolve_external_passphrase_opt(explicit) {
-        return Ok(ExtKey::Passphrase(p));
+        return Ok(p);
     }
-    if let Some(cmk) = session.cmk_bytes() {
-        return Ok(ExtKey::Cmk(cmk));
+    // No interactive prompt when prompts are suppressed (e.g. the web console),
+    // since the child can't read a terminal and would hang. Return a clear,
+    // recognizable error instead.
+    if credstore::prompts_suppressed() {
+        return Err(AppError::Config(
+            "external passphrase required — pass --external-passphrase or set \
+             $BLACKBOOK_EXTERNAL_PASSPHRASE".into()));
     }
-    Err(AppError::Config(
-        "no key for --external: this profile predates client master keys and no \
-         passphrase was given. Re-run `blackbook login` to mint a CMK, or pass \
-         --external-passphrase / set $BLACKBOOK_EXTERNAL_PASSPHRASE".into()))
+    let p = rpassword::prompt_password("Passphrase for this external item: ")
+        .map_err(|_| AppError::Config(
+            "this item is passphrase-sealed and no passphrase was provided — \
+             pass --external-passphrase, set $BLACKBOOK_EXTERNAL_PASSPHRASE, \
+             or run interactively so it can be requested".into()))?;
+    if p.is_empty() {
+        return Err(AppError::Config("empty passphrase".into()));
+    }
+    Ok(p)
+}
+
+// ---------------------------------------------------------------------------
+// Client-side storage spec — two orthogonal axes
+//
+// Client-side ("external") storage is the product of two independent choices:
+//
+//   KEY SOURCE  — where the wrapping key comes from:
+//       managed     (--external-key)        : the profile's CMK (Phase 3)
+//       passphrase  (--external-passphrase) : user-supplied, Argon2id
+//
+//   DATA LOCATION — where the ciphertext lives:
+//       in-server   (default)               : the opaque envelope is stored in
+//                                             blackbook (external-key model)
+//       resident    (--external-data)       : the ciphertext lives on this
+//                                             client; the server keeps only a
+//                                             manifest + its key-component half
+//
+//   --external  ==  --external-key + --external-data  (managed key, resident).
+//
+// Data residency is a *files-only* capability today (a secret has no on-disk
+// home), so `--external-data` on a secret is rejected with a clear message.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum KeySource { Managed, Passphrase }
+
+#[derive(Clone, Copy, PartialEq)]
+enum DataLoc { InServer, Resident }
+
+/// A fully-resolved client-side storage decision. `None` from the resolver
+/// means "no client-side encryption — store normally".
+struct ExtSpec { key: KeySource, data: DataLoc }
+
+/// Raw client-side flags as they arrive from clap, before validation. The
+/// resolver turns these into an `Option<ExtSpec>` (None = normal storage).
+struct ExtFlags {
+    /// `--external` — implies external-key AND external-data.
+    external: bool,
+    /// `--external-key` / `-e` — managed-key client-side encryption.
+    external_key: bool,
+    /// `--external-data` (alias `--resident`/`-E` for files) — resident data.
+    external_data: bool,
+    /// `--external-passphrase` — user-supplied key (value or None).
+    passphrase: Option<String>,
+    /// `--external-passphrase-env` — opt into passphrase-mode client-side
+    /// encryption while taking the passphrase value from
+    /// `$BLACKBOOK_EXTERNAL_PASSPHRASE` rather than an argv flag. Lets the web
+    /// console create passphrase-sealed items without the secret ever touching
+    /// the process command line. Still an *explicit* opt-in, so a normal `put`
+    /// with the env var set stays a normal secret (no silent encryption).
+    passphrase_from_env: bool,
+}
+
+/// Resolve the four client-side flags into a storage decision.
+/// `data_allowed` is false for secrets (no on-disk residency).
+///
+/// Selection rules:
+///   - Client-side encryption is opted into by an explicit `--external*` flag
+///     or an explicit `--external-passphrase` value. The *env var* alone is
+///     only a value source — a normal `put` with `$BLACKBOOK_EXTERNAL_PASSPHRASE`
+///     set stays a normal secret (no silent client-side encryption).
+///   - `--external-key` / `--external` choose the managed (CMK) key; an explicit
+///     `--external-passphrase` chooses a user key. Combining the two is an error.
+///   - `--external-data` requests resident data (files only); `--external` on a
+///     file is the shorthand for managed-key + resident. On a secret, `--external`
+///     degrades to external-key (no on-disk home), while an explicit
+///     `--external-data` is rejected.
+fn resolve_ext_spec(f: &ExtFlags, data_allowed: bool) -> Result<Option<ExtSpec>> {
+    let managed_signal = f.external_key || f.external;
+    let pass_flag = f.passphrase.as_deref().map_or(false, |s| !s.is_empty());
+    // Explicit passphrase opt-in, whether the value arrives via the flag or via
+    // the env-sourced `--external-passphrase-env` marker.
+    let pass_signal = pass_flag || f.passphrase_from_env;
+
+    if managed_signal && pass_signal {
+        return Err(AppError::Config(
+            "--external-key/--external select the managed key (CMK), but --external-passphrase \
+             selects a user-supplied key — choose one. For resident data with a passphrase, \
+             use --external-data --external-passphrase.".into()));
+    }
+
+    let wants_external = managed_signal || f.external_data || pass_signal;
+    if !wants_external { return Ok(None); }
+
+    // Explicit data-residency on a secret is rejected (no on-disk home).
+    if f.external_data && !data_allowed {
+        return Err(AppError::Config(
+            "--external-data is not available for secrets — a secret has no on-disk home, so \
+             its data always lives in blackbook. Use --external-key (managed key) or \
+             --external-passphrase (user key) to encrypt it client-side.".into()));
+    }
+
+    // Key source: an explicit managed signal forces managed (ignoring any
+    // ambient env var). An explicit passphrase opt-in (flag value OR the
+    // `--external-passphrase-env` marker) forces the user key — the value is
+    // sourced later in `ext_key_for_spec`, which errors clearly if neither flag
+    // nor env supplied one. Otherwise the managed key.
+    let key = if managed_signal {
+        KeySource::Managed
+    } else if pass_signal || resolve_external_passphrase_opt(f.passphrase.clone()).is_some() {
+        KeySource::Passphrase
+    } else {
+        KeySource::Managed
+    };
+
+    // Data location: resident when --external-data, or --external on a target
+    // that supports it (files). --external on a secret degrades to in-server.
+    let data = if f.external_data || (f.external && data_allowed) {
+        DataLoc::Resident
+    } else {
+        DataLoc::InServer
+    };
+
+    Ok(Some(ExtSpec { key, data }))
+}
+
+/// Build the seal key for an `ExtSpec`, sourcing the passphrase if needed.
+fn ext_key_for_spec(spec: &ExtSpec, session: &client::Session, explicit: Option<String>) -> Result<ExtKey> {
+    match spec.key {
+        KeySource::Passphrase => {
+            let p = resolve_external_passphrase_for_read(explicit)?;
+            Ok(ExtKey::Passphrase(p))
+        }
+        KeySource::Managed => session.cmk_bytes().map(ExtKey::Cmk).ok_or_else(|| AppError::Config(
+            "no managed key (CMK) for --external-key: this profile predates client master \
+             keys. Re-run `blackbook login` to mint one, or use --external-passphrase.".into())),
+    }
 }
 
 /// Seal `plaintext`, returning `(meta_header, ciphertext)`. `meta_header` is
@@ -825,11 +1158,11 @@ fn ext_key_for_put(session: &client::Session, explicit: Option<String>) -> Resul
 /// `ciphertext` as the on-disk blob.
 fn external_seal_parts(key: &ExtKey, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     use rand::RngCore;
-    let mut dek = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut dek);
+    let mut dek = Zeroizing::new([0u8; 32]);
+    rand::thread_rng().fill_bytes(dek.as_mut_slice());
 
-    let (mode, salt, m, t, p, kek): (u8, Vec<u8>, u32, u32, u32, [u8; 32]) = match key {
-        ExtKey::Cmk(cmk) => (EXT_MODE_CMK, Vec::new(), 0, 0, 0, *cmk),
+    let (mode, salt, m, t, p, kek): (u8, Vec<u8>, u32, u32, u32, Zeroizing<[u8; 32]>) = match key {
+        ExtKey::Cmk(cmk) => (EXT_MODE_CMK, Vec::new(), 0, 0, 0, Zeroizing::new(*cmk)),
         ExtKey::Passphrase(pass) => {
             let mut salt = [0u8; 16];
             rand::thread_rng().fill_bytes(&mut salt);
@@ -837,9 +1170,9 @@ fn external_seal_parts(key: &ExtKey, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u
             (EXT_MODE_ARGON2, salt.to_vec(), m, t, p, k)
         }
     };
-    let wrapped_dek = blackbook_core::aead_seal(&dek, &kek)
+    let wrapped_dek = blackbook_core::aead_seal(dek.as_slice(), kek.as_slice())
         .map_err(|e| AppError::Crypto(format!("wrap dek: {e}")))?;
-    let ciphertext = blackbook_core::aead_seal(plaintext, &dek)
+    let ciphertext = blackbook_core::aead_seal(plaintext, dek.as_slice())
         .map_err(|e| AppError::Crypto(format!("seal: {e}")))?;
     let meta = ext_encode_v2(mode, &salt, m, t, p, &wrapped_dek, &[]);
     Ok((meta, ciphertext))
@@ -919,26 +1252,24 @@ fn ext_decode(buf: &[u8]) -> Result<ExtEnvelope> {
 
 /// Recover the wrapping KEK for an envelope, given the session (for the CMK)
 /// and an optional passphrase (for passphrase/legacy modes).
-fn external_kek(env: &ExtEnvelope, session: &client::Session, explicit_pass: Option<String>) -> Result<[u8; 32]> {
+fn external_kek(env: &ExtEnvelope, session: &client::Session, explicit_pass: Option<String>) -> Result<Zeroizing<[u8; 32]>> {
     match (env.version, env.mode) {
         (2, m) if m == EXT_MODE_CMK => {
-            session.cmk_bytes().ok_or_else(|| AppError::Crypto(
+            session.cmk_bytes().map(Zeroizing::new).ok_or_else(|| AppError::Crypto(
                 "this external item is sealed under the profile's client master key, \
                  but the active profile has none (different identity?)".into()))
         }
         (2, _) => {
-            let pass = resolve_external_passphrase_opt(explicit_pass).ok_or_else(|| AppError::Config(
-                "this external item needs its passphrase — pass --external-passphrase \
-                 or set $BLACKBOOK_EXTERNAL_PASSPHRASE".into()))?;
+            // Passphrase-sealed: request the passphrase on this access (flag →
+            // env → prompt). Never cached, so it's asked for each read.
+            let pass = resolve_external_passphrase_for_read(explicit_pass)?;
             let (m, t, p) = env.argon;
             credstore::argon2_key_with(&pass, &env.salt, m, t, p)
                 .map_err(|e| AppError::Crypto(format!("kdf: {e}")))
         }
         (_, _) => {
-            // v1 legacy: scrypt(passphrase)
-            let pass = resolve_external_passphrase_opt(explicit_pass).ok_or_else(|| AppError::Config(
-                "this legacy external item needs its passphrase — pass \
-                 --external-passphrase or set $BLACKBOOK_EXTERNAL_PASSPHRASE".into()))?;
+            // v1 legacy: scrypt(passphrase) — same per-access request.
+            let pass = resolve_external_passphrase_for_read(explicit_pass)?;
             blackbook_core::scrypt_dek(pass.as_bytes(), &env.salt)
                 .map_err(|e| AppError::Crypto(format!("kdf: {e}")))
         }
@@ -948,8 +1279,8 @@ fn external_kek(env: &ExtEnvelope, session: &client::Session, explicit_pass: Opt
 /// Open an external envelope to plaintext, using the session + optional passphrase.
 fn external_open(env: &ExtEnvelope, session: &client::Session, explicit_pass: Option<String>) -> Result<Vec<u8>> {
     let kek = external_kek(env, session, explicit_pass)?;
-    let dek = blackbook_core::aead_open(&env.wrapped_dek, &kek)
-        .map_err(|_| AppError::Crypto("wrong key/passphrase or corrupt envelope (DEK unwrap failed)".into()))?;
+    let dek = Zeroizing::new(blackbook_core::aead_open(&env.wrapped_dek, kek.as_slice())
+        .map_err(|_| AppError::Crypto("wrong key/passphrase or corrupt envelope (DEK unwrap failed)".into()))?);
     blackbook_core::aead_open(&env.ciphertext, &dek)
         .map_err(|_| AppError::Crypto("decryption failed (wrong key/passphrase or corrupt data)".into()))
 }
@@ -1024,15 +1355,15 @@ fn resident_seal(key: &ExtKey, plaintext: &[u8], orig_name: &str) -> Result<(Vec
     let ct = blackbook_core::aead_seal(plaintext, &kf)
         .map_err(|e| AppError::Crypto(format!("seal: {e}")))?;
 
-    let (mode, salt_b64, m, t, p, client_kek, label): (u8, String, u32, u32, u32, [u8; 32], &'static str) = match key {
-        ExtKey::Cmk(cmk) => (0, String::new(), 0, 0, 0, *cmk, "CMK"),
+    let (mode, salt_b64, m, t, p, client_kek, label): (u8, String, u32, u32, u32, Zeroizing<[u8; 32]>, &'static str) = match key {
+        ExtKey::Cmk(cmk) => (0, String::new(), 0, 0, 0, Zeroizing::new(*cmk), "CMK"),
         ExtKey::Passphrase(pass) => {
             let mut salt = [0u8; 16]; rand::thread_rng().fill_bytes(&mut salt);
             let (k, m, t, p) = credstore::argon2_key(pass, &salt)?;
             (1, b64.encode(salt), m, t, p, k, "passphrase")
         }
     };
-    let wrapped_c = blackbook_core::aead_seal(&kf_c, &client_kek)
+    let wrapped_c = blackbook_core::aead_seal(kf_c.as_slice(), client_kek.as_slice())
         .map_err(|e| AppError::Crypto(format!("wrap client half: {e}")))?;
 
     let header = ResidentHeader {
@@ -1075,29 +1406,84 @@ fn resident_open(
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
     // Recover the client half: unwrap Kf_c with CMK or Argon2id(passphrase).
-    let client_kek: [u8; 32] = match header.mode {
-        0 => session.cmk_bytes().ok_or_else(|| AppError::Crypto(
+    let client_kek: Zeroizing<[u8; 32]> = match header.mode {
+        0 => session.cmk_bytes().map(Zeroizing::new).ok_or_else(|| AppError::Crypto(
             "resident file is sealed under the profile's client master key, but \
              the active profile has none".into()))?,
         _ => {
-            let pass = resolve_external_passphrase_opt(explicit_pass).ok_or_else(|| AppError::Config(
-                "this resident file needs its passphrase — pass --external-passphrase \
-                 or set $BLACKBOOK_EXTERNAL_PASSPHRASE".into()))?;
+            // Passphrase-sealed resident file: request the passphrase on this
+            // access (flag → env → prompt); never cached.
+            let pass = resolve_external_passphrase_for_read(explicit_pass)?;
             let salt = b64.decode(&header.salt).map_err(|_| AppError::Crypto("bad salt".into()))?;
             credstore::argon2_key_with(&pass, &salt, header.m_cost, header.t_cost, header.p_cost)
                 .map_err(|e| AppError::Crypto(format!("kdf: {e}")))?
         }
     };
     let wrapped_c = b64.decode(&header.wrapped_c).map_err(|_| AppError::Crypto("bad wrapped_c".into()))?;
-    let kf_c = blackbook_core::aead_open(&wrapped_c, &client_kek)
-        .map_err(|_| AppError::Crypto("wrong key/passphrase (client half unwrap failed)".into()))?;
-    let kf_s = b64.decode(kf_s_b64).map_err(|_| AppError::Crypto("server key component not base64".into()))?;
+    let kf_c = Zeroizing::new(blackbook_core::aead_open(&wrapped_c, client_kek.as_slice())
+        .map_err(|_| AppError::Crypto("wrong key/passphrase (client half unwrap failed)".into()))?);
+    let kf_s = Zeroizing::new(b64.decode(kf_s_b64).map_err(|_| AppError::Crypto("server key component not base64".into()))?);
     if kf_c.len() != 32 || kf_s.len() != 32 {
         return Err(AppError::Crypto("key halves must be 32 bytes".into()));
     }
-    let kf: Vec<u8> = kf_c.iter().zip(kf_s.iter()).map(|(a, b)| a ^ b).collect();
+    let kf: Zeroizing<Vec<u8>> = Zeroizing::new(kf_c.iter().zip(kf_s.iter()).map(|(a, b)| a ^ b).collect());
     blackbook_core::aead_open(ciphertext, &kf)
         .map_err(|_| AppError::Crypto("decryption failed (wrong key halves or corrupt data)".into()))
+}
+
+/// Unwrap just the client key-half (`Kf_c`) from a resident stash header using
+/// its *current* key (CMK or passphrase). Used by `file rekey` — re-keying a
+/// resident file only needs to rewrap this 32-byte half, not the ciphertext.
+fn resident_unwrap_client_half(
+    header: &ResidentHeader, session: &client::Session, explicit_pass: Option<String>,
+) -> Result<[u8; 32]> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let client_kek: Zeroizing<[u8; 32]> = match header.mode {
+        0 => session.cmk_bytes().map(Zeroizing::new).ok_or_else(|| AppError::Crypto(
+            "resident file is sealed under the profile's client master key, but the active profile has none".into()))?,
+        _ => {
+            let pass = resolve_external_passphrase_for_read(explicit_pass)?;
+            let salt = b64.decode(&header.salt).map_err(|_| AppError::Crypto("bad salt".into()))?;
+            credstore::argon2_key_with(&pass, &salt, header.m_cost, header.t_cost, header.p_cost)
+                .map_err(|e| AppError::Crypto(format!("kdf: {e}")))?
+        }
+    };
+    let wrapped_c = b64.decode(&header.wrapped_c).map_err(|_| AppError::Crypto("bad wrapped_c".into()))?;
+    let kf_c = Zeroizing::new(blackbook_core::aead_open(&wrapped_c, client_kek.as_slice())
+        .map_err(|_| AppError::Crypto("wrong key/passphrase (client half unwrap failed)".into()))?);
+    if kf_c.len() != 32 { return Err(AppError::Crypto("client half must be 32 bytes".into())); }
+    let mut out = [0u8; 32]; out.copy_from_slice(&kf_c); Ok(out)
+}
+
+/// Rebuild a resident stash, re-wrapping the (unchanged) client key-half under
+/// `new_key` and keeping the (unchanged) ciphertext. The file key `Kf` and the
+/// server's half `Kf_s` are untouched, so no server interaction is needed.
+fn resident_rewrap(new_key: &ExtKey, kf_c: &[u8; 32], ciphertext: &[u8], orig_name: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    use rand::RngCore;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let (mode, salt_b64, m, t, p, client_kek): (u8, String, u32, u32, u32, Zeroizing<[u8; 32]>) = match new_key {
+        ExtKey::Cmk(cmk) => (0, String::new(), 0, 0, 0, Zeroizing::new(*cmk)),
+        ExtKey::Passphrase(pass) => {
+            let mut salt = [0u8; 16]; rand::thread_rng().fill_bytes(&mut salt);
+            let (k, m, t, p) = credstore::argon2_key(pass, &salt)?;
+            (1, b64.encode(salt), m, t, p, k)
+        }
+    };
+    let wrapped_c = blackbook_core::aead_seal(kf_c, client_kek.as_slice())
+        .map_err(|e| AppError::Crypto(format!("wrap client half: {e}")))?;
+    let header = ResidentHeader {
+        mode, salt: salt_b64, m_cost: m, t_cost: t, p_cost: p,
+        wrapped_c: b64.encode(&wrapped_c), orig_name: orig_name.to_string(),
+    };
+    let hjson = serde_json::to_vec(&header)?;
+    let mut stash = Vec::with_capacity(8 + hjson.len() + ciphertext.len());
+    stash.extend_from_slice(RESIDENT_MAGIC);
+    stash.extend_from_slice(&(hjson.len() as u32).to_be_bytes());
+    stash.extend_from_slice(&hjson);
+    stash.extend_from_slice(ciphertext);
+    Ok(stash)
 }
 
 #[derive(serde::Deserialize)]
@@ -1190,6 +1576,15 @@ async fn cmd_login(
     if reuse && !minted {
         println!("Carried the existing client master key forward — external data stays decryptable.");
     }
+    // Default this profile to the identity's private user domain, so commands
+    // land in the user's own namespace without needing -D. Only set it if the
+    // user hasn't already chosen a default via `domain use` (explicit wins).
+    if let Some(ud) = me.user_domain.as_deref() {
+        if client::Session::read_domain_pref(&profile).is_none() {
+            client::Session::write_domain_pref(&profile, ud)?;
+            println!("Default domain for '{profile}' set to your user domain '{ud}' (change with `blackbook -P {profile} domain use NAME`).");
+        }
+    }
     println!("The profile is locked at rest — unlock future sessions with `blackbook -P {profile} unlock`.");
     Ok(())
 }
@@ -1272,10 +1667,10 @@ async fn cmd_unlock(ttl_minutes: u64) -> Result<()> {
         None, &format!("Passphrase for profile '{profile}': "), false)?;
     // Verify the passphrase actually opens the envelope before caching.
     let kek = env.derive_kek(&pass).map_err(|e| AppError::Config(e.to_string()))?;
-    env.open_with_kek(&kek).map_err(|_| AppError::Config(
+    env.open_with_kek(kek.as_slice()).map_err(|_| AppError::Config(
         "wrong passphrase — profile not unlocked".into()))?;
     let ttl = ttl_minutes.saturating_mul(60);
-    credstore::agent_store(&profile, &kek, ttl)
+    credstore::agent_store(&profile, kek.as_slice(), ttl)
         .map_err(|e| AppError::Config(e.to_string()))?;
     println!("Profile '{profile}' unlocked for {ttl_minutes} minute(s).");
     Ok(())
@@ -1291,22 +1686,292 @@ async fn cmd_lock() -> Result<()> {
     Ok(())
 }
 
+/// Change the passphrase on the active profile. Opens the encrypted envelope
+/// with the current passphrase and re-seals the *same* inner bundle (session +
+/// CMK) under a fresh Argon2id KEK from the new passphrase. The CMK is
+/// preserved verbatim, so every CMK-sealed external item still decrypts; only
+/// the on-disk wrapping changes.
+async fn cmd_passphrase(old: Option<String>, new: Option<String>) -> Result<()> {
+    let profile = client::active_profile();
+    let path = client::Session::path_for(&profile)
+        .map_err(|e| AppError::Config(e.to_string()))?;
+    let bytes = std::fs::read(&path)
+        .map_err(|_| AppError::Config(format!("no such profile '{profile}' — run `blackbook login` first")))?;
+    let env: credstore::EncryptedProfile = serde_json::from_slice(&bytes)
+        .map_err(|_| AppError::Config(format!(
+            "profile '{profile}' is not an encrypted profile (legacy plaintext); re-run `blackbook login` to protect it")))?;
+
+    // Current passphrase: flag → $BLACKBOOK_OLD_PASSPHRASE → $BLACKBOOK_PASSPHRASE → prompt.
+    let old_pp: Zeroizing<String> = match old.filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("BLACKBOOK_OLD_PASSPHRASE").ok().filter(|s| !s.is_empty())) {
+        Some(p) => Zeroizing::new(p),
+        None => credstore::resolve_passphrase(None, &format!("Current passphrase for '{profile}': "), false)?,
+    };
+    let inner = env.open_with_passphrase(&old_pp)
+        .map_err(|_| AppError::Config("current passphrase is incorrect".into()))?;
+
+    // New passphrase: flag → $BLACKBOOK_NEW_PASSPHRASE → prompt (confirmed).
+    let new_pp: Zeroizing<String> = match new.filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("BLACKBOOK_NEW_PASSPHRASE").ok().filter(|s| !s.is_empty())) {
+        Some(p) => Zeroizing::new(p),
+        None => credstore::resolve_passphrase(None, "New passphrase: ", true)?,
+    };
+    if *new_pp == *old_pp {
+        return Err(AppError::Config("new passphrase is the same as the current one".into()));
+    }
+
+    // Re-seal the exact inner bundle under the new passphrase, write atomically,
+    // and refresh the agent so the session stays unlocked.
+    let sealed = credstore::seal_profile(&new_pp, &inner)
+        .map_err(|e| AppError::Config(e.to_string()))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&sealed)?)?;
+    std::fs::rename(&tmp, &path)?;
+    if let Ok(kek) = sealed.derive_kek(&new_pp) {
+        let _ = credstore::agent_store(&profile, kek.as_slice(), credstore::DEFAULT_AGENT_TTL_SECS);
+    }
+    println!("✓ passphrase changed for profile '{profile}'. The client master key was preserved — all external data still decrypts.");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shell completions
+//
+// The completion "brain" is the hidden `__complete` subcommand: the shell
+// passes it the words typed so far and it prints one candidate per line. It
+// introspects clap's own command tree for command/flag *names* (so it can
+// never drift from the real CLI) and reads local `~/.bbk` data for dynamic
+// *values* (profile names, domains, resident files). It performs NO network
+// I/O — server-side resource names are deliberately not completed (that would
+// fire an authenticated request, hit the audit log, and leak names on every
+// <Tab>).
+// ---------------------------------------------------------------------------
+
+/// Emit a shell completion script. The script registers a native completer
+/// that calls back into this binary's `__complete`, so all logic stays in Rust.
+fn cmd_completions(shell: &str) -> Result<()> {
+    // Absolute path to this exe, so completion works without the binary on PATH.
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "blackbook".to_string());
+    match shell.to_lowercase().as_str() {
+        "powershell" | "pwsh" | "ps" => print!("{}", powershell_script(&exe)),
+        "bash" => print!("{}", bash_script(&exe)),
+        "zsh" => print!("{}", zsh_script(&exe)),
+        "fish" => print!("{}", fish_script(&exe)),
+        other => return Err(AppError::Config(format!(
+            "unknown shell '{other}' — choose powershell, bash, zsh, or fish"))),
+    }
+    Ok(())
+}
+
+/// The completion brain. `words` is the full command line argv (`blackbook`,
+/// then everything typed). Prints candidates, one per line.
+fn cmd_complete(words: &[String]) {
+    use std::io::Write;
+    let cands = complete_candidates(words);
+    let mut out = std::io::stdout().lock();
+    for c in cands {
+        let _ = writeln!(out, "{c}");
+    }
+}
+
+/// Compute completion candidates for a command line. Pure + side-effect-free
+/// apart from reading local `~/.bbk` files, so it's easy to reason about.
+fn complete_candidates(words: &[String]) -> Vec<String> {
+    // words[0] is the program name; the rest are real tokens. The final token
+    // is the (possibly empty) word being completed.
+    let args = if words.is_empty() { &[][..] } else { &words[1..] };
+    let cur = args.last().cloned().unwrap_or_default();
+    let prev = if args.len() >= 2 { args[args.len() - 2].clone() } else { String::new() };
+
+    // 1) Value completion: if the previous token is a flag that takes a known
+    //    local value, complete that value set regardless of position.
+    if let Some(vals) = value_candidates_for_flag(&prev) {
+        return filter_prefix(vals, &cur);
+    }
+
+    // 2) Positional value completion for a few verbs whose first argument is a
+    //    locally-known name (e.g. `profile use <name>`, `file get <resident>`).
+    if let Some(vals) = positional_value_candidates(args) {
+        return filter_prefix(vals, &cur);
+    }
+
+    // 3) Otherwise complete command / subcommand / flag *names* by walking
+    //    clap's command tree to the current subcommand context.
+    let cmd = Cli::command();
+    let ctx = resolve_subcommand(&cmd, args);
+    let mut out: Vec<String> = Vec::new();
+    // Subcommand names (only if the current word isn't a flag).
+    if !cur.starts_with('-') {
+        for sub in ctx.get_subcommands() {
+            if sub.is_hide_set() { continue; }
+            out.push(sub.get_name().to_string());
+        }
+    }
+    // Flags valid in this context (long names; plus global flags from the root).
+    for a in ctx.get_arguments().chain(cmd.get_arguments()) {
+        if let Some(long) = a.get_long() {
+            let f = format!("--{long}");
+            if !out.contains(&f) { out.push(f); }
+        }
+    }
+    filter_prefix(out, &cur)
+}
+
+/// Local value sets for flags that take a name we already know on this machine.
+fn value_candidates_for_flag(flag: &str) -> Option<Vec<String>> {
+    match flag {
+        "-P" | "--profile" => Some(local_profiles()),
+        "-D" | "--domain" => Some(local_domains()),
+        _ => None,
+    }
+}
+
+/// First-positional value completion for verbs whose argument is local.
+fn positional_value_candidates(args: &[String]) -> Option<Vec<String>> {
+    // Find the first non-flag token (the subcommand path), e.g. ["profile","use"].
+    let path: Vec<&str> = args.iter()
+        .map(|s| s.as_str())
+        .filter(|s| !s.starts_with('-'))
+        .collect();
+    match path.as_slice() {
+        // `profile use|show|rm <name>` → known profiles
+        ["profile", "use", ..] | ["profile", "show", ..] | ["profile", "rm", ..] =>
+            Some(local_profiles()),
+        // `domain use <name>` → known domains
+        ["domain", "use", ..] => Some(local_domains()),
+        // `file get|rm <name>` → resident files this machine actually holds
+        ["file", "get", ..] | ["file", "rm", ..] => Some(local_resident_files()),
+        _ => None,
+    }
+}
+
+/// Walk the clap command tree following the subcommand tokens in `args`,
+/// returning the deepest matched command (the completion context).
+fn resolve_subcommand<'a>(root: &'a clap::Command, args: &[String]) -> &'a clap::Command {
+    let mut ctx = root;
+    for tok in args {
+        if tok.starts_with('-') { continue; }
+        match ctx.get_subcommands().find(|s| s.get_name() == tok
+            || s.get_all_aliases().any(|a| a == tok)) {
+            Some(sub) => ctx = sub,
+            None => break,
+        }
+    }
+    ctx
+}
+
+fn filter_prefix(mut v: Vec<String>, prefix: &str) -> Vec<String> {
+    if !prefix.is_empty() && !prefix.starts_with('-') {
+        v.retain(|c| c.starts_with(prefix));
+    } else if prefix.starts_with('-') {
+        v.retain(|c| c.starts_with(prefix));
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+fn local_profiles() -> Vec<String> {
+    client::Session::list_profiles().unwrap_or_default()
+}
+
+/// Domains we can infer locally: every profile's saved default-domain pref,
+/// plus the always-present `default`. (No network — this is best-effort.)
+fn local_domains() -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    set.insert("default".to_string());
+    for p in local_profiles() {
+        if let Some(d) = client::Session::read_domain_pref(&p) { set.insert(d); }
+    }
+    set.into_iter().collect()
+}
+
+/// Resident files this machine holds, from the local index (`<domain>/<name>`).
+/// Returns the bare names.
+fn local_resident_files() -> Vec<String> {
+    resident_index_load().keys()
+        .map(|k| k.rsplit('/').next().unwrap_or(k).to_string())
+        .collect()
+}
+
+fn powershell_script(exe: &str) -> String {
+    format!(r#"# Blackbook PowerShell completion. Add to your $PROFILE:
+#   blackbook completions powershell | Out-String | Invoke-Expression
+Register-ArgumentCompleter -Native -CommandName blackbook -ScriptBlock {{
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $words = @($commandAst.CommandElements | ForEach-Object {{ $_.ToString() }})
+    # If the cursor is on a fresh trailing space, add an empty word to complete.
+    if ($commandAst.CommandElements[-1].Extent.EndOffset -lt $cursorPosition) {{
+        $words += ''
+    }}
+    & '{exe}' __complete -- @words 2>$null | ForEach-Object {{
+        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+    }}
+}}
+"#)
+}
+
+fn bash_script(exe: &str) -> String {
+    format!(r#"# Blackbook bash completion. Source it:  source <(blackbook completions bash)
+_blackbook() {{
+    local IFS=$'\n'
+    COMPREPLY=( $('{exe}' __complete -- "${{COMP_WORDS[@]}}" 2>/dev/null) )
+}}
+complete -F _blackbook blackbook
+"#)
+}
+
+fn zsh_script(exe: &str) -> String {
+    format!(r#"# Blackbook zsh completion. Source it:  source <(blackbook completions zsh)
+_blackbook() {{
+    local -a c
+    c=(${{(f)"$('{exe}' __complete -- ${{words[@]}} 2>/dev/null)"}})
+    compadd -- $c
+}}
+compdef _blackbook blackbook
+"#)
+}
+
+fn fish_script(exe: &str) -> String {
+    format!(r#"# Blackbook fish completion. Source it:  blackbook completions fish | source
+complete -c blackbook -f -a "({exe} __complete -- (commandline -opc) (commandline -ct) 2>/dev/null)"
+"#)
+}
+
 async fn cmd_whoami() -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, None, None)?;
     let me = bb.whoami().await?;
     println!("{} ({}) — id {} — auth: {}", me.name, me.role, me.id, me.auth_method);
     println!("server: {}", session.server);
+    if let Some(ud) = me.user_domain.as_deref() {
+        println!("user domain: {ud}");
+    }
+    // Show this identity's client-certificate fingerprint as a visual
+    // "randomart" (and a compact braille rendering) so it can be eyeballed
+    // against what the server vouches — the way SSH shows key art.
+    if let Some(cert_pem) = session.cert_pem.as_deref() {
+        if let Ok(fp_hex) = tunnel_crypto::cert_fingerprint(cert_pem) {
+            if let Ok(fp) = hex::decode(&fp_hex) {
+                println!("cert fingerprint (SHA3-256): {}", &fp_hex[..32.min(fp_hex.len())]);
+                println!("  braille: {}", presentation::braille(&fp));
+                println!("{}", presentation::randomart(&fp, &me.name));
+            }
+        }
+    }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_put(
     name: String, value: Option<String>,
     mfa_required: bool, delete_on_read: bool, max_reads: Option<i64>,
     rotate_on_read: bool,
     quorum: Option<i32>, signatories: Vec<String>,
     overwrite: bool, preserve_on_cleanup: bool, no_overwrite: bool,
-    external: bool, external_passphrase: Option<String>,
+    ext: ExtFlags,
     domain: Option<String>, mfa: Option<String>,
 ) -> Result<()> {
     let session = client::Session::load()?;
@@ -1315,9 +1980,12 @@ async fn cmd_put(
         eprint!("value (stdin): ");
         read_stdin_line()
     });
-    if external && rotate_on_read {
+    // Secrets: data residency (--external-data / --external) is not available;
+    // only the key axis applies. resolve_ext_spec enforces that.
+    let spec = resolve_ext_spec(&ext, /* data_allowed = */ false)?;
+    if spec.is_some() && rotate_on_read {
         return Err(AppError::Config(
-            "--rotate-on-read is meaningless for --external secrets (the server can't re-key what it can't read)".into()));
+            "--rotate-on-read is meaningless for client-side secrets (the server can't re-key what it can't read)".into()));
     }
     let flags = if mfa_required || delete_on_read || max_reads.is_some()
         || rotate_on_read || preserve_on_cleanup || no_overwrite {
@@ -1337,12 +2005,10 @@ async fn cmd_put(
         (None, true) => None,
     };
     let mut ext_mode_label = "";
-    let resp = if external {
+    let resp = if let Some(spec) = spec {
         // Encrypt locally; the server only ever sees the opaque envelope.
-        // Default to the profile's CMK (no passphrase); an explicit passphrase
-        // upgrades to Argon2id.
-        let key = ext_key_for_put(&session, external_passphrase)?;
-        ext_mode_label = match key { ExtKey::Cmk(_) => " [external/CMK]", ExtKey::Passphrase(_) => " [external/passphrase]" };
+        let key = ext_key_for_spec(&spec, &session, ext.passphrase)?;
+        ext_mode_label = match key { ExtKey::Cmk(_) => " [external-key/managed]", ExtKey::Passphrase(_) => " [external-key/passphrase]" };
         let envelope = external_seal(&key, value.as_bytes())?;
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&envelope);
@@ -1415,6 +2081,63 @@ async fn cmd_get(
         return Ok(());
     }
     println!("{}", resp.data);
+    Ok(())
+}
+
+/// Resolve the *target* key for a rekey from the rekey flags. `--external-key`
+/// → managed (CMK); `--external-passphrase` → a new user passphrase; neither →
+/// default to managed (the natural "drop the passphrase" choice). The two are
+/// mutually exclusive. Shared by `rekey` (secrets) and `file rekey`.
+fn rekey_target_key(
+    session: &client::Session, external_key: bool, new_passphrase: Option<String>,
+) -> Result<ExtKey> {
+    let pass = new_passphrase.filter(|s| !s.is_empty());
+    if external_key && pass.is_some() {
+        return Err(AppError::Config(
+            "choose one target key: --external-key (managed) OR --external-passphrase (user).".into()));
+    }
+    match pass {
+        Some(p) => Ok(ExtKey::Passphrase(p)),
+        None => session.cmk_bytes().map(ExtKey::Cmk).ok_or_else(|| AppError::Config(
+            "this profile has no managed key (CMK) to rekey to. Re-run `blackbook login`, \
+             or pass --external-passphrase to set a user passphrase.".into())),
+    }
+}
+
+fn ext_key_label(k: &ExtKey) -> &'static str {
+    match k { ExtKey::Cmk(_) => "managed (CMK)", ExtKey::Passphrase(_) => "passphrase" }
+}
+
+/// Change the client-side key on an external secret. Fetches the opaque
+/// envelope, decrypts it with the current key (old passphrase / CMK), and
+/// re-seals the *same plaintext* under the new key, then stores it back with
+/// `overwrite`. Only the wrapping changes.
+async fn cmd_rekey(
+    name: String, old_external_passphrase: Option<String>,
+    external_key: bool, external_passphrase: Option<String>,
+    domain: Option<String>, mfa: Option<String>,
+) -> Result<()> {
+    let session = client::Session::load()?;
+    let bb = build_client(&session, domain, mfa)?;
+    let resp = bb.retrieve_with_request(&name, None).await?;
+    if !resp.external {
+        return Err(AppError::Config(format!(
+            "'{name}' is a normal (server-side) secret, not client-side — there is no external key to change.")));
+    }
+    let envelope_b64 = resp.envelope.ok_or_else(||
+        AppError::Crypto("server marked secret external but returned no envelope".into()))?;
+    use base64::Engine as _;
+    let envelope = base64::engine::general_purpose::STANDARD.decode(&envelope_b64)
+        .map_err(|_| AppError::Crypto("envelope is not valid base64".into()))?;
+    let env = ext_decode(&envelope)?;
+    // Decrypt with the *current* key.
+    let plain = external_open(&env, &session, old_external_passphrase)?;
+    // Re-seal under the *new* key and store back.
+    let new_key = rekey_target_key(&session, external_key, external_passphrase)?;
+    let new_env = external_seal(&new_key, &plain)?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&new_env);
+    bb.store_external(&name, &b64, None, None, /* overwrite = */ true).await?;
+    println!("✓ rekeyed secret '{name}' → {}.", ext_key_label(&new_key));
     Ok(())
 }
 
@@ -1548,10 +2271,14 @@ fn rules_summary(flags: &client::ResourceFlagsView, read_count: i64,
     if parts.is_empty() { "-".into() } else { parts.join(", ") }
 }
 
-async fn cmd_ls(domain: Option<String>, mfa: Option<String>) -> Result<()> {
+async fn cmd_ls(domain: Option<String>, mfa: Option<String>, json: bool) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, domain, mfa)?;
     let resp = bb.list().await?;
+    if json {
+        println!("{}", serde_json::to_string(&resp)?);
+        return Ok(());
+    }
     if resp.count == 0 { println!("(no secrets)"); return Ok(()); }
     println!("{:<28}  {:<8}  {:<10}  {:<24}  {}", "NAME", "KIND", "STATUS", "UPDATED", "RULES");
     println!("{}", "-".repeat(118));
@@ -1596,28 +2323,106 @@ async fn cmd_rm(name: String, yes: bool, domain: Option<String>, mfa: Option<Str
     Ok(())
 }
 
+async fn cmd_tunnel(cmd: TunnelCmd) -> Result<()> {
+    use tunnel_client::Proto;
+    let session = client::Session::load()?;
+    let bb = build_client(&session, None, None)?;
+    let me = bb.whoami().await?;
+    let my_name = me.name.clone();
+    let my_cert = session.cert_pem.clone()
+        .ok_or_else(|| AppError::Config("profile has no client certificate".into()))?;
+    let my_key = session.key_pem.clone()
+        .ok_or_else(|| AppError::Config("profile has no client key".into()))?;
+
+    match cmd {
+        TunnelCmd::Ls => {
+            let v = bb.tunnel_list().await?;
+            let tunnels = v.get("tunnels").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+            if tunnels.is_empty() { println!("(no active tunnels)"); return Ok(()); }
+            println!("{:<26}  {:<14}  {:<14}  {}", "ID", "OFFERER", "TARGET", "STATE");
+            println!("{}", "-".repeat(70));
+            for t in tunnels {
+                println!("{:<26}  {:<14}  {:<14}  {}",
+                    t.get("id").and_then(|x| x.as_str()).unwrap_or("?"),
+                    t.get("offerer").and_then(|x| x.as_str()).unwrap_or("?"),
+                    t.get("target").and_then(|x| x.as_str()).unwrap_or("?"),
+                    t.get("state").and_then(|x| x.as_str()).unwrap_or("?"));
+            }
+            Ok(())
+        }
+        TunnelCmd::Forward { peer, listen, target, udp } => {
+            let proto = if udp { Proto::Udp } else { Proto::Tcp };
+            // Offer the tunnel, then connect and run the handshake.
+            let tid = bb.tunnel_offer(&peer).await?;
+            println!("🔌 offered tunnel {tid} to '{peer}'. Waiting for them to `tunnel accept`…");
+            let mut ws = bb.tunnel_connect_ws(&tid).await
+                .map_err(|e| AppError::Client(e.to_string()))?;
+            let (sess, vouch) = tunnel_client::handshake(&mut ws, &my_name, &my_cert, &my_key).await
+                .map_err(|e| AppError::Config(format!("tunnel handshake: {e}")))?;
+            println!("🔒 secured E2E with '{}' (cert {}…) — server cannot read this tunnel.",
+                     vouch.peer_name, &vouch.peer_fingerprint[..16.min(vouch.peer_fingerprint.len())]);
+            println!("➡️  forwarding {} {listen} → {}:{target}",
+                     if udp { "udp" } else { "tcp" }, vouch.peer_name);
+            tunnel_client::run_listener(ws, sess, proto, listen, target).await
+                .map_err(|e| AppError::Config(format!("tunnel: {e}")))?;
+            Ok(())
+        }
+        TunnelCmd::Accept { from, wait_timeout } => {
+            // Poll for an offer addressed to us, then connect + serve dials.
+            println!("👂 waiting for a tunnel offer{}…",
+                     from.as_deref().map(|f| format!(" from '{f}'")).unwrap_or_default());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout);
+            let tid = loop {
+                let v = bb.tunnel_list().await?;
+                let found = v.get("tunnels").and_then(|x| x.as_array()).and_then(|arr| {
+                    arr.iter().find(|t| {
+                        t.get("target").and_then(|x| x.as_str()) == Some(my_name.as_str())
+                        && t.get("state").and_then(|x| x.as_str()) != Some("connected")
+                        && from.as_deref().map_or(true, |f| t.get("offerer").and_then(|x| x.as_str()) == Some(f))
+                    }).and_then(|t| t.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                });
+                if let Some(id) = found { break id; }
+                if std::time::Instant::now() >= deadline {
+                    return Err(AppError::Config(format!("no tunnel offer within {wait_timeout}s")));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            };
+            let mut ws = bb.tunnel_connect_ws(&tid).await
+                .map_err(|e| AppError::Client(e.to_string()))?;
+            let (sess, vouch) = tunnel_client::handshake(&mut ws, &my_name, &my_cert, &my_key).await
+                .map_err(|e| AppError::Config(format!("tunnel handshake: {e}")))?;
+            println!("🔒 secured E2E with '{}' (cert {}…) — serving their dial requests.",
+                     vouch.peer_name, &vouch.peer_fingerprint[..16.min(vouch.peer_fingerprint.len())]);
+            tunnel_client::run_target(ws, sess).await
+                .map_err(|e| AppError::Config(format!("tunnel: {e}")))?;
+            Ok(())
+        }
+    }
+}
+
 async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, domain, mfa)?;
     match cmd {
         FileCmd::Put { path, name, mime, mfa_required, delete_on_read, max_reads,
                        rotate_on_read, quorum, signatories, overwrite,
-                       preserve_on_cleanup, no_overwrite, external, external_passphrase,
-                       resident, server_copy, shred } => {
+                       preserve_on_cleanup, no_overwrite, external_key, external_passphrase,
+                       external, external_data, server_copy, shred, external_passphrase_env } => {
             let body = std::fs::read(&path)?;
             let name = name.unwrap_or_else(|| {
                 path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
             });
             if name.is_empty() { return Err(AppError::Config("could not derive --name from path".into())); }
-            if external && resident {
-                return Err(AppError::Config("--external and --resident are mutually exclusive".into()));
-            }
-            if (external || resident) && rotate_on_read {
+            // Files allow both axes. resolve_ext_spec validates key/data combos.
+            let ext = ExtFlags { external, external_key, external_data, passphrase: external_passphrase, passphrase_from_env: external_passphrase_env };
+            let spec = resolve_ext_spec(&ext, /* data_allowed = */ true)?;
+            let resident = matches!(spec, Some(ExtSpec { data: DataLoc::Resident, .. }));
+            if spec.is_some() && rotate_on_read {
                 return Err(AppError::Config(
                     "--rotate-on-read is meaningless for client-side files (the server can't re-key what it can't read)".into()));
             }
             if !resident && (server_copy || shred) {
-                return Err(AppError::Config("--server-copy and --shred require --resident".into()));
+                return Err(AppError::Config("--server-copy and --shred require --external-data (resident)".into()));
             }
             match (quorum, signatories.is_empty()) {
                 (Some(_), true) => return Err(AppError::Config(
@@ -1631,8 +2436,8 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
             if resident {
                 // Encrypt locally, stash the ciphertext on this machine, and
                 // upload only the manifest + the server's key-component half.
-                let key = ext_key_for_put(&session, external_passphrase)?;
-                let label = match key { ExtKey::Cmk(_) => "CMK", ExtKey::Passphrase(_) => "passphrase" };
+                let key = ext_key_for_spec(spec.as_ref().unwrap(), &session, ext.passphrase.clone())?;
+                let label = match key { ExtKey::Cmk(_) => "managed", ExtKey::Passphrase(_) => "passphrase" };
                 let (stash, kc_b64, _) = resident_seal(&key, &body, &name)?;
                 // Persist the stash file under ~/.bbk/resident/<id>.bbkr.
                 let stash_id = format!("{}.bbkr", blackbook_core::Id::new(16).to_hex());
@@ -1660,26 +2465,29 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                         let mut idx = resident_index_load();
                         idx.insert(resident_key(&dom, &name), stash_id);
                         resident_index_save(&idx)?;
-                        if shred { let _ = std::fs::remove_file(&path); }
+                        // --shred: overwrite the original plaintext before
+                        // unlinking, so the cleartext isn't trivially recoverable
+                        // from freed blocks (best-effort; see secure_delete docs).
+                        if shred { let _ = credstore::secure_delete(&path); }
                         let copy = if server_copy { " + server backup" } else { "" };
-                        let shred_note = if shred { "; original shredded" } else { "" };
+                        let shred_note = if shred { "; original shredded (overwritten)" } else { "" };
                         println!("registered resident {} (stash {}, sha3:{}…) [resident/{}{}]{}",
                                  resp.name, stash_path.display(), &resp.content_hash[..16], label, copy, shred_note);
                     }
                     Err(e) => {
-                        // Roll back the local stash so we don't leave an orphan.
-                        let _ = std::fs::remove_file(&stash_path);
+                        // Roll back the local stash so we don't leave an orphan;
+                        // the stash holds ciphertext + a wrapped key, so scrub it.
+                        let _ = credstore::secure_delete(&stash_path);
                         return Err(e.into());
                     }
                 }
             } else {
-                // For external files, encrypt locally: the uploaded body is the
-                // ciphertext and the server keeps only the envelope header meta.
-                // Default to the CMK; an explicit passphrase upgrades to Argon2id.
+                // Data-in-server: either external-key (encrypt locally, server
+                // stores the opaque envelope) or normal (server-side encryption).
                 let mut file_ext_label = "";
-                let (upload_body, external_meta) = if external {
-                    let key = ext_key_for_put(&session, external_passphrase)?;
-                    file_ext_label = match key { ExtKey::Cmk(_) => " [external/CMK]", ExtKey::Passphrase(_) => " [external/passphrase]" };
+                let (upload_body, external_meta) = if let Some(spec) = spec.as_ref() {
+                    let key = ext_key_for_spec(spec, &session, ext.passphrase.clone())?;
+                    file_ext_label = match key { ExtKey::Cmk(_) => " [external-key/managed]", ExtKey::Passphrase(_) => " [external-key/passphrase]" };
                     let (meta, ct) = external_seal_parts(&key, &body)?;
                     use base64::Engine as _;
                     (ct, Some(base64::engine::general_purpose::STANDARD.encode(&meta)))
@@ -1691,7 +2499,7 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     mfa_required, delete_on_read, max_reads, rotate_on_read,
                     preserve_on_cleanup, no_overwrite, overwrite,
                     quorum, signatories,
-                    external, external_meta,
+                    external: external_meta.is_some(), external_meta,
                     resident: false, key_component: None, server_copy: false,
                 };
                 let resp = bb.file_put(&name, upload_body, &opts).await?;
@@ -1758,8 +2566,12 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 }
             }
         }
-        FileCmd::Ls => {
+        FileCmd::Ls { json } => {
             let list = bb.file_list().await?;
+            if json {
+                println!("{}", serde_json::to_string(&list)?);
+                return Ok(());
+            }
             if list.count == 0 { println!("(no files)"); return Ok(()); }
             println!("{:<32}  {:>9}  {:<14}  {:<16}  {}", "NAME", "SIZE", "OWNER", "KIND", "RULES");
             println!("{}", "-".repeat(120));
@@ -1786,6 +2598,55 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
         FileCmd::Rotate { name } => {
             bb.file_rotate(&name).await?;
             println!("rotated DEK for '{name}'");
+        }
+        FileCmd::Rekey { name, old_external_passphrase, external_key, external_passphrase } => {
+            let dom = domain_label(&bb);
+            let new_key = rekey_target_key(&session, external_key, external_passphrase)?;
+            // Resident file? Then the ciphertext + server key-half never change —
+            // we only rewrap the client-half (Kf_c) in the local stash header.
+            // Detect locally (the stash is what we'd rewrap) without a download.
+            let idx = resident_index_load();
+            if let Some(stash_id) = idx.get(&resident_key(&dom, &name)).cloned() {
+                let stash_path = resident_dir()?.join(&stash_id);
+                let stash = std::fs::read(&stash_path)
+                    .map_err(|e| AppError::Config(format!("reading resident stash: {e}")))?;
+                let (header, ct) = resident_parse(&stash)?;
+                // Unwrap Kf_c with the current key.
+                let kf_c = resident_unwrap_client_half(&header, &session, old_external_passphrase)?;
+                // Re-wrap Kf_c under the new key, rewrite the stash header in place.
+                let new_stash = resident_rewrap(&new_key, &kf_c, &ct, &header.orig_name)?;
+                let tmp = stash_path.with_extension("bbkr.tmp");
+                std::fs::write(&tmp, &new_stash)?;
+                std::fs::rename(&tmp, &stash_path)?;
+                println!("✓ rekeyed resident file '{name}' → {} (local stash only; no re-upload).", ext_key_label(&new_key));
+            } else {
+                // External-key file: fetch, decrypt, re-seal, re-upload the envelope.
+                let dl = bb.file_get_download(&name, None).await?;
+                if dl.resident {
+                    return Err(AppError::Config(format!(
+                        "'{name}' is resident but this machine has no local stash for it — rekey must run where the stash lives.")));
+                }
+                let meta_b64 = dl.external_meta.ok_or_else(|| AppError::Config(format!(
+                    "'{name}' is a normal (server-side) file, not client-side — there is no external key to change.")))?;
+                use base64::Engine as _;
+                let mut envelope = base64::engine::general_purpose::STANDARD.decode(&meta_b64)
+                    .map_err(|_| AppError::Crypto("external meta is not valid base64".into()))?;
+                envelope.extend_from_slice(&dl.bytes);
+                let env = ext_decode(&envelope)?;
+                let plain = external_open(&env, &session, old_external_passphrase)?;
+                let (meta, ct) = external_seal_parts(&new_key, &plain)?;
+                let opts = client::FilePutOpts {
+                    mime: dl.content_type.as_deref(),
+                    mfa_required: false, delete_on_read: false, max_reads: None, rotate_on_read: false,
+                    preserve_on_cleanup: false, no_overwrite: false, overwrite: true,
+                    quorum: None, signatories: vec![],
+                    external: true,
+                    external_meta: Some(base64::engine::general_purpose::STANDARD.encode(&meta)),
+                    resident: false, key_component: None, server_copy: false,
+                };
+                bb.file_put(&name, ct, &opts).await?;
+                println!("✓ rekeyed external-key file '{name}' → {}.", ext_key_label(&new_key));
+            }
         }
     }
     Ok(())
@@ -1864,6 +2725,38 @@ async fn cmd_client(cmd: ClientCmd) -> Result<()> {
     Ok(())
 }
 
+/// Parse a rate string `N/PERIOD` → (max, period_secs). PERIOD is a number with
+/// an optional unit suffix `s`/`m`/`h`/`d` (a bare number means seconds).
+fn parse_rate(s: &str) -> Result<(i32, i32)> {
+    let (n, period) = s.split_once('/').ok_or_else(|| AppError::Config(
+        format!("rate must be N/PERIOD, e.g. 10/1h — got '{s}'")))?;
+    let max: i32 = n.trim().parse().map_err(|_| AppError::Config(format!("bad rate count '{n}'")))?;
+    let p = period.trim();
+    let split = p.find(|c: char| c.is_alphabetic()).unwrap_or(p.len());
+    let (num, unit) = p.split_at(split);
+    let num: i64 = num.parse().map_err(|_| AppError::Config(format!("bad rate period '{p}'")))?;
+    let secs = match unit {
+        "" | "s" => num,
+        "m" => num * 60,
+        "h" => num * 3600,
+        "d" => num * 86_400,
+        other => return Err(AppError::Config(format!("unknown period unit '{other}' (use s/m/h/d)"))),
+    };
+    if max <= 0 || secs <= 0 {
+        return Err(AppError::Config("rate count and period must be positive".into()));
+    }
+    Ok((max, secs as i32))
+}
+
+/// Render a period in whole seconds back to the most natural unit.
+fn fmt_period(secs: i32) -> String {
+    let s = secs as i64;
+    if s % 86_400 == 0 { format!("{}d", s / 86_400) }
+    else if s % 3600 == 0 { format!("{}h", s / 3600) }
+    else if s % 60 == 0 { format!("{}m", s / 60) }
+    else { format!("{s}s") }
+}
+
 async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, None, None)?;
@@ -1871,7 +2764,7 @@ async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
         AclCmd::Grant {
             subject, pattern,
             create, read, update, delete,
-            expires_at, not_before, max_uses,
+            expires_at, not_before, max_uses, rate, schedule,
         } => {
             // The rule's domain comes from the global --domain (default).
             let domain = domain.unwrap_or_else(|| "default".to_string());
@@ -1883,6 +2776,10 @@ async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
             if actions.is_empty() {
                 return Err(AppError::Config("at least one of --create/--read/--update/--delete required".into()));
             }
+            let (rate_max, rate_period_secs) = match rate.as_deref() {
+                Some(s) => { let (m, p) = parse_rate(s)?; (Some(m), Some(p)) }
+                None => (None, None),
+            };
             let (client_name, group_domain) = match subject.strip_prefix('@') {
                 Some(g) => (None, Some(g.to_string())),
                 None    => (Some(subject.clone()), None),
@@ -1891,31 +2788,42 @@ async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
                 client_name, group_domain,
                 domain: Some(domain.clone()),
                 expires_at, not_before, max_uses,
+                rate_max, rate_period_secs, schedule: schedule.clone(),
             };
             bb.grant_acl(&pattern, &actions, opts).await?;
-            println!("granted {} on '{pattern}' to {} (domain={domain})",
-                     actions.join("+"), subject);
+            let extra = [
+                rate.as_ref().map(|r| format!("rate={r}")),
+                schedule.as_ref().map(|s| format!("schedule='{s}'")),
+            ].into_iter().flatten().collect::<Vec<_>>().join(", ");
+            println!("granted {} on '{pattern}' to {} (domain={domain}){}",
+                     actions.join("+"), subject,
+                     if extra.is_empty() { String::new() } else { format!(" [{extra}]") });
         }
         AclCmd::Ls => {
             let list = bb.list_acl().await?;
             if list.count == 0 { println!("(no acl entries)"); return Ok(()); }
-            println!("{:<14}  {:<10}  {:<22}  {:<28}  {:<12}  {:<24}  USE",
-                     "ID", "DOMAIN", "SUBJECT", "PATTERN", "ACTIONS", "EXPIRES");
+            println!("{:<14}  {:<10}  {:<20}  {:<24}  {:<10}  {:<8}  {}",
+                     "ID", "DOMAIN", "SUBJECT", "PATTERN", "ACTIONS", "USE", "LIMITS");
             println!("{}", "-".repeat(140));
             for e in list.entries {
                 let subject = e.client_name
-                    .map(|c| c)
                     .or_else(|| e.group_domain.map(|g| format!("@{g}")))
                     .unwrap_or_else(|| "?".into());
                 let use_disp = match (e.max_uses, e.use_count) {
                     (Some(m), c) => format!("{c}/{m}"),
                     (None, c) => format!("{c}"),
                 };
-                println!("{:<14}  {:<10}  {:<22}  {:<28}  {:<12}  {:<24}  {}",
+                // Compact limits column: rate, schedule, expiry.
+                let mut limits: Vec<String> = Vec::new();
+                if let (Some(m), Some(p)) = (e.rate_max, e.rate_period_secs) {
+                    limits.push(format!("rate {m}/{}", fmt_period(p)));
+                }
+                if let Some(s) = &e.schedule { limits.push(format!("cron \"{s}\"")); }
+                if let Some(x) = &e.expires_at { limits.push(format!("exp {}", &x[..x.len().min(10)])); }
+                println!("{:<14}  {:<10}  {:<20}  {:<24}  {:<10}  {:<8}  {}",
                          e.id, e.domain, subject, e.resource_pattern,
-                         e.actions.join(","),
-                         e.expires_at.as_deref().unwrap_or("-"),
-                         use_disp);
+                         e.actions.join(","), use_disp,
+                         if limits.is_empty() { "-".into() } else { limits.join(", ") });
             }
         }
         AclCmd::Revoke { id } => {
@@ -1983,9 +2891,59 @@ async fn cmd_domain(cmd: DomainCmd) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_audit(limit: i64, verify: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn cmd_audit(
+    limit: i64, verify: bool, archive: bool, keep_last: Option<i64>, before: Option<String>,
+    prune: bool, verify_archive: Option<String>, list_archives: bool,
+) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, None, None)?;
+
+    if let Some(file) = verify_archive {
+        let v = bb.audit_archive_verify(&file).await?;
+        let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+        if ok {
+            println!("archive '{file}' OK — verified {} row(s) (id {}..{})",
+                     v.get("verified").and_then(|x| x.as_i64()).unwrap_or(0),
+                     v.get("first_id").and_then(|x| x.as_i64()).unwrap_or(0),
+                     v.get("last_id").and_then(|x| x.as_i64()).unwrap_or(0));
+        } else {
+            println!("archive '{file}' BROKEN — {}", v.get("reason").and_then(|x| x.as_str()).unwrap_or("unknown"));
+        }
+        return Ok(());
+    }
+    if list_archives {
+        let v = bb.audit_archives().await?;
+        let empty = vec![];
+        let arr = v.get("archives").and_then(|x| x.as_array()).unwrap_or(&empty);
+        if arr.is_empty() { println!("(no archives)"); return Ok(()); }
+        println!("{:<44}  {}", "FILE", "SIZE");
+        println!("{}", "-".repeat(60));
+        for a in arr {
+            println!("{:<44}  {}", a.get("file").and_then(|x| x.as_str()).unwrap_or("?"),
+                     a.get("size_bytes").and_then(|x| x.as_u64()).unwrap_or(0));
+        }
+        return Ok(());
+    }
+    if archive {
+        if keep_last.is_none() && before.is_none() {
+            return Err(AppError::Config("specify --keep-last N or --before TIMESTAMP".into()));
+        }
+        let v = bb.audit_archive(keep_last, before.as_deref(), prune).await?;
+        let n = v.get("archived").and_then(|x| x.as_i64()).unwrap_or(0);
+        if n == 0 {
+            println!("nothing archived — {}", v.get("message").and_then(|x| x.as_str()).unwrap_or(""));
+        } else {
+            println!("archived {n} row(s) (id {}..{}) → {} ({} bytes); pruned {}",
+                     v.get("first_id").and_then(|x| x.as_i64()).unwrap_or(0),
+                     v.get("last_id").and_then(|x| x.as_i64()).unwrap_or(0),
+                     v.get("file").and_then(|x| x.as_str()).unwrap_or("?"),
+                     v.get("size_bytes").and_then(|x| x.as_u64()).unwrap_or(0),
+                     v.get("pruned").and_then(|x| x.as_u64()).unwrap_or(0));
+        }
+        return Ok(());
+    }
+
     if verify {
         let v = bb.audit_verify().await?;
         let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -2063,6 +3021,50 @@ fn server_sans(bind: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Process hardening
+// ---------------------------------------------------------------------------
+
+/// Best-effort OS hardening for the long-lived server, applied before any key
+/// material is loaded. Two protections, both targeting "secrets must stay in
+/// RAM, never disk":
+///   1. **No core dumps** — a crash must not spill the master key / DEK to a
+///      core file. We zero `RLIMIT_CORE` *and* set `PR_SET_DUMPABLE=0` (which
+///      also blocks same-uid `ptrace` snooping).
+///   2. **No swap** — `mlockall` pins current and future pages in RAM so secret
+///      bytes can't be paged out to disk.
+///
+/// Every step is best-effort: in a hardened container `mlockall` can fail on a
+/// low `RLIMIT_MEMLOCK`, so we log and continue rather than refuse to boot.
+#[cfg(target_os = "linux")]
+fn harden_process() {
+    // SAFETY: plain libc calls with valid arguments; we only read their return
+    // codes and never dereference anything we didn't allocate on the stack.
+    unsafe {
+        let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0 {
+            log::warn!("hardening: could not disable core dumps (RLIMIT_CORE)");
+        }
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
+            log::warn!("hardening: could not set PR_SET_DUMPABLE=0");
+        }
+        if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) != 0 {
+            log::warn!("hardening: mlockall() failed (RLIMIT_MEMLOCK too low under this \
+                        container/cgroup?) — secret pages may be swappable. Raise the \
+                        memlock limit or disable swap on the host for full protection.");
+        } else {
+            log::info!("hardening: core dumps disabled and process memory locked (no swap).");
+        }
+    }
+}
+
+/// On non-Linux hosts the syscalls above aren't available; the server still
+/// runs, just without these OS-level guarantees.
+#[cfg(not(target_os = "linux"))]
+fn harden_process() {
+    log::info!("hardening: core-dump/swap locking is Linux-only; skipped on this platform.");
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -2099,7 +3101,25 @@ async fn main() -> Result<()> {
             }
         }
 
+        Commands::RekeyDek => {
+            let data_dir = std::env::var("BLACKBOOK_DATA_DIR")
+                .unwrap_or_else(|_| "/opt/blackbook/data".to_string());
+            let paths = persistence::DataPaths::under(&data_dir);
+            let provider = persistence::DekProvider::from_env()
+                .map_err(|e| AppError::Config(format!("master key: {e}")))?;
+            persistence::rekey_master_dek(&paths, &provider)
+                .map_err(|e| AppError::Config(format!("rekey: {e}")))?;
+            println!("✓ master DEK rotated under the '{}' provider (master key unchanged; \
+                      restart the server if you also rotated the keyfile).", provider.kind());
+        }
+
+        Commands::Web { bind } => {
+            webui::run_web(&bind).await.map_err(|e| AppError::Config(e.to_string()))?;
+        }
+
         Commands::Server { bind } => {
+            // Lock the process down before any key material is loaded into RAM.
+            harden_process();
             let db_url = cli.database_url.ok_or_else(|| AppError::Config("DATABASE_URL not provided".into()))?;
             log::info!("Initializing Blackbook server...");
             let db = Database::new(&db_url).await?;
@@ -2128,12 +3148,18 @@ async fn main() -> Result<()> {
                        paths.server_cert.display(), sans);
             let ca_shared: tls::SharedCa = Arc::new(ca);
 
-            // DEK + master key.
-            let passphrase = std::env::var("BLACKBOOK_MASTER_PASSPHRASE").ok();
-            let dek = persistence::resolve_dek(&paths, passphrase.as_deref())
+            // DEK + master key. The outermost key is produced by a provider
+            // (user passphrase, or a locally-wrapped keyfile) and never stored
+            // raw on disk. Fail closed: no provider → refuse to start.
+            let provider = persistence::DekProvider::from_env()
+                .map_err(|e| AppError::Config(format!("master key: {e}")))?;
+            log::info!("master DEK provider: {}", provider.kind());
+            let dek = persistence::resolve_dek(&paths, &provider)
                 .map_err(|e| AppError::Config(format!("persistence/DEK: {e}")))?;
+            drop(provider); // wipe the passphrase (if any) as soon as the DEK is resolved.
             let (keys, keys_new) = persistence::load_or_init_master(&paths, &dek)
                 .map_err(|e| AppError::Config(format!("persistence/master: {e}")))?;
+            drop(dek); // DEK is no longer needed; wipe it now rather than at scope end.
             log::info!("Master key {} at {}",
                        if keys_new { "generated" } else { "loaded" },
                        paths.master_key.display());
@@ -2159,21 +3185,24 @@ async fn main() -> Result<()> {
                     ) {
                         log::warn!("could not write admin bundle: {e}");
                     }
+                    // The token is deliberately NOT logged: container/journald
+                    // logs persist on disk (and are often shipped off-host), so
+                    // emitting the bearer token there would defeat its secrecy.
+                    // It lives only in the 0600 bundle on the data volume.
+                    let _ = &token; // consumed by write_admin_bundle above
                     log::warn!("================================================================");
-                    log::warn!("BLACKBOOK FIRST-RUN ADMIN BUNDLE  --  COPY IT NOW");
+                    log::warn!("BLACKBOOK FIRST-RUN ADMIN BUNDLE  --  RETRIEVE IT NOW");
                     log::warn!("");
-                    log::warn!("    Token  : {token}");
-                    log::warn!("    Bundle : {}", paths.admin_bundle.display());
+                    log::warn!("    Bundle : {}  (mode 0600, contains the token)", paths.admin_bundle.display());
                     log::warn!("");
                     log::warn!("    docker cp blackbook-app:/opt/blackbook/data/admin-bundle.json .");
                     log::warn!("    blackbook login admin-bundle.json      # saves to profile 'admin'");
                     log::warn!("");
                     log::warn!("    (The bundle's server URL defaults to {public_url};");
                     log::warn!("     override at login with `-s https://your-host:8443`.)");
-                    log::warn!("    The individual admin-cert.pem / admin-key.pem / admin-token");
-                    log::warn!("    files are still written alongside for convenience.");
-                    log::warn!("");
-                    log::warn!("This is the ONLY time the token appears in logs.");
+                    log::warn!("    Treat the bundle as a secret: copy it over a secure channel,");
+                    log::warn!("    then delete it from the volume. The token is NOT written to");
+                    log::warn!("    logs — only to the bundle file.");
                     log::warn!("================================================================");
                 }
                 Ok(None) => log::info!("Admin client already provisioned; not bootstrapping."),
@@ -2214,6 +3243,7 @@ async fn main() -> Result<()> {
                 audit_hmac_key,
                 name_index_key,
                 metadata_enc_key,
+                tunnels: tunnel_relay::TunnelHub::new(),
             };
 
             server::run_server(
@@ -2230,18 +3260,25 @@ async fn main() -> Result<()> {
         Commands::Logout => cmd_logout().await?,
         Commands::Unlock { ttl_minutes } => cmd_unlock(ttl_minutes).await?,
         Commands::Lock => cmd_lock().await?,
+        Commands::Passphrase { old, new } => cmd_passphrase(old, new).await?,
+        Commands::Completions { shell } => cmd_completions(&shell)?,
+        Commands::Complete { words } => cmd_complete(&words),
         Commands::Profile(cmd) => cmd_profile(cmd).await?,
         Commands::Whoami => cmd_whoami().await?,
-        Commands::Put { name, value, mfa_required, delete_on_read, max_reads, rotate_on_read, quorum, signatories, overwrite, preserve_on_cleanup, no_overwrite, external, external_passphrase } =>
+        Commands::Put { name, value, mfa_required, delete_on_read, max_reads, rotate_on_read, quorum, signatories, overwrite, preserve_on_cleanup, no_overwrite, external_key, external_passphrase, external, external_data, external_passphrase_env } =>
             cmd_put(name, value, mfa_required, delete_on_read, max_reads, rotate_on_read,
                     quorum, signatories, overwrite, preserve_on_cleanup, no_overwrite,
-                    external, external_passphrase,
+                    ExtFlags { external, external_key, external_data, passphrase: external_passphrase, passphrase_from_env: external_passphrase_env },
                     effective_domain.clone(), cli.mfa.clone()).await?,
         Commands::Get { name, request_id, wait, wait_timeout, external_passphrase } =>
             cmd_get(name, request_id, wait, wait_timeout, external_passphrase, effective_domain.clone(), cli.mfa.clone()).await?,
-        Commands::Ls => cmd_ls(effective_domain.clone(), cli.mfa.clone()).await?,
+        Commands::Ls { json } => cmd_ls(effective_domain.clone(), cli.mfa.clone(), json).await?,
         Commands::Rm { name, yes } => cmd_rm(name, yes, effective_domain.clone(), cli.mfa.clone()).await?,
+        Commands::Rekey { name, old_external_passphrase, external_key, external_passphrase } =>
+            cmd_rekey(name, old_external_passphrase, external_key, external_passphrase,
+                      effective_domain.clone(), cli.mfa.clone()).await?,
         Commands::File(cmd) => cmd_file(cmd, effective_domain.clone(), cli.mfa.clone()).await?,
+        Commands::Tunnel(cmd) => cmd_tunnel(cmd).await?,
         Commands::Client(cmd) => cmd_client(cmd).await?,
         Commands::Acl(cmd) => cmd_acl(cmd, effective_domain.clone()).await?,
         Commands::Domain(cmd) => cmd_domain(cmd).await?,
@@ -2249,9 +3286,61 @@ async fn main() -> Result<()> {
         Commands::Approve { request_id } => cmd_approve(request_id).await?,
         Commands::Requests { id, verbose } => cmd_requests(id, verbose).await?,
         Commands::Grants(cmd) => cmd_grants(cmd, effective_domain.clone()).await?,
-        Commands::Audit { limit, verify } => cmd_audit(limit, verify).await?,
+        Commands::Audit { limit, verify, archive, keep_last, before, prune, verify_archive, list_archives } =>
+            cmd_audit(limit, verify, archive, keep_last, before, prune, verify_archive, list_archives).await?,
         Commands::Cleanup => cmd_cleanup(effective_domain.clone()).await?,
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags() -> ExtFlags {
+        ExtFlags {
+            external: false, external_key: false, external_data: false,
+            passphrase: None, passphrase_from_env: false,
+        }
+    }
+
+    // These cases are deliberately independent of $BLACKBOOK_EXTERNAL_PASSPHRASE:
+    // each resolves before (or without) consulting the env, so they're stable
+    // regardless of the runner's environment.
+
+    #[test]
+    fn no_external_flags_means_normal_storage() {
+        // A plain put must never become client-side encrypted, even if the env
+        // var happens to be set — opt-in is explicit only.
+        assert!(resolve_ext_spec(&flags(), false).unwrap().is_none());
+    }
+
+    #[test]
+    fn external_key_selects_managed_in_server() {
+        let f = ExtFlags { external_key: true, ..flags() };
+        let spec = resolve_ext_spec(&f, false).unwrap().expect("external");
+        assert!(matches!(spec.key, KeySource::Managed));
+        assert!(matches!(spec.data, DataLoc::InServer));
+    }
+
+    #[test]
+    fn passphrase_env_opt_in_selects_passphrase_mode() {
+        // The env-sourced opt-in chooses the user-key path even though no argv
+        // passphrase value was supplied (the value is sourced later, in
+        // ext_key_for_spec). This is what lets the web console create a
+        // passphrase-sealed secret without the passphrase touching argv.
+        let f = ExtFlags { passphrase_from_env: true, ..flags() };
+        let spec = resolve_ext_spec(&f, false).unwrap().expect("external");
+        assert!(matches!(spec.key, KeySource::Passphrase));
+        assert!(matches!(spec.data, DataLoc::InServer));
+    }
+
+    #[test]
+    fn passphrase_env_plus_managed_is_rejected() {
+        // Managed key and a passphrase opt-in are contradictory — must be a
+        // clear error, not a silent pick.
+        let f = ExtFlags { passphrase_from_env: true, external_key: true, ..flags() };
+        assert!(resolve_ext_spec(&f, false).is_err());
+    }
 }

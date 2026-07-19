@@ -28,11 +28,14 @@ The Blackbook Docker setup provides a secure, production-ready deployment of the
 **Key Files**:
 - `Dockerfile` - Multi-stage build (build + runtime)
 - `docker-compose.yml` - Service orchestration and networking
-- `config/postgres.conf` - PostgreSQL security configuration
-- `config/blackbook.env` - Application environment variables
-- `scripts/01-init-postgres.sql` - Database initialization
-- `scripts/generate-certificates.sh` - SSL/TLS certificate generation
-- `scripts/generate-certificates.ps1` - Windows certificate generation
+- `config/postgres.conf` - PostgreSQL config (SSL, SCRAM, logging), loaded via `-c config_file`
+- `config/pg_hba.conf` - Postgres auth rules (TLS-only, SCRAM; rejects plaintext)
+- `config/blackbook.env` - Example env vars (copy to `./.env`)
+- `scripts/01-blackbook-roles.sh` - Creates the least-privilege `blackbook_app` role on first boot
+- `scripts/postgres-entrypoint.sh` - Installs Postgres TLS certs with correct perms
+- `scripts/generate-postgres-certs.sh` - Generates the Postgres CA + server cert (run once)
+- `scripts/generate-certificates.{sh,ps1}` - *Optional* certs for a reverse proxy only; the
+  Blackbook **API** server auto-mints its own CA + cert (no manual step needed)
 
 ---
 
@@ -73,12 +76,12 @@ The Blackbook Docker setup provides a secure, production-ready deployment of the
 
 ### Database Access Control
 
-| User | Type | Tables | Permissions | Purpose |
-|------|------|--------|-------------|---------|
-| `blackbook_admin` | Role | All | Super | Admin/backup |
-| `blackbook_app` | User | secrets, credentials | SELECT/INSERT/UPDATE/DELETE | Application |
-| `blackbook_backup` | User | All | SELECT only | Backups |
-| `postgres` | System | System | Super | Database system |
+| User | Type | Scope | Privileges | Purpose |
+|------|------|-------|------------|---------|
+| `blackbook_admin` | Superuser | cluster | Super | Init / break-glass only — **not** used by the app |
+| `blackbook_app` | Login role | own `blackbook_*` objects in the one DB | USAGE+CREATE on `public`; owns its tables. **No** createrole/createdb/replication/bypassrls | The application (connects over TLS) |
+| `blackbook_backup` | Login role | `public` tables | SELECT only (optional, if `BACKUP_PASSWORD` set) | Read-only backups |
+| `postgres` | System | system | Super | Database system |
 
 ---
 
@@ -206,14 +209,18 @@ To customize:
 
 ### Database Initialization
 
-**File**: `scripts/01-init-postgres.sql`
+**File**: `scripts/01-blackbook-roles.sh` (runs once, on a fresh data volume)
 
-The init script is currently **disabled** in `docker-compose.yml` (it uses `psql :'var'` substitutions that docker-entrypoint-initdb.d does not pass through). The Blackbook server creates all required tables at startup via idempotent `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ADD COLUMN IF NOT EXISTS` statements in `main.rs`.
+This shell hook creates the least-privilege `blackbook_app` login role (and, if
+`BACKUP_PASSWORD` is set, a read-only `blackbook_backup` role), grants the app
+`USAGE`+`CREATE` on `public`, and revokes `CONNECT` from `PUBLIC`. The Blackbook
+server then creates all its `blackbook_*` tables at startup — **as `blackbook_app`,
+which owns them** — via idempotent `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE …
+ADD COLUMN IF NOT EXISTS` statements in `main.rs`.
 
-To add custom tables:
-1. Create new SQL file in `scripts/` (e.g., `02-custom.sql`)
-2. Re-enable the init script mount in `docker-compose.yml` once it is rewritten as a shell wrapper
-3. Verify with: `docker-compose exec postgres psql -U blackbook_admin -d blackbook -c "\d"`
+To add custom bootstrap SQL: drop another `NN-name.sh`/`.sql` into `scripts/` and
+mount it into `/docker-entrypoint-initdb.d/`. Verify the schema/ownership with:
+`docker compose exec postgres psql -U blackbook_admin -d blackbook -c "\dt"`.
 
 ---
 

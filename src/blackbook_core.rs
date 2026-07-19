@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha3::{Sha3_256, Digest};
 use std::collections::HashMap;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 // Matches the Python prototype's scrypt() helper: n=2^12, r=16, p=4.
 // dklen is passed by each call site.
@@ -142,9 +142,27 @@ impl Id {
     }
 }
 
-/// Base85 encoding (simple implementation)
+/// Z85 (ZeroMQ base-85) — compact, printable, terminal-safe ASCII. Encodes
+/// each 4-byte group into 5 characters; a trailing partial group is zero-padded
+/// (lossless for the 32-byte ids this is used on, which are a multiple of 4).
 fn base85_encode(data: &[u8]) -> String {
-    BASE64.encode(data) // Simplified - use base64 for now
+    const Z85: &[u8; 85] =
+        b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
+    let mut out = String::with_capacity(data.len().div_ceil(4) * 5);
+    for chunk in data.chunks(4) {
+        let mut n: u32 = 0;
+        for i in 0..4 {
+            n = n.wrapping_mul(256).wrapping_add(*chunk.get(i).unwrap_or(&0) as u32);
+        }
+        let mut buf = [0u8; 5];
+        let mut v = n;
+        for slot in buf.iter_mut().rev() {
+            *slot = Z85[(v % 85) as usize];
+            v /= 85;
+        }
+        out.push_str(std::str::from_utf8(&buf).unwrap());
+    }
+    out
 }
 
 /// Asymmetric key pair (Ed25519 for signing)
@@ -215,6 +233,16 @@ impl AsymmetricKey {
     /// Get public key
     pub fn public_key(&self) -> Vec<u8> {
         self.verifying_key.clone()
+    }
+}
+
+/// Wipe the Ed25519 private key (and any cached signature) when an
+/// `AsymmetricKey` is dropped, so identity key material doesn't linger in
+/// freed heap. The public `verifying_key` is not secret and is left as-is.
+impl Drop for AsymmetricKey {
+    fn drop(&mut self) {
+        self.signing_key.zeroize();
+        self.signature.zeroize();
     }
 }
 
@@ -395,37 +423,42 @@ impl WrappedKey {
             ));
         }
         let wrapper = SecondaryKey::scrypt(PrimaryKey::new(), "key-wrap/v1", 32);
-        let mut buf: Vec<u8> = secret.to_vec();
+        // `buf` starts as the raw inner secret and holds key material through
+        // every round, so it (and each derived KEK) is wiped on drop.
+        let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(secret.to_vec());
         for i in 0..iterations {
-            let kek_bytes = wrapper.handle_with_info(&Self::round_info(i))?;
+            let kek_bytes = Zeroizing::new(wrapper.handle_with_info(&Self::round_info(i))?);
             let kek = KekAes256::from(<[u8; 32]>::try_from(kek_bytes.as_slice())
                 .map_err(|_| CryptoError::KeyDerivation("KEK was not 32 bytes".to_string()))?);
-            let mut next = vec![0u8; buf.len() + 8];
-            kek.wrap(&buf, &mut next)
+            let mut next = Zeroizing::new(vec![0u8; buf.len() + 8]);
+            kek.wrap(buf.as_slice(), next.as_mut_slice())
                 .map_err(|e| CryptoError::Encryption(format!("aes-kw iter {i}: {e:?}")))?;
             buf = next;
         }
-        Ok(Self { wrapped: buf, wrapper, iterations })
+        // The final buffer is the fully-wrapped (encrypted) blob, safe to store.
+        Ok(Self { wrapped: buf.to_vec(), wrapper, iterations })
     }
 
     /// Recover the wrapped secret by reversing every iteration.
     pub fn unwrap(&self) -> CryptoResult<Vec<u8>> {
-        let mut buf: Vec<u8> = self.wrapped.clone();
+        let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(self.wrapped.clone());
         for i in (0..self.iterations).rev() {
             if buf.len() < 8 {
                 return Err(CryptoError::Decryption(
                     "wrapped blob is too short to unwrap".to_string(),
                 ));
             }
-            let kek_bytes = self.wrapper.handle_with_info(&Self::round_info(i))?;
+            let kek_bytes = Zeroizing::new(self.wrapper.handle_with_info(&Self::round_info(i))?);
             let kek = KekAes256::from(<[u8; 32]>::try_from(kek_bytes.as_slice())
                 .map_err(|_| CryptoError::KeyDerivation("KEK was not 32 bytes".to_string()))?);
-            let mut next = vec![0u8; buf.len() - 8];
-            kek.unwrap(&buf, &mut next)
+            let mut next = Zeroizing::new(vec![0u8; buf.len() - 8]);
+            kek.unwrap(buf.as_slice(), next.as_mut_slice())
                 .map_err(|e| CryptoError::Decryption(format!("aes-kw iter {i}: {e:?}")))?;
             buf = next;
         }
-        Ok(buf)
+        // Hand the recovered secret to the caller, which owns its disposal; our
+        // intermediate copies are wiped as the Zeroizing buffers drop.
+        Ok(buf.to_vec())
     }
 
     /// Per-iteration `info`: `i` in minimal big-endian form. The wrapper's
@@ -459,18 +492,19 @@ fn timestamp_bytes() -> [u8; TIMESTAMP_LEN] {
 
 /// scrypt-derive a 32-byte key. Public so other modules (persistence) can
 /// reuse the same KDF parameters when sealing the DEK with a passphrase.
-pub fn scrypt_dek(key: &[u8], salt: &[u8]) -> CryptoResult<[u8; 32]> {
+pub fn scrypt_dek(key: &[u8], salt: &[u8]) -> CryptoResult<Zeroizing<[u8; 32]>> {
     derive_message_key(key, salt)
 }
 
 /// Derive a per-message AES-256 key by running scrypt over the caller's key
 /// material with the random salt. Mirrors the Python `encrypt`'s
-/// `key = scrypt(key, salt)` step.
-fn derive_message_key(key: &[u8], salt: &[u8]) -> CryptoResult<[u8; 32]> {
+/// `key = scrypt(key, salt)` step. Returned in a [`Zeroizing`] wrapper so the
+/// derived key is wiped from memory when the caller drops it.
+fn derive_message_key(key: &[u8], salt: &[u8]) -> CryptoResult<Zeroizing<[u8; 32]>> {
     let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, 32)
         .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
-    let mut out = [0u8; 32];
-    scrypt::scrypt(key, salt, &params, &mut out)
+    let mut out = Zeroizing::new([0u8; 32]);
+    scrypt::scrypt(key, salt, &params, out.as_mut_slice())
         .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
     Ok(out)
 }
@@ -493,7 +527,7 @@ pub fn encrypt_aes_gcm(data: &[u8], key: &[u8]) -> CryptoResult<Vec<u8>> {
     let timestamp = timestamp_bytes();
 
     let message_key = derive_message_key(key, &salt)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&message_key));
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(message_key.as_slice()));
     let nonce = Nonce::from_slice(&salt[..12]);
 
     let ciphertext = cipher
@@ -514,20 +548,46 @@ pub fn encrypt_aes_gcm(data: &[u8], key: &[u8]) -> CryptoResult<Vec<u8>> {
 ///
 /// Output: `nonce(12) ‖ ciphertext-with-tag`.
 pub fn aead_seal(plaintext: &[u8], dek: &[u8]) -> CryptoResult<Vec<u8>> {
-    if dek.len() != 32 {
-        return Err(CryptoError::Encryption("DEK must be 32 bytes".into()));
-    }
     let mut rng = rand::thread_rng();
     let mut nonce = [0u8; 12];
     rng.fill(&mut nonce);
+    aead_seal_nonce(plaintext, dek, &nonce)
+}
+
+/// AES-256-GCM seal with an explicit 12-byte nonce, returning
+/// `nonce(12) ‖ ciphertext-with-tag`. The caller owns nonce uniqueness — used
+/// by the tunnel data plane, which derives nonces from a per-direction counter.
+pub fn aead_seal_nonce(plaintext: &[u8], dek: &[u8], nonce: &[u8; 12]) -> CryptoResult<Vec<u8>> {
+    if dek.len() != 32 {
+        return Err(CryptoError::Encryption("DEK must be 32 bytes".into()));
+    }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .encrypt(Nonce::from_slice(nonce), plaintext)
         .map_err(|_| CryptoError::Encryption("AES-GCM seal failed".into()))?;
     let mut out = Vec::with_capacity(12 + ct.len());
-    out.extend_from_slice(&nonce);
+    out.extend_from_slice(nonce);
     out.extend_from_slice(&ct);
     Ok(out)
+}
+
+/// Inverse of [`aead_seal_nonce`] but with a *caller-supplied expected nonce*:
+/// the frame carries its own nonce prefix, which must equal `expected` (so a
+/// relay can't shift the counter). Returns the plaintext.
+pub fn aead_open_nonce(frame: &[u8], dek: &[u8], expected: &[u8; 12]) -> CryptoResult<Vec<u8>> {
+    if dek.len() != 32 {
+        return Err(CryptoError::Decryption("DEK must be 32 bytes".into()));
+    }
+    if frame.len() < 12 + 16 {
+        return Err(CryptoError::Decryption("frame too short".into()));
+    }
+    if &frame[..12] != expected.as_slice() {
+        return Err(CryptoError::Decryption("unexpected nonce (out-of-order or replayed frame)".into()));
+    }
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
+    cipher
+        .decrypt(Nonce::from_slice(&frame[..12]), &frame[12..])
+        .map_err(|_| CryptoError::Decryption("AES-GCM open failed".into()))
 }
 
 /// Inverse of [`aead_seal`].
@@ -560,7 +620,7 @@ pub fn decrypt_aes_gcm(envelope: &[u8], key: &[u8]) -> CryptoResult<Vec<u8>> {
     let body = &envelope[ENVELOPE_PREFIX..];
 
     let message_key = derive_message_key(key, salt)?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&message_key));
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(message_key.as_slice()));
     let nonce = Nonce::from_slice(&salt[..12]);
 
     cipher
@@ -817,7 +877,8 @@ pub struct BlackbookKey {
     /// HMAC key for hashing resource names into opaque DB lookup ids —
     /// keeps the friendly name out of plaintext in the index column.
     pub index: SecondaryKey,
-    /// Reserved for record-level MAC of audit/log entries (Phase D+ use).
+    /// Keyed-MAC key for the tamper-evident audit hash chain (derived once at
+    /// server start into `AppState::audit_hmac_key`; see `auth::audit`).
     pub hmac: SecondaryKey,
     /// KEK that wraps per-client TOTP secrets before they're written to
     /// `blackbook_clients.totp_secret_enc`.
@@ -854,15 +915,16 @@ impl BlackbookKey {
     }
 
     pub fn serialize(&self) -> CryptoResult<String> {
-        let json = serde_json::to_vec(self)?;
-        let key_bytes = self.symmetric_bytes()?;
+        // `json` is the entire key hierarchy in the clear; wipe it after sealing.
+        let json = Zeroizing::new(serde_json::to_vec(self)?);
+        let key_bytes = Zeroizing::new(self.symmetric_bytes()?);
         let encrypted = encrypt_aes_gcm(&json, &key_bytes)?;
         Ok(BASE64.encode(&encrypted))
     }
 
     pub fn deserialize(data: &str, symmetric_key: &[u8]) -> CryptoResult<Self> {
         let encrypted = BASE64.decode(data)?;
-        let decrypted = decrypt_aes_gcm(&encrypted, symmetric_key)?;
+        let decrypted = Zeroizing::new(decrypt_aes_gcm(&encrypted, symmetric_key)?);
         Ok(serde_json::from_slice(&decrypted)?)
     }
 

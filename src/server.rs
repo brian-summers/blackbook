@@ -9,6 +9,7 @@ use sqlx::PgPool;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 
 use crate::auth::{
     self, acl_check, acl_record_use, action_name, audit, AclDecision, AuditStatus,
@@ -18,6 +19,7 @@ use sqlx::types::Json as SqlxJson;
 use crate::blackbook_core::{
     aead_open, aead_seal, decrypt_aes_gcm, encrypt_aes_gcm, AclAction, BlackbookKey, Id,
 };
+use crate::audit_archive;
 use crate::tls::SharedCa;
 
 // ---------------------------------------------------------------------------
@@ -130,6 +132,10 @@ pub struct HealthResponse {
 pub struct WhoamiResponse {
     pub id: String, pub name: String, pub role: String,
     pub auth_method: String,
+    /// The caller's private user domain (`~<name>`), if it exists. Lets the CLI
+    /// default a fresh profile to the user's own domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_domain: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -176,6 +182,16 @@ pub struct GrantAclRequest {
     /// Cap on the number of times this grant can authorize an action.
     #[serde(default)]
     pub max_uses: Option<i32>,
+    /// Rate limit: at most `rate_max` authorizations per `rate_period_secs`
+    /// (fixed window). Both must be set together, or neither.
+    #[serde(default)]
+    pub rate_max: Option<i32>,
+    #[serde(default)]
+    pub rate_period_secs: Option<i32>,
+    /// 5-field cron schedule of allowed-access windows (mask semantics).
+    /// NULL = always allowed. e.g. `* 9-17 * * 1-5` = weekdays 9–5.
+    #[serde(default)]
+    pub schedule: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -191,6 +207,12 @@ pub struct AclSummary {
     pub not_before: Option<String>,
     pub max_uses: Option<i32>,
     pub use_count: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_max: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_period_secs: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<String>,
 }
 
 // Domains
@@ -286,6 +308,10 @@ pub struct AppState {
     /// `dec_field`. A DB-only attacker without this key sees only opaque
     /// IDs, ciphertext, and timestamps.
     pub metadata_enc_key: Arc<Vec<u8>>,
+    /// In-memory registry of live client↔client tunnels (the relay pairs two
+    /// mTLS-authenticated clients and forwards opaque E2E frames). Ephemeral —
+    /// no DB row; see [`crate::tunnel_relay`].
+    pub tunnels: crate::tunnel_relay::TunnelHub,
 }
 
 // ---------------------------------------------------------------------------
@@ -567,11 +593,25 @@ pub async fn health_check(state: web::Data<AppState>) -> Result<HttpResponse> {
     }))
 }
 
-pub async fn whoami(client: AuthenticatedClient) -> Result<HttpResponse> {
+pub async fn whoami(
+    state: web::Data<AppState>,
+    client: AuthenticatedClient,
+) -> Result<HttpResponse> {
     let method = auth_method_str(client.auth_method);
+    // Report the caller's private user domain (`~<name>`) when it exists, so the
+    // CLI can default a fresh profile to it.
+    let dname = auth::user_domain_name(&client.name);
+    let dname_id = domain_name_id_hex(&state.name_index_key, &dname);
+    let has_user_domain: Option<(i32,)> = sqlx::query_as(
+        "SELECT 1 FROM blackbook_domains d
+         JOIN blackbook_domain_members m ON m.domain_id = d.id
+         WHERE d.name_id = $1 AND d.archived_at IS NULL AND m.client_id = $2 LIMIT 1",
+    ).bind(&dname_id).bind(&client.id).fetch_optional(&state.db).await
+    .map_err(actix_web::error::ErrorInternalServerError)?;
     Ok(HttpResponse::Ok().json(WhoamiResponse {
         id: client.id, name: client.name, role: client.role,
         auth_method: method.into(),
+        user_domain: has_user_domain.map(|_| dname),
     }))
 }
 
@@ -2015,6 +2055,7 @@ pub async fn create_client_endpoint(
             Ok(err(StatusCode::CONFLICT, "conflict",
                   format!("client '{}' already exists", req.name)))
         }
+        Err(auth::AuthOpError::Invalid(m)) => Ok(err(StatusCode::BAD_REQUEST, "validation_error", m)),
         Err(e) => Err(actix_web::error::ErrorInternalServerError(e.to_string())),
     }
 }
@@ -2149,19 +2190,33 @@ pub async fn grant_acl(
         (Err(resp), _) | (_, Err(resp)) => return Ok(resp),
     };
 
+    // Validate rate + schedule before persisting.
+    if req.rate_max.is_some() != req.rate_period_secs.is_some() {
+        return Ok(err(StatusCode::BAD_REQUEST, "validation_error",
+            "rate_max and rate_period_secs must be set together"));
+    }
+    if let Some(sched) = &req.schedule {
+        // Validate against a reference time; a parse error means a bad schedule.
+        if let Err(msg) = auth::cron_window_matches(sched, &chrono::Utc::now().naive_utc()) {
+            return Ok(err(StatusCode::BAD_REQUEST, "validation_error", format!("bad schedule: {msg}")));
+        }
+    }
+
     let id = Id::new(12).encode();
     let pattern_enc = enc_str(&state.metadata_enc_key, &req.resource_pattern)
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
     sqlx::query(
         "INSERT INTO blackbook_acl
             (id, domain_id, client_id, group_domain_id, pattern_enc,
-             actions, expires_at, not_before, max_uses, granted_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             actions, expires_at, not_before, max_uses, granted_by,
+             rate_max, rate_period_secs, schedule)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(&id).bind(&domain_id).bind(&client_id).bind(&group_domain_id)
     .bind(&pattern_enc).bind(mask)
     .bind(expires_at).bind(not_before).bind(req.max_uses)
     .bind(&caller.id)
+    .bind(req.rate_max).bind(req.rate_period_secs).bind(&req.schedule)
     .execute(&state.db).await
     .map_err(actix_web::error::ErrorInternalServerError)?;
 
@@ -2206,10 +2261,12 @@ pub async fn list_acl(
     let rows: Vec<(
         String, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>, Vec<u8>, i32,
         String, Option<String>, Option<String>, Option<i32>, i32,
+        Option<i32>, Option<i32>, Option<String>,
     )> = sqlx::query_as(
         "SELECT a.id, d.name_enc, c.name_enc, g.name_enc, a.pattern_enc, a.actions,
                 a.granted_at::text, a.expires_at::text, a.not_before::text,
-                a.max_uses, a.use_count
+                a.max_uses, a.use_count,
+                a.rate_max, a.rate_period_secs, a.schedule
          FROM blackbook_acl a
          JOIN blackbook_domains d  ON d.id = a.domain_id
          LEFT JOIN blackbook_clients c ON c.id = a.client_id
@@ -2221,7 +2278,7 @@ pub async fn list_acl(
     .map_err(actix_web::error::ErrorInternalServerError)?;
     let key = state.metadata_enc_key.as_slice();
     let items: Vec<_> = rows.into_iter()
-        .map(|(id, domain_enc, client_name_enc, group_domain_enc, pattern_enc, actions, granted_at, expires_at, not_before, max_uses, use_count)| AclSummary {
+        .map(|(id, domain_enc, client_name_enc, group_domain_enc, pattern_enc, actions, granted_at, expires_at, not_before, max_uses, use_count, rate_max, rate_period_secs, schedule)| AclSummary {
             id,
             domain: dec_str(key, &domain_enc).unwrap_or_else(|_| "?".into()),
             client_name: client_name_enc.and_then(|b| dec_str(key, &b).ok()),
@@ -2229,6 +2286,7 @@ pub async fn list_acl(
             resource_pattern: dec_str(key, &pattern_enc).unwrap_or_else(|_| "?".into()),
             actions: actions_from_mask(actions),
             granted_at, expires_at, not_before, max_uses, use_count,
+            rate_max, rate_period_secs, schedule,
         }).collect();
     Ok(HttpResponse::Ok().json(serde_json::json!({"entries": items, "count": items.len()})))
 }
@@ -2276,6 +2334,10 @@ pub async fn create_domain(
     if let Err(resp) = require_admin(&caller) { return Ok(resp); }
     if req.name.trim().is_empty() {
         return Ok(err(StatusCode::BAD_REQUEST, "validation_error", "name is required"));
+    }
+    if req.name.starts_with(auth::USER_DOMAIN_PREFIX) {
+        return Ok(err(StatusCode::BAD_REQUEST, "validation_error",
+            format!("domain names may not start with '{}' (reserved for private user domains)", auth::USER_DOMAIN_PREFIX)));
     }
     let id = Id::new(12).encode();
     let name_enc = enc_str(&state.metadata_enc_key, &req.name)
@@ -3203,7 +3265,13 @@ pub async fn verify_audit(
         .map_err(actix_web::error::ErrorInternalServerError)?;
 
     let key = state.audit_hmac_key.as_slice();
-    let mut prev = [0u8; 32];
+    // Resume from the latest archive anchor (if old rows were archived+pruned)
+    // so the first surviving row's prev_hash chains correctly; else genesis.
+    let mut prev = match latest_audit_anchor(&state.db).await
+        .map_err(actix_web::error::ErrorInternalServerError)? {
+        Some((_id, h)) => h,
+        None => [0u8; 32],
+    };
     let mut verified: i64 = 0;
     for (id, ts, client_id, action, resource_enc, status, message_enc, stored_prev, stored_row) in rows {
         // Decrypt the encrypted columns back to plaintext for hashing —
@@ -3277,6 +3345,212 @@ pub async fn verify_audit(
 }
 
 // ---------------------------------------------------------------------------
+// Audit-log archival (compress + encrypt + chain-verify old rows off the DB)
+// ---------------------------------------------------------------------------
+
+/// The latest archive anchor: `(archived_through_id, final_row_hash)` of the
+/// most recent prune, or `None` if nothing has been pruned.
+async fn latest_audit_anchor(db: &PgPool) -> sqlx::Result<Option<(i64, [u8; 32])>> {
+    let row: Option<(i64, String)> = sqlx::query_as(
+        "SELECT archived_through_id, final_row_hash FROM blackbook_audit_anchors
+         ORDER BY archived_through_id DESC LIMIT 1",
+    ).fetch_optional(db).await?;
+    Ok(row.and_then(|(id, h)| {
+        let mut buf = [0u8; 32];
+        hex::decode_to_slice(&h, &mut buf).ok().map(|_| (id, buf))
+    }))
+}
+
+/// Dedicated AES key for encrypting archive files — domain-separated from the
+/// metadata key and the audit MAC key.
+fn audit_archive_enc_key(keys: &BlackbookKey) -> std::result::Result<Vec<u8>, String> {
+    keys.index.handle_with_info(b"audit-archive-enc/v1").map_err(|e| e.to_string())
+}
+
+/// Best-effort timestamp parse for the `before` cutoff.
+fn parse_audit_ts(s: &str) -> Option<chrono::NaiveDateTime> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) { return Some(dt.naive_utc()); }
+    for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, fmt) { return Some(dt); }
+        if fmt == "%Y-%m-%d" {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(s, fmt) { return d.and_hms_opt(0,0,0); }
+        }
+    }
+    None
+}
+
+/// Reject path traversal: an archive name must be a bare `*.bbka` filename.
+fn safe_archive_name(name: &str) -> bool {
+    !name.is_empty() && name.ends_with(".bbka")
+        && !name.contains('/') && !name.contains('\\') && !name.contains("..")
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArchiveQuery {
+    /// Archive rows older than this timestamp (RFC3339 / `YYYY-MM-DD[ HH:MM:SS]`).
+    pub before: Option<String>,
+    /// Keep the most recent N rows un-archived (mutually exclusive with `before`).
+    pub keep_last: Option<i64>,
+    /// Delete the archived rows from the DB and record a chain anchor.
+    #[serde(default)]
+    pub prune: bool,
+}
+
+/// Export the oldest contiguous run of audit rows to a compressed, encrypted,
+/// chain-verifiable archive on the data volume; optionally prune them. Admin.
+/// At least one row is always kept live so the running chain head stays a real
+/// row.
+pub async fn audit_archive_create(
+    state: web::Data<AppState>,
+    q: web::Query<ArchiveQuery>,
+    caller: AuthenticatedClient,
+) -> Result<HttpResponse> {
+    if let Err(resp) = require_admin(&caller) { return Ok(resp); }
+    let (anchor_id, genesis_prev) = latest_audit_anchor(&state.db).await
+        .map_err(actix_web::error::ErrorInternalServerError)?
+        .unwrap_or((0i64, [0u8; 32]));
+
+    let rows: Vec<(i64, chrono::NaiveDateTime, Option<String>, String, Option<Vec<u8>>, String, Option<Vec<u8>>, Option<String>, String)> =
+        sqlx::query_as(
+            "SELECT id, ts, client_id, action, resource_enc, status, message_enc, prev_hash, row_hash
+             FROM blackbook_audit WHERE id > $1 ORDER BY id ASC",
+        ).bind(anchor_id).fetch_all(&state.db).await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let total = rows.len();
+    if total <= 1 {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({
+            "archived": 0, "message": "fewer than 2 live rows — nothing to archive"})));
+    }
+
+    // How many of the oldest rows to archive. Always keep >= 1 row live.
+    let mut cutoff = if let Some(keep) = q.keep_last {
+        total.saturating_sub(keep.max(0) as usize)
+    } else if let Some(before) = &q.before {
+        match parse_audit_ts(before) {
+            Some(b) => rows.iter().take_while(|r| r.1 < b).count(),
+            None => return Ok(HttpResponse::BadRequest().json(serde_json::json!({"error":"unparseable 'before' timestamp"}))),
+        }
+    } else {
+        return Ok(HttpResponse::BadRequest().json(serde_json::json!({
+            "error":"specify 'keep_last' (keep N most recent) or 'before' (timestamp)"})));
+    };
+    cutoff = cutoff.min(total - 1); // never archive the very last live row
+    if cutoff == 0 {
+        return Ok(HttpResponse::Ok().json(serde_json::json!({"archived":0,"message":"nothing matched the cutoff"})));
+    }
+
+    let mut arows = Vec::with_capacity(cutoff);
+    for (id, ts, client_id, action, resource_enc, status, message_enc, prev_hash, row_hash) in rows.iter().take(cutoff) {
+        let dec = |b: &Option<Vec<u8>>| -> std::result::Result<Option<String>, actix_web::Error> {
+            match b { Some(x) => Ok(Some(dec_str(&state.metadata_enc_key, x)
+                .map_err(actix_web::error::ErrorInternalServerError)?)), None => Ok(None) }
+        };
+        arows.push(audit_archive::ArchivedRow {
+            id: *id, ts_micros: ts.and_utc().timestamp_micros(),
+            client_id: client_id.clone(), action: action.clone(), status: status.clone(),
+            resource: dec(resource_enc)?, message: dec(message_enc)?,
+            prev_hash: prev_hash.clone().unwrap_or_default(), row_hash: row_hash.clone(),
+        });
+    }
+    let first_id = arows.first().unwrap().id;
+    let last_id = arows.last().unwrap().id;
+    let final_row_hash = arows.last().unwrap().row_hash.clone();
+    let archive = audit_archive::AuditArchive {
+        v: audit_archive::ARCHIVE_VERSION,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        count: arows.len(), first_id, last_id,
+        genesis_prev: hex::encode(genesis_prev), final_row_hash: final_row_hash.clone(),
+        rows: arows,
+    };
+    // Refuse to archive if the live chain over this range doesn't verify.
+    let v = audit_archive::verify_archive(&state.audit_hmac_key, &archive);
+    if !v.ok {
+        return Ok(HttpResponse::Conflict().json(serde_json::json!({
+            "error":"the live audit chain does not verify over the selected range; refusing to archive",
+            "detail": v})));
+    }
+    let enc_key = { let keys = state.keys.read().await; audit_archive_enc_key(&keys) }
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let blob = audit_archive::build_archive(&enc_key, &archive)
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+
+    let dir = state.data_dir.join("audit-archives");
+    tokio::fs::create_dir_all(&dir).await.map_err(actix_web::error::ErrorInternalServerError)?;
+    let fname = format!("audit-{first_id:010}-{last_id:010}-{}.bbka",
+                        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"));
+    tokio::fs::write(dir.join(&fname), &blob).await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+
+    let mut pruned = 0u64;
+    if q.prune {
+        let res = sqlx::query("DELETE FROM blackbook_audit WHERE id > $1 AND id <= $2")
+            .bind(anchor_id).bind(last_id).execute(&state.db).await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+        pruned = res.rows_affected();
+        sqlx::query("INSERT INTO blackbook_audit_anchors (archived_through_id, final_row_hash, archive_file)
+                     VALUES ($1, $2, $3)")
+            .bind(last_id).bind(&final_row_hash).bind(&fname).execute(&state.db).await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+    }
+    audit(&state.db, &state.audit_hmac_key, &state.metadata_enc_key, Some(&caller.id),
+          "audit.archive", Some(&fname), AuditStatus::Ok,
+          Some(&format!("archived {} rows (id {first_id}..{last_id}); pruned {pruned}", archive.count))).await;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "archived": archive.count, "first_id": first_id, "last_id": last_id,
+        "file": fname, "pruned": pruned, "size_bytes": blob.len(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyArchiveQuery { pub file: String }
+
+/// Decrypt + decompress a named archive and recompute its hash chain end to
+/// end with the master MAC key. Admin.
+pub async fn audit_archive_verify(
+    state: web::Data<AppState>,
+    q: web::Query<VerifyArchiveQuery>,
+    caller: AuthenticatedClient,
+) -> Result<HttpResponse> {
+    if let Err(resp) = require_admin(&caller) { return Ok(resp); }
+    if !safe_archive_name(&q.file) {
+        return Ok(HttpResponse::BadRequest().json(serde_json::json!({"error":"invalid archive name"})));
+    }
+    let path = state.data_dir.join("audit-archives").join(&q.file);
+    let blob = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(_) => return Ok(HttpResponse::NotFound().json(serde_json::json!({"error":"no such archive"}))),
+    };
+    let enc_key = { let keys = state.keys.read().await; audit_archive_enc_key(&keys) }
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let archive = match audit_archive::open_archive(&enc_key, &blob) {
+        Ok(a) => a,
+        Err(e) => return Ok(HttpResponse::Ok().json(serde_json::json!({"ok":false,"reason":e.to_string()}))),
+    };
+    let v = audit_archive::verify_archive(&state.audit_hmac_key, &archive);
+    Ok(HttpResponse::Ok().json(v))
+}
+
+/// List archive files on the data volume. Admin.
+pub async fn audit_archive_list(
+    state: web::Data<AppState>,
+    caller: AuthenticatedClient,
+) -> Result<HttpResponse> {
+    if let Err(resp) = require_admin(&caller) { return Ok(resp); }
+    let dir = state.data_dir.join("audit-archives");
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".bbka") { continue; }
+            let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+            files.push(serde_json::json!({"file": name, "size_bytes": size}));
+        }
+    }
+    files.sort_by(|a, b| a["file"].as_str().cmp(&b["file"].as_str()));
+    Ok(HttpResponse::Ok().json(serde_json::json!({"archives": files, "count": files.len()})))
+}
+
+// ---------------------------------------------------------------------------
 // TLS / mTLS bootstrap
 // ---------------------------------------------------------------------------
 
@@ -3314,6 +3588,226 @@ fn build_ssl_acceptor(
     Ok(acceptor)
 }
 
+// ---------------------------------------------------------------------------
+// Tunnels — relay opaque E2E frames between two mTLS-authenticated clients.
+// The server pairs them and vouches each peer's name + cert fingerprint; it
+// never sees the ephemeral keys, so it cannot read or forge the channel.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct OfferTunnelRequest {
+    /// Client name the offerer wants to reach.
+    pub target: String,
+}
+
+/// Look up a client's current cert fingerprint by name (the value the relay
+/// vouches to the peer). Returns None if no active client by that name.
+async fn client_fingerprint(state: &AppState, name: &str) -> Option<String> {
+    let name_id = client_name_id_hex(&state.name_index_key, name);
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT cert_fingerprint FROM blackbook_clients WHERE name_id = $1 AND revoked_at IS NULL",
+    ).bind(&name_id).fetch_optional(&state.db).await.ok().flatten();
+    row.map(|(fp,)| fp)
+}
+
+/// Offer a tunnel to another client. Returns a tunnel id the offerer then opens
+/// a WebSocket on; the target joins the same id.
+pub async fn offer_tunnel(
+    state: web::Data<AppState>,
+    req: web::Json<OfferTunnelRequest>,
+    client: AuthenticatedClient,
+) -> Result<HttpResponse> {
+    if req.target.trim().is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "validation_error", "target is required"));
+    }
+    if req.target == client.name {
+        return Ok(err(StatusCode::BAD_REQUEST, "validation_error", "cannot tunnel to yourself"));
+    }
+    // The target must exist (so the offerer gets a clear error, and so we don't
+    // mint dangling offers). Its fingerprint is resolved at attach time.
+    if client_fingerprint(&state, &req.target).await.is_none() {
+        return Ok(err(StatusCode::NOT_FOUND, "not_found",
+                      format!("no active client named '{}'", req.target)));
+    }
+    let my_fp = match client_fingerprint(&state, &client.name).await {
+        Some(fp) => fp,
+        None => return Ok(err(StatusCode::INTERNAL_SERVER_ERROR, "internal", "own fingerprint not found")),
+    };
+    let id = state.tunnels.offer(&client.name, &my_fp, &req.target).await;
+    audit(&state.db, &state.audit_hmac_key, &state.metadata_enc_key, Some(&client.id), "tunnel.offer",
+          Some(&req.target), AuditStatus::Ok, None).await;
+    Ok(HttpResponse::Created().json(serde_json::json!({ "tunnel_id": id, "target": req.target })))
+}
+
+/// List tunnels this client offered or is the target of.
+pub async fn list_tunnels(
+    state: web::Data<AppState>,
+    client: AuthenticatedClient,
+) -> Result<HttpResponse> {
+    let items = state.tunnels.list_for(&client.name).await;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "tunnels": items, "count": items.len() })))
+}
+
+/// WebSocket endpoint: both peers connect here with the tunnel id. The server
+/// pairs them, vouches each to the other, then relays opaque binary frames.
+pub async fn tunnel_ws(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    req: actix_web::HttpRequest,
+    body: web::Payload,
+    client: AuthenticatedClient,
+) -> Result<HttpResponse> {
+    let tunnel_id = path.into_inner();
+    use crate::tunnel_relay::{RelayMsg, Vouch};
+    use futures_util::StreamExt as _;
+
+    // Identify this caller's role within the tunnel and reject anyone who isn't
+    // one of the two authorized parties.
+    let role = state.tunnels.with_lock(|map| {
+        map.get(&tunnel_id).map(|t| {
+            if t.offerer_name == client.name { Some(true) }       // offerer/initiator
+            else if t.target_name == client.name { Some(false) }  // target/answerer
+            else { None }
+        })
+    }).await;
+    let is_initiator = match role {
+        Some(Some(r)) => r,
+        Some(None) => return Ok(err(StatusCode::FORBIDDEN, "forbidden", "not a party to this tunnel")),
+        None => return Ok(err(StatusCode::NOT_FOUND, "not_found", "no such tunnel")),
+    };
+
+    let (resp, ws_session, mut msg_stream) = actix_ws::handle(&req, body)
+        .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
+
+    // Channel the *peer's* WS task uses to push frames toward us.
+    let (my_tx, mut my_rx) = mpsc::unbounded_channel::<RelayMsg>();
+
+    // Register our side and, if the peer is already attached, capture both
+    // vouches + the peer's sender so we can wire the pair.
+    let my_name = client.name.clone();
+    let my_fp = client_fingerprint(&state, &client.name).await.unwrap_or_default();
+    let tunnels = state.tunnels.clone();
+    let tid = tunnel_id.clone();
+
+    struct Wiring {
+        peer_tx: Option<mpsc::UnboundedSender<RelayMsg>>,
+        my_vouch: Option<Vouch>,
+        peer_vouch_and_tx: Option<(Vouch, mpsc::UnboundedSender<RelayMsg>)>,
+    }
+    let wiring = tunnels.with_lock(|map| {
+        let Some(t) = map.get_mut(&tid) else {
+            return Wiring { peer_tx: None, my_vouch: None, peer_vouch_and_tx: None };
+        };
+        if is_initiator {
+            t.offerer_name = my_name.clone();
+            t.offerer_fp = my_fp.clone();
+            t.to_offerer = Some(my_tx.clone());
+        } else {
+            t.answerer_name = Some(my_name.clone());
+            t.answerer_fp = Some(my_fp.clone());
+            t.to_answerer = Some(my_tx.clone());
+        }
+        // If both sides are now present, produce both vouches.
+        if t.to_offerer.is_some() && t.to_answerer.is_some() {
+            let off_v = Vouch {
+                you_are_initiator: true, tunnel_id: tid.clone(),
+                peer_name: t.answerer_name.clone().unwrap_or_default(),
+                peer_fingerprint: t.answerer_fp.clone().unwrap_or_default(),
+            };
+            let ans_v = Vouch {
+                you_are_initiator: false, tunnel_id: tid.clone(),
+                peer_name: t.offerer_name.clone(),
+                peer_fingerprint: t.offerer_fp.clone(),
+            };
+            // "my" vouch describes the peer to me; "peer" vouch goes to them.
+            let (my_vouch, peer_vouch, peer_tx) = if is_initiator {
+                (off_v, ans_v, t.to_answerer.clone().unwrap())
+            } else {
+                (ans_v, off_v, t.to_offerer.clone().unwrap())
+            };
+            Wiring {
+                peer_tx: Some(peer_tx.clone()),
+                my_vouch: Some(my_vouch),
+                peer_vouch_and_tx: Some((peer_vouch, peer_tx)),
+            }
+        } else {
+            Wiring { peer_tx: None, my_vouch: None, peer_vouch_and_tx: None }
+        }
+    }).await;
+
+    // If we completed the pair, deliver both vouches now (mine into my own
+    // queue, the peer's into theirs). If we're first, the second arrival does it.
+    let peer_tx_for_frames = wiring.peer_tx.clone();
+    if let Some(v) = wiring.my_vouch { let _ = my_tx.send(RelayMsg::Vouch(v)); }
+    if let Some((v, ptx)) = wiring.peer_vouch_and_tx { let _ = ptx.send(RelayMsg::Vouch(v)); }
+
+    // Outbound pump: RelayMsg → this WebSocket.
+    let mut out = ws_session.clone();
+    actix_web::rt::spawn(async move {
+        while let Some(msg) = my_rx.recv().await {
+            match msg {
+                RelayMsg::Vouch(v) => {
+                    let json = serde_json::to_string(&v).unwrap_or_default();
+                    if out.text(json).await.is_err() { break; }
+                }
+                RelayMsg::Frame(bytes) => {
+                    if out.binary(bytes).await.is_err() { break; }
+                }
+                RelayMsg::PeerGone => { let _ = out.close(None).await; break; }
+            }
+        }
+    });
+
+    // Inbound pump: this WebSocket → peer's queue. Resolve the peer sender
+    // lazily (the peer may attach after us) by re-reading the hub on first frame.
+    let tunnels2 = state.tunnels.clone();
+    let tid2 = tunnel_id.clone();
+    actix_web::rt::spawn(async move {
+        let mut peer_tx = peer_tx_for_frames;
+        while let Some(Ok(msg)) = msg_stream.next().await {
+            match msg {
+                actix_ws::Message::Binary(b) => {
+                    if peer_tx.is_none() {
+                        peer_tx = tunnels2.with_lock(|map| {
+                            map.get(&tid2).and_then(|t| {
+                                if is_initiator { t.to_answerer.clone() } else { t.to_offerer.clone() }
+                            })
+                        }).await;
+                    }
+                    if let Some(tx) = &peer_tx {
+                        if tx.send(RelayMsg::Frame(b.to_vec())).is_err() { break; }
+                    }
+                }
+                actix_ws::Message::Ping(p) => { let _ = ws_session.clone().pong(&p).await; }
+                actix_ws::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        // Teardown: tell the peer and drop the tunnel.
+        let peer = tunnels2.with_lock(|map| {
+            let peer = map.get(&tid2).and_then(|t| {
+                if is_initiator { t.to_answerer.clone() } else { t.to_offerer.clone() }
+            });
+            map.remove(&tid2);
+            peer
+        }).await;
+        if let Some(tx) = peer { let _ = tx.send(RelayMsg::PeerGone); }
+    });
+
+    Ok(resp)
+}
+
+/// Rate-limit key for a request: the mTLS client-cert CN if present (every
+/// request is mTLS-authenticated), else the peer IP.
+fn net_client_key(req: &actix_web::dev::ServiceRequest) -> String {
+    if let Some(p) = req.conn_data::<crate::auth::PeerCertInfo>() {
+        if !p.common_name.is_empty() { return format!("cn:{}", p.common_name); }
+    }
+    let ci = req.connection_info();
+    let ip = ci.realip_remote_addr().unwrap_or("?").to_string();
+    format!("ip:{ip}")
+}
+
 pub async fn run_server(
     state: AppState,
     bind_addr: &str,
@@ -3324,7 +3818,11 @@ pub async fn run_server(
     log::info!("Starting Blackbook HTTPS server on {bind_addr}");
     let acceptor = build_ssl_acceptor(cert_path, key_path, ca_path)?;
 
+    // Tier 1: one shared, loose per-client network rate limiter across workers.
+    let net_limiter = std::sync::Arc::new(crate::net_ratelimit::NetRateLimiter::from_env());
+
     HttpServer::new(move || {
+        let nl = net_limiter.clone();
         App::new()
             .app_data(web::Data::new(state.clone()))
             // Generous-ish payload limit so file uploads work; per-route guard
@@ -3332,6 +3830,22 @@ pub async fn run_server(
             .app_data(web::PayloadConfig::new(MAX_FILE_BYTES))
             .wrap(middleware::Logger::default())
             .wrap(middleware::Compress::default())
+            // Coarse anti-DoS gate before anything else runs.
+            .wrap_fn(move |req, srv| {
+                use actix_web::dev::Service as _;
+                use futures_util::future::FutureExt as _;
+                if nl.allow(&net_client_key(&req)) {
+                    srv.call(req).map(|r| r.map(|sr| sr.map_into_boxed_body())).boxed_local()
+                } else {
+                    let resp = req.into_response(HttpResponse::TooManyRequests()
+                        .json(serde_json::json!({
+                            "error": "rate_limited",
+                            "message": "too many requests from this client; slow down",
+                        })))
+                        .map_into_boxed_body();
+                    async move { Ok(resp) }.boxed_local()
+                }
+            })
             // Public
             .route("/health", web::get().to(health_check))
             // Authenticated user-level
@@ -3374,6 +3888,13 @@ pub async fn run_server(
             .route("/api/v1/domains/{name}/members/{client}", web::delete().to(remove_domain_member))
             .route("/api/v1/audit", web::get().to(list_audit))
             .route("/api/v1/audit/verify", web::get().to(verify_audit))
+            .route("/api/v1/audit/archive", web::post().to(audit_archive_create))
+            .route("/api/v1/audit/archive/verify", web::get().to(audit_archive_verify))
+            .route("/api/v1/audit/archives", web::get().to(audit_archive_list))
+            // Tunnels — client↔client E2E relay
+            .route("/api/v1/tunnels", web::post().to(offer_tunnel))
+            .route("/api/v1/tunnels", web::get().to(list_tunnels))
+            .route("/api/v1/tunnels/{id}/ws", web::get().to(tunnel_ws))
     })
     // Hand the OpenSSL stream's peer cert info to per-request extractors.
     // actix-tls's `TlsStream<IO>` derefs to the inner `SslStream<IO>` via its

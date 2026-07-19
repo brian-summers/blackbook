@@ -19,8 +19,9 @@
 
 use argon2::{Argon2, Algorithm, Version, Params};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 use crate::blackbook_core::{aead_seal, aead_open};
 
@@ -48,7 +49,7 @@ pub enum CredError {
     Decrypt,
     #[error("this profile is encrypted; unlock it (`blackbook unlock`) or set $BLACKBOOK_PASSPHRASE")]
     Locked,
-    #[error("no passphrase available (set $BLACKBOOK_PASSPHRASE or run interactively)")]
+    #[error("profile passphrase required (set $BLACKBOOK_PASSPHRASE, or run interactively to be prompted)")]
     NoPassphrase,
 }
 
@@ -75,24 +76,26 @@ pub struct EncryptedProfile {
 /// the same strong KDF when a user supplies an explicit passphrase. Returns
 /// the derived key plus the cost parameters actually used, so callers can
 /// record them in a versioned envelope.
-pub fn argon2_key(passphrase: &str, salt: &[u8]) -> Result<([u8; 32], u32, u32, u32)> {
+pub fn argon2_key(passphrase: &str, salt: &[u8]) -> Result<(Zeroizing<[u8; 32]>, u32, u32, u32)> {
     let k = derive_kek(passphrase, salt, ARGON_M_COST, ARGON_T_COST, ARGON_P_COST)?;
     Ok((k, ARGON_M_COST, ARGON_T_COST, ARGON_P_COST))
 }
 
 /// Argon2id-derive with explicit cost parameters (for opening an envelope that
 /// recorded its own costs).
-pub fn argon2_key_with(passphrase: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<[u8; 32]> {
+pub fn argon2_key_with(passphrase: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<Zeroizing<[u8; 32]>> {
     derive_kek(passphrase, salt, m, t, p)
 }
 
-/// Derive the 32-byte KEK from a passphrase + salt with Argon2id.
-fn derive_kek(passphrase: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<[u8; 32]> {
+/// Derive the 32-byte KEK from a passphrase + salt with Argon2id. The derived
+/// key is returned in a [`Zeroizing`] wrapper so it is wiped from memory once
+/// the caller is done sealing/opening with it.
+fn derive_kek(passphrase: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<Zeroizing<[u8; 32]>> {
     let params = Params::new(m, t, p, Some(32))
         .map_err(|e| CredError::Kdf(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut out = [0u8; 32];
-    argon.hash_password_into(passphrase.as_bytes(), salt, &mut out)
+    let mut out = Zeroizing::new([0u8; 32]);
+    argon.hash_password_into(passphrase.as_bytes(), salt, out.as_mut_slice())
         .map_err(|e| CredError::Kdf(e.to_string()))?;
     Ok(out)
 }
@@ -106,7 +109,7 @@ pub fn seal_profile(passphrase: &str, inner_json: &[u8]) -> Result<EncryptedProf
     let mut salt = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut salt);
     let kek = derive_kek(passphrase, &salt, ARGON_M_COST, ARGON_T_COST, ARGON_P_COST)?;
-    let ct = aead_seal(inner_json, &kek).map_err(|e| CredError::Kdf(e.to_string()))?;
+    let ct = aead_seal(inner_json, kek.as_slice()).map_err(|e| CredError::Kdf(e.to_string()))?;
     Ok(EncryptedProfile {
         v: 2,
         enc: "argon2id-aes256gcm".into(),
@@ -121,8 +124,8 @@ pub fn seal_profile(passphrase: &str, inner_json: &[u8]) -> Result<EncryptedProf
 impl EncryptedProfile {
     /// Re-derive the KEK for this envelope from a passphrase (using the
     /// envelope's own recorded cost parameters, so old files keep opening
-    /// even if the defaults change).
-    pub fn derive_kek(&self, passphrase: &str) -> Result<[u8; 32]> {
+    /// even if the defaults change). Returned [`Zeroizing`] for safe disposal.
+    pub fn derive_kek(&self, passphrase: &str) -> Result<Zeroizing<[u8; 32]>> {
         use base64::Engine as _;
         let salt = base64::engine::general_purpose::STANDARD
             .decode(&self.salt).map_err(|e| CredError::B64(e.to_string()))?;
@@ -130,17 +133,19 @@ impl EncryptedProfile {
     }
 
     /// Decrypt the inner JSON given an already-derived KEK (the agent path).
-    pub fn open_with_kek(&self, kek: &[u8]) -> Result<Vec<u8>> {
+    /// The plaintext is the credential bundle (token + private key + CMK), so
+    /// it is returned [`Zeroizing`] and wiped once the caller has parsed it.
+    pub fn open_with_kek(&self, kek: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         use base64::Engine as _;
         let ct = base64::engine::general_purpose::STANDARD
             .decode(&self.ct).map_err(|e| CredError::B64(e.to_string()))?;
-        aead_open(&ct, kek).map_err(|_| CredError::Decrypt)
+        aead_open(&ct, kek).map(Zeroizing::new).map_err(|_| CredError::Decrypt)
     }
 
     /// Decrypt the inner JSON directly from a passphrase.
-    pub fn open_with_passphrase(&self, passphrase: &str) -> Result<Vec<u8>> {
+    pub fn open_with_passphrase(&self, passphrase: &str) -> Result<Zeroizing<Vec<u8>>> {
         let kek = self.derive_kek(passphrase)?;
-        self.open_with_kek(&kek)
+        self.open_with_kek(kek.as_slice())
     }
 }
 
@@ -148,24 +153,34 @@ impl EncryptedProfile {
 // Passphrase sourcing
 // ---------------------------------------------------------------------------
 
+/// True when interactive passphrase prompts are forbidden. Set by non-tty
+/// front-ends (the web console) so a child process can't grab the controlling
+/// terminal and hang — instead the passphrase sites return a clear error.
+/// `rpassword` on Windows reads the console device directly (not stdin), so
+/// closing the child's stdin is not enough; this flag is the reliable guard.
+pub fn prompts_suppressed() -> bool {
+    std::env::var("BLACKBOOK_NO_PROMPT").map(|v| !v.is_empty()).unwrap_or(false)
+}
+
 /// Resolve a passphrase for sealing/opening: explicit arg → $BLACKBOOK_PASSPHRASE
 /// → interactive no-echo prompt (only if attached to a TTY). `confirm` asks
 /// twice when prompting (used at login/seal time).
-pub fn resolve_passphrase(explicit: Option<&str>, prompt: &str, confirm: bool) -> Result<String> {
+pub fn resolve_passphrase(explicit: Option<&str>, prompt: &str, confirm: bool) -> Result<Zeroizing<String>> {
     if let Some(p) = explicit {
-        if !p.is_empty() { return Ok(p.to_string()); }
+        if !p.is_empty() { return Ok(Zeroizing::new(p.to_string())); }
     }
     if let Ok(p) = std::env::var("BLACKBOOK_PASSPHRASE") {
-        if !p.is_empty() { return Ok(p); }
+        if !p.is_empty() { return Ok(Zeroizing::new(p)); }
     }
+    if prompts_suppressed() { return Err(CredError::NoPassphrase); }
     // Fall back to an interactive prompt. rpassword errors if there's no TTY,
     // which we surface as NoPassphrase so automation gets a clear message.
-    let p1 = rpassword::prompt_password(prompt).map_err(|_| CredError::NoPassphrase)?;
+    let p1 = Zeroizing::new(rpassword::prompt_password(prompt).map_err(|_| CredError::NoPassphrase)?);
     if p1.is_empty() { return Err(CredError::NoPassphrase); }
     if confirm {
-        let p2 = rpassword::prompt_password("Confirm passphrase: ")
-            .map_err(|_| CredError::NoPassphrase)?;
-        if p1 != p2 {
+        let p2 = Zeroizing::new(rpassword::prompt_password("Confirm passphrase: ")
+            .map_err(|_| CredError::NoPassphrase)?);
+        if *p1 != *p2 {
             return Err(CredError::Kdf("passphrases did not match".into()));
         }
     }
@@ -215,29 +230,61 @@ pub fn agent_store(profile: &str, kek: &[u8], ttl_secs: u64) -> Result<()> {
 }
 
 /// Fetch a still-valid cached KEK for `profile`, if any. Expired entries are
-/// removed and treated as absent.
-pub fn agent_get(profile: &str) -> Option<[u8; 32]> {
+/// securely removed and treated as absent. The KEK is returned [`Zeroizing`]
+/// so the caller's copy is wiped after it opens the profile.
+pub fn agent_get(profile: &str) -> Option<Zeroizing<[u8; 32]>> {
     use base64::Engine as _;
     let path = agent_path(profile).ok()?;
     let bytes = std::fs::read(&path).ok()?;
     let entry: AgentEntry = serde_json::from_slice(&bytes).ok()?;
     if entry.expires_at <= now_secs() {
-        let _ = std::fs::remove_file(&path);
+        let _ = secure_delete(&path);
         return None;
     }
-    let raw = base64::engine::general_purpose::STANDARD.decode(&entry.kek).ok()?;
+    let raw = Zeroizing::new(base64::engine::general_purpose::STANDARD.decode(&entry.kek).ok()?);
     if raw.len() != 32 { return None; }
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&raw);
     Some(out)
 }
 
-/// Remove any cached KEK for `profile`. Returns whether something was removed.
+/// Remove any cached KEK for `profile`, overwriting it first. Returns whether
+/// something was removed.
 pub fn agent_clear(profile: &str) -> bool {
     match agent_path(profile) {
-        Ok(p) if p.exists() => std::fs::remove_file(&p).is_ok(),
+        Ok(p) if p.exists() => secure_delete(&p).is_ok(),
         _ => false,
     }
+}
+
+/// Best-effort secure file deletion: overwrite the file's bytes with random
+/// data, flush to disk, then unlink. This lowers the chance that a secret
+/// (a cached KEK, a resident stash, a shredded plaintext) survives in freed
+/// blocks after a plain unlink. It is *best-effort*: copy-on-write, log-
+/// structured, and wear-levelled (SSD) filesystems may still retain the old
+/// blocks, so it complements — does not replace — full-disk encryption.
+pub fn secure_delete(path: &Path) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    use rand::RngCore;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let len = meta.len();
+        if len > 0 {
+            if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(path) {
+                let mut remaining = len;
+                let mut buf = [0u8; 4096];
+                let _ = f.seek(SeekFrom::Start(0));
+                while remaining > 0 {
+                    rand::thread_rng().fill_bytes(&mut buf);
+                    let n = remaining.min(buf.len() as u64) as usize;
+                    if f.write_all(&buf[..n]).is_err() { break; }
+                    remaining -= n as u64;
+                }
+                let _ = f.flush();
+                let _ = f.sync_all();
+            }
+        }
+    }
+    std::fs::remove_file(path)
 }
 
 fn harden_perms(path: &std::path::Path) {
@@ -252,4 +299,39 @@ fn harden_perms(path: &std::path::Path) {
     }
     #[cfg(not(unix))]
     { let _ = path; }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seal_open_roundtrip_via_passphrase_and_kek() {
+        // The credential bundle round-trips through the (now Zeroizing) seal/
+        // open paths — both the passphrase path and the cached-KEK agent path.
+        let secret = br#"{"token":"bbk_abc","key_pem":"-----KEY-----","cmk":"zz"}"#;
+        let env = seal_profile("correct horse battery", secret).unwrap();
+
+        let opened = env.open_with_passphrase("correct horse battery").unwrap();
+        assert_eq!(opened.as_slice(), secret.as_slice());
+
+        let kek = env.derive_kek("correct horse battery").unwrap();
+        let opened2 = env.open_with_kek(kek.as_slice()).unwrap();
+        assert_eq!(opened2.as_slice(), secret.as_slice());
+    }
+
+    #[test]
+    fn wrong_passphrase_is_rejected() {
+        let env = seal_profile("right", b"payload").unwrap();
+        assert!(matches!(env.open_with_passphrase("wrong"), Err(CredError::Decrypt)));
+    }
+
+    #[test]
+    fn secure_delete_removes_the_file() {
+        let path = std::env::temp_dir().join(format!("bbk-sd-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::write(&path, b"sensitive-bytes-that-should-be-scrubbed").unwrap();
+        assert!(path.exists());
+        secure_delete(&path).unwrap();
+        assert!(!path.exists(), "secure_delete must remove the file");
+    }
 }

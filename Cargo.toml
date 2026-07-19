@@ -2,11 +2,21 @@
 name = "blackbook"
 version = "0.1.0"
 edition = "2021"
+description = "A Dockerized, end-to-end-encrypted secrets engine driven from a CLI: TLS 1.3 + mandatory mTLS, per-domain namespaces, group ACLs, TOTP MFA, and K-of-N threshold approvals."
+license = "AGPL-3.0-only"
+readme = "README.md"
+rust-version = "1.94"
+keywords = ["secrets", "vault", "encryption", "mtls", "cryptography"]
+categories = ["cryptography", "command-line-utilities"]
 
 [dependencies]
-clap = { version = "=4.4", features = ["derive", "env"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+# OS-level process hardening for the long-lived server: disable core dumps and
+# lock secret pages out of swap (mlockall) so the in-RAM master key can't reach
+# disk. Linux-gated, best-effort.
+libc = "0.2"
 tokio = { version = "1.35", features = ["full"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "json"] }
 zeroize = "1.6"
 scrypt = "0.11.0"
 # Argon2id for the password paths only (credential-bundle unlock + explicit
@@ -17,9 +27,9 @@ argon2 = "0.5"
 rpassword = "7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 log = "0.4"
-env_logger = "0.10"
+env_logger = "0.11"
 uuid = { version = "1.5", features = ["v4", "serde"] }
 home = "0.5.9"
 aes-gcm = "0.10"
@@ -31,7 +41,7 @@ aes-kw = "0.2"
 pbkdf2 = "0.12"
 ed25519-dalek = "2.0"
 x25519-dalek = "2.0"
-base64 = "0.21"
+base64 = "0.22"
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
@@ -39,12 +49,12 @@ actix-web = { version = "4.4", features = ["openssl"] }
 actix-tls = { version = "3.0", features = ["openssl"] }
 actix-rt = "2.8"
 openssl = { version = "0.10", features = ["vendored"] }
-reqwest = { version = "0.11", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 tokio-util = "0.7"
 futures-util = "0.3"
-dirs = "5"
+dirs = "6"
 # Cert generation (CA + server + per-client) for TLS / mTLS.
-rcgen = { version = "0.12", default-features = false, features = ["pem", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 time = "0.3"
 # File uploads come in via raw PUT bodies, not multipart, so we don't need
 # actix-multipart. mime_guess sniffs Content-Type from filenames when the
@@ -54,4 +64,15 @@ mime_guess = "2"
 # apps; the secret bytes themselves are encrypted at rest under the master.
 totp-rs = { version = "5", features = ["otpauth"] }
 base32 = "0.4"
+# Tunnel feature: HKDF-SHA256 to derive directional session keys from the
+# X25519 shared secret; actix-ws for the relay's WebSocket endpoints. The client
+# side upgrades the existing mTLS reqwest client to a WebSocket via
+# reqwest-websocket, so the tunnel reuses the same cert + pinned CA as the REST
+# API (no separate TLS config needed).
+hkdf = "0.12"
+actix-ws = "0.3"
+reqwest-websocket = "0.4"
+# gzip for audit-log archives: old rows are exported to a compressed, encrypted,
+# hash-chain-verifiable file on the data volume so the live chain stays bounded.
+flate2 = "1"
 
