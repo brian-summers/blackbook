@@ -1,6 +1,8 @@
 # Blackbook
 
-A secrets engine you run as a Docker container and drive from a CLI. Holds string secrets and arbitrary files, encrypted end-to-end, behind TLS 1.3 + mTLS, with per-domain namespaces, group ACLs, resource policy flags, TOTP MFA, and K-of-N threshold approvals.
+<img width="1024" height="1024" alt="bbk" src="https://github.com/user-attachments/assets/fb60334e-c31f-42ff-a29b-bf4f5b70cba8" />
+
+A secrets engine isolated in a Docker container and driven from a CLI. Holds string secrets and arbitrary files, encrypted end-to-end from CLI to server behind TLS 1.3 + mTLS, with per-domain namespaces, group ACLs, resource policy flags, TOTP MFA, and K-of-N threshold approvals.
 
 ## What's in the box
 
