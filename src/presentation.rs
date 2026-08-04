@@ -7,18 +7,10 @@
 //!   hex by hand.
 //! - [`braille`] — one Unicode braille cell per byte (U+2800+byte): the most
 //!   compact rendering possible, one glyph per byte.
-//! - [`ucas`] — one Unified Canadian Aboriginal Syllabic per byte
-//!   (U+1401+byte): also one glyph per byte, with a distinctive look.
 
 /// One braille pattern glyph per byte (`U+2800`–`U+28FF`). 32 bytes → 32 chars.
 pub fn braille(data: &[u8]) -> String {
     data.iter().map(|&b| char::from_u32(0x2800 + b as u32).unwrap()).collect()
-}
-
-/// One Unified Canadian Aboriginal Syllabic per byte (`U+1401`–`U+1500`, all
-/// assigned). 32 bytes → 32 chars.
-pub fn ucas(data: &[u8]) -> String {
-    data.iter().map(|&b| char::from_u32(0x1401 + b as u32).unwrap()).collect()
 }
 
 /// OpenSSH-style "randomart": a 17×9 grid produced by a "drunken bishop" walk
@@ -86,14 +78,6 @@ mod tests {
     fn braille_one_glyph_per_byte() {
         assert_eq!(braille(&[0x00, 0xff]), "\u{2800}\u{28ff}");
         assert_eq!(braille(&[1, 2, 3]).chars().count(), 3);
-    }
-
-    #[test]
-    fn ucas_one_glyph_per_byte_no_tofu() {
-        // Every byte maps into the assigned U+1401..=U+1500 range.
-        let s = ucas(&(0u8..=255).collect::<Vec<_>>());
-        assert_eq!(s.chars().count(), 256);
-        assert!(s.chars().all(|c| ('\u{1401}'..='\u{1500}').contains(&c)));
     }
 
     #[test]

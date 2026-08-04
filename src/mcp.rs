@@ -97,7 +97,10 @@ pub async fn run(cfg: McpConfig) -> std::io::Result<()> {
 
         match method {
             "initialize" => {
-                send(&mut stdout, result(id, initialize_result())).await?;
+                let requested = msg.get("params")
+                    .and_then(|p| p.get("protocolVersion"))
+                    .and_then(Value::as_str);
+                send(&mut stdout, result(id, initialize_result(requested))).await?;
             }
             "ping" => {
                 send(&mut stdout, result(id, json!({}))).await?;
@@ -140,9 +143,15 @@ fn error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(requested: Option<&str>) -> Value {
+    // Per the MCP lifecycle: if we support the client's requested version, echo
+    // it back; otherwise offer our latest and let the client decide.
+    let version = match requested {
+        Some(v) if PROTO_SUPPORTED.contains(&v) => v,
+        _ => PROTO_LATEST,
+    };
     json!({
-        "protocolVersion": PROTO_LATEST,
+        "protocolVersion": version,
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "blackbook", "version": env!("CARGO_PKG_VERSION") },
         "instructions":

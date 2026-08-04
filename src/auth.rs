@@ -957,7 +957,7 @@ pub struct NewClient {
 #[cfg(test)]
 mod tests {
     use super::{ResourceFlags, compute_audit_hash, sql_like_match, cron_window_matches, rate_ok};
-    use chrono::{NaiveDate, NaiveDateTime};
+    use chrono::NaiveDateTime;
 
     fn dt(s: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").unwrap()

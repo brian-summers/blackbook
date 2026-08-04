@@ -795,14 +795,6 @@ impl BlackbookClient {
         Err(ClientError::Api { status: status.as_u16(), message })
     }
 
-    /// Returns (bytes, content_type, external_meta_b64). The third is set when
-    /// the server flags the download as a client-side ("external") file via
-    /// `X-Blackbook-External: 1` + `X-Blackbook-External-Meta`.
-    async fn handle_bytes(&self, resp: reqwest::Response) -> Result<(Vec<u8>, Option<String>, Option<String>)> {
-        let d = self.handle_download(resp).await?;
-        Ok((d.bytes, d.content_type, d.external_meta))
-    }
-
     /// Full download result, including the Phase 4 resident key component.
     async fn handle_download(&self, resp: reqwest::Response) -> Result<FileDownload> {
         let status = resp.status();
@@ -979,12 +971,6 @@ impl BlackbookClient {
         self.handle(resp).await
     }
 
-    pub async fn retrieve(&self, id_or_name: &str) -> Result<RetrieveResponse> {
-        let body = serde_json::json!({"resource_id": id_or_name});
-        let resp = self.req_in_domain(reqwest::Method::POST, "/api/v1/retrieve").json(&body).send().await?;
-        self.handle(resp).await
-    }
-
     /// Admin-only: purge tombstoned secrets in the current domain. Returns
     /// the count deleted, the count of preserve_on_cleanup rows that were
     /// kept, and the names of every row that was removed.
@@ -1031,27 +1017,8 @@ impl BlackbookClient {
         self.handle(resp).await
     }
 
-    pub async fn file_get(&self, name: &str) -> Result<(Vec<u8>, Option<String>, Option<String>)> {
-        self.file_get_with_request(name, None).await
-    }
-
-    /// Download a file, optionally presenting an approved K-of-N request id.
-    /// Returns (bytes, content_type, external_meta_b64) — the last is set for
-    /// client-side ("external") files.
-    pub async fn file_get_with_request(
-        &self, name: &str, request_id: Option<&str>,
-    ) -> Result<(Vec<u8>, Option<String>, Option<String>)> {
-        let url = format!("/api/v1/files/{}", urlencoding_simple(name));
-        let mut rb = self.req_in_domain(reqwest::Method::GET, &url);
-        if let Some(rid) = request_id {
-            rb = rb.header("X-Blackbook-Request-Id", rid);
-        }
-        let resp = rb.send().await?;
-        self.handle_bytes(resp).await
-    }
-
-    /// Like [`file_get_with_request`] but returns the full [`FileDownload`],
-    /// including the resident key component. Used by the resident-file path.
+    /// Download a file (optionally presenting an approved K-of-N request id),
+    /// returning the full [`FileDownload`] including the resident key component.
     pub async fn file_get_download(
         &self, name: &str, request_id: Option<&str>,
     ) -> Result<FileDownload> {

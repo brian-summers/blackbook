@@ -1509,10 +1509,8 @@ struct LoginBundle {
     cert_pem: Option<String>,
     key_pem: Option<String>,
     ca_pem: Option<String>,
-    // The shape returned by `client create` also includes these — accept and ignore.
-    #[serde(default)] name: Option<String>,
-    #[serde(default)] role: Option<String>,
-    #[serde(default)] expires_at: Option<String>,
+    // `client create` also returns name/role/expires_at; serde ignores those
+    // unknown fields, so we don't model them here.
 }
 
 async fn cmd_login(

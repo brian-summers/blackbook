@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 
 use crate::auth::{
-    self, acl_check, acl_record_use, action_name, audit, AclDecision, AuditStatus,
+    self, acl_check, acl_record_use, action_name, audit, AuditStatus,
     AuthenticatedClient, PeerCertInfo, ResourceFlags,
 };
 use sqlx::types::Json as SqlxJson;

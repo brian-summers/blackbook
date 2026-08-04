@@ -116,15 +116,6 @@ impl TunnelHub {
             })
             .collect()
     }
-
-    /// Attach a side's outbound channel. `as_offerer` picks which slot.
-    /// Returns the peer's outbound sender if the peer is already attached, so
-    /// the caller can wire both directions; plus the Vouch to send this side
-    /// once the peer is known.
-    pub async fn attach_offerer(&self, id: &str, tx: mpsc::UnboundedSender<RelayMsg>) {
-        let mut map = self.inner.lock().await;
-        if let Some(t) = map.get_mut(id) { t.to_offerer = Some(tx); }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
