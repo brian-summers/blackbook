@@ -54,7 +54,7 @@ impl From<credstore::CredError> for AppError {
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "blackbook", version, about, long_about = None)]
+#[command(name = "bbk", version, about, long_about = None)]
 struct Cli {
     #[arg(short = 'd', long, env = "DATABASE_URL")]
     database_url: Option<String>,
@@ -1753,12 +1753,18 @@ fn cmd_completions(shell: &str) -> Result<()> {
     // Absolute path to this exe, so completion works without the binary on PATH.
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "blackbook".to_string());
+        .unwrap_or_else(|_| "bbk".to_string());
+    // The command *name* to register completion for is this binary's basename
+    // (normally `bbk`), derived from the exe so a renamed binary still works.
+    let cmd = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "bbk".to_string());
     match shell.to_lowercase().as_str() {
-        "powershell" | "pwsh" | "ps" => print!("{}", powershell_script(&exe)),
-        "bash" => print!("{}", bash_script(&exe)),
-        "zsh" => print!("{}", zsh_script(&exe)),
-        "fish" => print!("{}", fish_script(&exe)),
+        "powershell" | "pwsh" | "ps" => print!("{}", powershell_script(&exe, &cmd)),
+        "bash" => print!("{}", bash_script(&exe, &cmd)),
+        "zsh" => print!("{}", zsh_script(&exe, &cmd)),
+        "fish" => print!("{}", fish_script(&exe, &cmd)),
         other => return Err(AppError::Config(format!(
             "unknown shell '{other}' — choose powershell, bash, zsh, or fish"))),
     }
@@ -1896,10 +1902,10 @@ fn local_resident_files() -> Vec<String> {
         .collect()
 }
 
-fn powershell_script(exe: &str) -> String {
+fn powershell_script(exe: &str, cmd: &str) -> String {
     format!(r#"# Blackbook PowerShell completion. Add to your $PROFILE:
-#   blackbook completions powershell | Out-String | Invoke-Expression
-Register-ArgumentCompleter -Native -CommandName blackbook -ScriptBlock {{
+#   {cmd} completions powershell | Out-String | Invoke-Expression
+Register-ArgumentCompleter -Native -CommandName {cmd} -ScriptBlock {{
     param($wordToComplete, $commandAst, $cursorPosition)
     $words = @($commandAst.CommandElements | ForEach-Object {{ $_.ToString() }})
     # If the cursor is on a fresh trailing space, add an empty word to complete.
@@ -1913,30 +1919,30 @@ Register-ArgumentCompleter -Native -CommandName blackbook -ScriptBlock {{
 "#)
 }
 
-fn bash_script(exe: &str) -> String {
-    format!(r#"# Blackbook bash completion. Source it:  source <(blackbook completions bash)
-_blackbook() {{
+fn bash_script(exe: &str, cmd: &str) -> String {
+    format!(r#"# Blackbook bash completion. Source it:  source <({cmd} completions bash)
+_{cmd}() {{
     local IFS=$'\n'
     COMPREPLY=( $('{exe}' __complete -- "${{COMP_WORDS[@]}}" 2>/dev/null) )
 }}
-complete -F _blackbook blackbook
+complete -F _{cmd} {cmd}
 "#)
 }
 
-fn zsh_script(exe: &str) -> String {
-    format!(r#"# Blackbook zsh completion. Source it:  source <(blackbook completions zsh)
-_blackbook() {{
+fn zsh_script(exe: &str, cmd: &str) -> String {
+    format!(r#"# Blackbook zsh completion. Source it:  source <({cmd} completions zsh)
+_{cmd}() {{
     local -a c
     c=(${{(f)"$('{exe}' __complete -- ${{words[@]}} 2>/dev/null)"}})
     compadd -- $c
 }}
-compdef _blackbook blackbook
+compdef _{cmd} {cmd}
 "#)
 }
 
-fn fish_script(exe: &str) -> String {
-    format!(r#"# Blackbook fish completion. Source it:  blackbook completions fish | source
-complete -c blackbook -f -a "({exe} __complete -- (commandline -opc) (commandline -ct) 2>/dev/null)"
+fn fish_script(exe: &str, cmd: &str) -> String {
+    format!(r#"# Blackbook fish completion. Source it:  {cmd} completions fish | source
+complete -c {cmd} -f -a "({exe} __complete -- (commandline -opc) (commandline -ct) 2>/dev/null)"
 "#)
 }
 

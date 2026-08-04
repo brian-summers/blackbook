@@ -22,9 +22,9 @@ WORKDIR /build
 # Copy source code
 COPY . .
 
-# Build release binary
+# Build release binary (the CLI/server binary is named `bbk`)
 RUN cargo build --release \
-    && chmod +x target/release/blackbook
+    && chmod +x target/release/bbk
 
 # Stage 2: Runtime stage
 FROM debian:bookworm-slim
@@ -53,8 +53,8 @@ RUN mkdir -p /opt/blackbook/bin \
     && chmod 700 /opt/blackbook \
     && chmod 700 /opt/blackbook/data
 
-# Copy compiled binary from builder
-COPY --from=builder --chown=blackbook:blackbook /build/target/release/blackbook /opt/blackbook/bin/blackbook
+# Copy compiled binary from builder (installed as /opt/blackbook/bin/bbk)
+COPY --from=builder --chown=blackbook:blackbook /build/target/release/bbk /opt/blackbook/bin/bbk
 
 # Set working directory
 WORKDIR /opt/blackbook
@@ -68,7 +68,7 @@ EXPOSE 8443
 
 # Health check - test connectivity to database
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD /opt/blackbook/bin/blackbook health || exit 1
+    CMD /opt/blackbook/bin/bbk health || exit 1
 
 # Environment variables (will be overridden in docker-compose or runtime)
 ENV RUST_LOG=info
@@ -77,5 +77,5 @@ ENV DATABASE_URL=""
 ENV BLACKBOOK_HTTPS_PORT=8443
 
 # Entry point - runs Blackbook with init command first, then starts service
-ENTRYPOINT ["/opt/blackbook/bin/blackbook"]
+ENTRYPOINT ["/opt/blackbook/bin/bbk"]
 CMD ["health"]

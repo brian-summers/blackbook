@@ -9,6 +9,12 @@ rust-version = "1.94"
 keywords = ["secrets", "vault", "encryption", "mtls", "cryptography"]
 categories = ["cryptography", "command-line-utilities"]
 
+# The CLI ships as `bbk` (matching the ~/.bbk home dir). The package/project
+# keeps the name `blackbook`; only the invoked command is the short `bbk`.
+[[bin]]
+name = "bbk"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
 # OS-level process hardening for the long-lived server: disable core dumps and

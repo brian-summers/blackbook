@@ -394,7 +394,7 @@ watch docker-compose ps
 docker-compose exec postgres pg_isready -U blackbook_admin
 
 # Blackbook health
-docker-compose exec blackbook /opt/blackbook/bin/blackbook health
+docker-compose exec blackbook /opt/blackbook/bin/bbk health
 
 # Automatic health: checks run every 30 seconds
 docker-compose logs | grep -i health
@@ -773,7 +773,7 @@ docker network inspect <network>         # Network details
 ### File Locations
 
 Inside containers:
-- App binary: `/opt/blackbook/bin/blackbook`
+- App binary: `/opt/blackbook/bin/bbk`
 - Config: `/opt/blackbook/config/`
 - Certificates: `/opt/blackbook/certs/`
 - Database data (PostgreSQL): `/var/lib/postgresql/data`

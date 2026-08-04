@@ -357,7 +357,7 @@ struct CompleteResponse { candidates: Vec<String> }
 /// Tab-completion: reuse the CLI's own `__complete` brain so suggestions can
 /// never drift from the real command surface.
 async fn complete(req: web::Json<CompleteRequest>) -> HttpResponse {
-    let mut argv = vec!["blackbook".to_string()];
+    let mut argv = vec!["bbk".to_string()];
     match tokenize(&req.line) {
         Ok(v) => argv.extend(v),
         Err(_) => {}
