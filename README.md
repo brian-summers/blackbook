@@ -276,6 +276,24 @@ It runs as *you*, at the same trust level as your terminal, and never invokes a 
 
 ---
 
+## AI agents (MCP)
+
+`bbk mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io) server so AI agents (Claude Code, Claude Desktop, …) can use Blackbook as tools. It's **secure by default** — the safe option is the default and you opt in to more:
+
+- **Offline crypto tools** always work and never touch the network: hash, encrypt/decrypt under a passphrase, derive keys, secure random, visual fingerprints.
+- **Online tools** (read/list secrets) appear only when you point it at a profile, and go through the normal authenticated client — so the **server still enforces that profile's ACLs, MFA, and K-of-N**. Give the agent a least-privilege profile and its reach is bounded.
+- **Writes are off** unless you pass `--allow-write`; `--offline` disables the network entirely.
+
+```powershell
+bbk mcp --offline                 # crypto-only utility, no server
+bbk -P agent unlock; bbk -P agent mcp          # read-only, as the `agent` profile
+claude mcp add blackbook -- bbk -P agent mcp   # register with Claude Code
+```
+
+Full tool list, security model, and Claude Desktop setup: **[MCP.md](MCP.md)**.
+
+---
+
 ## Secure tunnels
 
 Blackbook can also act as a **trusted introducer** between two of its clients, opening an end-to-end-encrypted tunnel that the server relays but *cannot read*. It's like `ssh -L` port forwarding, but the two ends authenticate each other using the certificates Blackbook already issued them, and the server only ever sees encrypted frames.
