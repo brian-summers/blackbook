@@ -752,6 +752,7 @@ impl BlackbookClient {
     }
     /// The domain this client is scoped to (`default` if unset).
     pub fn domain(&self) -> &str { &self.domain }
+    pub fn server_url(&self) -> &str { &self.server }
     pub fn with_mfa(mut self, code: impl Into<String>) -> Self {
         self.mfa = Some(code.into()); self
     }

@@ -16,6 +16,7 @@ mod server;
 mod client;
 mod credstore;
 mod webui;
+mod mcp;
 mod tunnel_crypto;
 mod tunnel_relay;
 mod tunnel_client;
@@ -97,6 +98,21 @@ enum Commands {
         #[arg(short, long, default_value = "127.0.0.1:8088")]
         bind: String,
     },
+
+    /// Run an MCP (Model Context Protocol) server on stdio so AI agents can use
+    /// Blackbook's data-security features. Offline crypto tools always work;
+    /// online tools use the active profile (`-P`) to talk to a Blackbook server,
+    /// bounded by that profile's permissions. Secure by default: reads only
+    /// (pass --allow-write to enable writes), and --offline for crypto-only.
+    Mcp {
+        /// Expose ONLY the offline crypto tools — never touch the network.
+        #[arg(long)]
+        offline: bool,
+        /// Enable the mutating online tools (secret_put / secret_delete).
+        #[arg(long)]
+        allow_write: bool,
+    },
+
     /// Database connectivity ping (used by Docker healthcheck).
     Health,
 
@@ -3121,6 +3137,27 @@ async fn main() -> Result<()> {
 
         Commands::Web { bind } => {
             webui::run_web(&bind).await.map_err(|e| AppError::Config(e.to_string()))?;
+        }
+
+        Commands::Mcp { offline, allow_write } => {
+            // Online tools act as the resolved active profile — but only if it
+            // actually exists on disk; otherwise the server is crypto-only.
+            let profile = if offline {
+                None
+            } else {
+                let p = client::active_profile();
+                match client::Session::path_for(&p) {
+                    Ok(path) if path.exists() => Some(p),
+                    _ => None,
+                }
+            };
+            let cfg = mcp::McpConfig {
+                profile,
+                offline,
+                allow_write,
+                domain: effective_domain.clone(),
+            };
+            mcp::run(cfg).await.map_err(|e| AppError::Config(e.to_string()))?;
         }
 
         Commands::Server { bind } => {
