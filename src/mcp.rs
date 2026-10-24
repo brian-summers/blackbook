@@ -268,6 +268,12 @@ fn tool(name: &str, description: &str, schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": schema })
 }
 
+/// Compact human-readable uptime from a second count.
+fn fmt_uptime(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    if d > 0 { format!("{d}d {h}h {m}m") } else if h > 0 { format!("{h}h {m}m") } else { format!("{m}m") }
+}
+
 // ---------------------------------------------------------------------------
 // Tool dispatch
 // ---------------------------------------------------------------------------
@@ -482,7 +488,8 @@ async fn call_online(cfg: &McpConfig, name: &str, args: &Value) -> Result<String
                 s.push_str(&format!("\nuser domain: {ud}"));
             }
             if let Some(h) = health {
-                s.push_str(&format!("\nhealth: {} (db {}), version {}", h.status, h.database, h.version));
+                s.push_str(&format!("\nhealth: {} (db {}), version {}, uptime {}",
+                    h.status, h.database, h.version, fmt_uptime(h.uptime)));
             }
             Ok(s)
         }

@@ -791,7 +791,9 @@ impl BlackbookClient {
         let status = resp.status();
         if status.is_success() { return Ok(resp.json::<T>().await?); }
         let body = resp.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<ApiError>(&body).map(|e| e.message).unwrap_or(body);
+        let message = serde_json::from_str::<ApiError>(&body)
+            .map(|e| if e.error.is_empty() { e.message } else { format!("{} [{}]", e.message, e.error) })
+            .unwrap_or(body);
         Err(ClientError::Api { status: status.as_u16(), message })
     }
 
@@ -815,7 +817,9 @@ impl BlackbookClient {
             });
         }
         let body = resp.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<ApiError>(&body).map(|e| e.message).unwrap_or(body);
+        let message = serde_json::from_str::<ApiError>(&body)
+            .map(|e| if e.error.is_empty() { e.message } else { format!("{} [{}]", e.message, e.error) })
+            .unwrap_or(body);
         Err(ClientError::Api { status: status.as_u16(), message })
     }
 

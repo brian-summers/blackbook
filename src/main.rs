@@ -2086,6 +2086,14 @@ async fn cmd_get(
             }
         }
     };
+    // On an interactive terminal, print provenance to stderr so the secret value
+    // on stdout stays pipe-clean. (The short id correlates with the audit log.)
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        let trunc = |s: &str| s[..s.len().min(19)].to_string();
+        eprintln!("↳ {} (id {}, created {}, updated {})",
+                  resp.resource_name, short_id(&resp.resource_id),
+                  trunc(&resp.created_at), trunc(&resp.updated_at));
+    }
     if resp.external {
         // Client-side secret: the server handed back an opaque envelope that
         // only our passphrase can open.
@@ -2211,6 +2219,9 @@ async fn cmd_requests(id: Option<String>, verbose: bool) -> Result<()> {
             println!("      can approve : {}", r.signatories.join(", "));
             println!("      approved by : {}",
                      if r.approvers.is_empty() { "(none yet)".to_string() } else { r.approvers.join(", ") });
+            if let Some(ca) = &r.consumed_at {
+                println!("      consumed at : {ca}");
+            }
         }
     }
     if !verbose {
@@ -2243,18 +2254,25 @@ async fn cmd_grants(cmd: GrantsCmd, domain: Option<String>) -> Result<()> {
         GrantsCmd::Ls => {
             let list = bb.list_access_grants().await?;
             if list.count == 0 { println!("(no advance grants)"); return Ok(()); }
-            println!("{:<14}  {:<12}  {:<12}  {:<7}  {:<22}  {:<8}  {:<24}  STATUS",
-                     "ID", "SIGNATORY", "GRANTEE", "KIND", "PATTERN", "USE", "EXPIRES");
-            println!("{}", "-".repeat(120));
+            println!("{:<14}  {:<12}  {:<12}  {:<10}  {:<6}  {:<20}  {:<7}  {:<23}  {:<11}  STATUS",
+                     "ID", "SIGNATORY", "GRANTEE", "DOMAIN", "KIND", "PATTERN", "USE", "VALIDITY", "CREATED");
+            println!("{}", "-".repeat(150));
             for g in list.grants {
                 let use_disp = match g.max_uses {
                     Some(m) => format!("{}/{}", g.use_count, m),
                     None => format!("{}", g.use_count),
                 };
+                let exp = &g.expires_at[..g.expires_at.len().min(10)];
+                // Validity window: show not-before → expiry when a start is set.
+                let validity = match &g.not_before {
+                    Some(nb) => format!("{}→{exp}", &nb[..nb.len().min(10)]),
+                    None => exp.to_string(),
+                };
+                let created = &g.created_at[..g.created_at.len().min(10)];
                 let status = if g.revoked { "revoked" } else { "active" };
-                println!("{:<14}  {:<12}  {:<12}  {:<7}  {:<22}  {:<8}  {:<24}  {}",
-                         g.id, g.signatory, g.grantee, g.resource_kind,
-                         g.pattern, use_disp, g.expires_at, status);
+                println!("{:<14}  {:<12}  {:<12}  {:<10}  {:<6}  {:<20}  {:<7}  {:<23}  {:<11}  {}",
+                         g.id, g.signatory, g.grantee, g.domain, g.resource_kind,
+                         g.pattern, use_disp, validity, created, status);
             }
         }
         GrantsCmd::Rm { id, yes } => {
@@ -2339,7 +2357,11 @@ async fn cmd_rm(name: String, yes: bool, domain: Option<String>, mfa: Option<Str
         if read_stdin_line().to_lowercase() != "y" { println!("aborted"); return Ok(()); }
     }
     let resp = bb.delete(&name).await?;
-    println!("deleted {} at {}", resp.resource_id, resp.deleted_at);
+    if resp.deleted {
+        println!("deleted '{}' (id {}) at {}", name, short_id(&resp.resource_id), resp.deleted_at);
+    } else {
+        println!("'{}' (id {}) was already gone — nothing to delete", name, short_id(&resp.resource_id));
+    }
     Ok(())
 }
 
@@ -2377,12 +2399,17 @@ async fn cmd_tunnel(cmd: TunnelCmd) -> Result<()> {
             println!("🔌 offered tunnel {tid} to '{peer}'. Waiting for them to `tunnel accept`…");
             let mut ws = bb.tunnel_connect_ws(&tid).await
                 .map_err(|e| AppError::Client(e.to_string()))?;
-            let (sess, vouch) = tunnel_client::handshake(&mut ws, &my_name, &my_cert, &my_key).await
+            // `handshake` returns only after the peer's ECDSA signature is
+            // verified against the fingerprint the server vouched, so
+            // `sess.peer_*` is the *cryptographically authenticated* identity —
+            // not merely the server's claim. Surface that, not the vouch.
+            let (sess, _vouch) = tunnel_client::handshake(&mut ws, &my_name, &my_cert, &my_key).await
                 .map_err(|e| AppError::Config(format!("tunnel handshake: {e}")))?;
-            println!("🔒 secured E2E with '{}' (cert {}…) — server cannot read this tunnel.",
-                     vouch.peer_name, &vouch.peer_fingerprint[..16.min(vouch.peer_fingerprint.len())]);
+            let peer_fp = &sess.peer_fingerprint[..16.min(sess.peer_fingerprint.len())];
+            println!("🔒 E2E secured — peer '{}' cryptographically verified (cert fp {peer_fp}…). \
+                      The server relays but cannot read this tunnel.", sess.peer_name);
             println!("➡️  forwarding {} {listen} → {}:{target}",
-                     if udp { "udp" } else { "tcp" }, vouch.peer_name);
+                     if udp { "udp" } else { "tcp" }, sess.peer_name);
             tunnel_client::run_listener(ws, sess, proto, listen, target).await
                 .map_err(|e| AppError::Config(format!("tunnel: {e}")))?;
             Ok(())
@@ -2409,10 +2436,11 @@ async fn cmd_tunnel(cmd: TunnelCmd) -> Result<()> {
             };
             let mut ws = bb.tunnel_connect_ws(&tid).await
                 .map_err(|e| AppError::Client(e.to_string()))?;
-            let (sess, vouch) = tunnel_client::handshake(&mut ws, &my_name, &my_cert, &my_key).await
+            let (sess, _vouch) = tunnel_client::handshake(&mut ws, &my_name, &my_cert, &my_key).await
                 .map_err(|e| AppError::Config(format!("tunnel handshake: {e}")))?;
-            println!("🔒 secured E2E with '{}' (cert {}…) — serving their dial requests.",
-                     vouch.peer_name, &vouch.peer_fingerprint[..16.min(vouch.peer_fingerprint.len())]);
+            let peer_fp = &sess.peer_fingerprint[..16.min(sess.peer_fingerprint.len())];
+            println!("🔒 E2E secured — peer '{}' cryptographically verified (cert fp {peer_fp}…) \
+                      — serving their dial requests.", sess.peer_name);
             tunnel_client::run_target(ws, sess).await
                 .map_err(|e| AppError::Config(format!("tunnel: {e}")))?;
             Ok(())
@@ -2698,6 +2726,11 @@ async fn cmd_client(cmd: ClientCmd) -> Result<()> {
                 eprintln!("Save the JSON above and run `blackbook login --bundle PATH` on the client.");
                 eprintln!("This is the ONLY time the cert/key/token appear in plaintext.");
             }
+            // Confirm what was provisioned: the new client's id (which appears as
+            // `client_id` in the audit log) and the private user domain it gets.
+            let udom = if new.user_domain.is_empty() { format!("~{}", new.name) } else { new.user_domain.clone() };
+            eprintln!("Provisioned client '{}' — id {}, role {}, private domain '{}'.",
+                      new.name, short_id(&new.id), new.role, udom);
         }
         ClientCmd::Rotate { name, ttl_days, out } => {
             let new = bb.rotate_my_or_client(&name, ttl_days).await?;
@@ -2724,11 +2757,13 @@ async fn cmd_client(cmd: ClientCmd) -> Result<()> {
         ClientCmd::Ls => {
             let list = bb.list_clients().await?;
             if list.count == 0 { println!("(no clients)"); return Ok(()); }
-            println!("{:<24}  {:<8}  {:<24}  {:<24}  {}", "NAME", "ROLE", "CREATED", "EXPIRES", "REVOKED");
-            println!("{}", "-".repeat(112));
+            println!("{:<10}  {:<22}  {:<8}  {:<22}  {:<22}  {}",
+                     "ID", "NAME", "ROLE", "CREATED", "EXPIRES", "REVOKED");
+            println!("{}", "-".repeat(100));
             for c in list.clients {
-                println!("{:<24}  {:<8}  {:<24}  {:<24}  {}",
-                         c.name, c.role, c.created_at,
+                // Short id (correlates with `client_id` in the audit log).
+                println!("{:<10}  {:<22}  {:<8}  {:<22}  {:<22}  {}",
+                         short_id(&c.id), c.name, c.role, c.created_at,
                          c.expires_at.as_deref().unwrap_or("never"),
                          c.revoked_at.as_deref().unwrap_or("-"));
             }
@@ -2777,6 +2812,11 @@ fn fmt_period(secs: i32) -> String {
     else { format!("{s}s") }
 }
 
+/// A short, git-style prefix of a UUID for compact list columns. Enough to
+/// eyeball and to correlate a row with the same id elsewhere (e.g. a
+/// `client_id` in the audit log) without printing the full 36-char UUID.
+fn short_id(id: &str) -> &str { &id[..id.len().min(8)] }
+
 async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, None, None)?;
@@ -2822,9 +2862,9 @@ async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
         AclCmd::Ls => {
             let list = bb.list_acl().await?;
             if list.count == 0 { println!("(no acl entries)"); return Ok(()); }
-            println!("{:<14}  {:<10}  {:<20}  {:<24}  {:<10}  {:<8}  {}",
-                     "ID", "DOMAIN", "SUBJECT", "PATTERN", "ACTIONS", "USE", "LIMITS");
-            println!("{}", "-".repeat(140));
+            println!("{:<14}  {:<10}  {:<20}  {:<24}  {:<10}  {:<8}  {:<12}  {}",
+                     "ID", "DOMAIN", "SUBJECT", "PATTERN", "ACTIONS", "USE", "GRANTED", "LIMITS");
+            println!("{}", "-".repeat(152));
             for e in list.entries {
                 let subject = e.client_name
                     .or_else(|| e.group_domain.map(|g| format!("@{g}")))
@@ -2833,16 +2873,18 @@ async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
                     (Some(m), c) => format!("{c}/{m}"),
                     (None, c) => format!("{c}"),
                 };
-                // Compact limits column: rate, schedule, expiry.
+                // Compact limits column: rate, schedule, not-before, expiry.
                 let mut limits: Vec<String> = Vec::new();
                 if let (Some(m), Some(p)) = (e.rate_max, e.rate_period_secs) {
                     limits.push(format!("rate {m}/{}", fmt_period(p)));
                 }
                 if let Some(s) = &e.schedule { limits.push(format!("cron \"{s}\"")); }
+                if let Some(nb) = &e.not_before { limits.push(format!("nbf {}", &nb[..nb.len().min(10)])); }
                 if let Some(x) = &e.expires_at { limits.push(format!("exp {}", &x[..x.len().min(10)])); }
-                println!("{:<14}  {:<10}  {:<20}  {:<24}  {:<10}  {:<8}  {}",
+                println!("{:<14}  {:<10}  {:<20}  {:<24}  {:<10}  {:<8}  {:<12}  {}",
                          e.id, e.domain, subject, e.resource_pattern,
                          e.actions.join(","), use_disp,
+                         &e.granted_at[..e.granted_at.len().min(10)],
                          if limits.is_empty() { "-".into() } else { limits.join(", ") });
             }
         }
@@ -2865,10 +2907,10 @@ async fn cmd_domain(cmd: DomainCmd) -> Result<()> {
         DomainCmd::Ls => {
             let list = bb.list_domains().await?;
             if list.count == 0 { println!("(no domains visible)"); return Ok(()); }
-            println!("{:<24}  {:<24}  {}", "NAME", "CREATED", "DESCRIPTION");
-            println!("{}", "-".repeat(80));
+            println!("{:<10}  {:<24}  {:<24}  {}", "ID", "NAME", "CREATED", "DESCRIPTION");
+            println!("{}", "-".repeat(90));
             for d in list.domains {
-                println!("{:<24}  {:<24}  {}", d.name, d.created_at,
+                println!("{:<10}  {:<24}  {:<24}  {}", short_id(&d.id), d.name, d.created_at,
                          d.description.as_deref().unwrap_or(""));
             }
         }
@@ -2979,14 +3021,19 @@ async fn cmd_audit(
     }
     let list = bb.audit(limit).await?;
     if list.count == 0 { println!("(no audit entries)"); return Ok(()); }
-    println!("{:<26}  {:<14}  {:<16}  {:<10}  {}", "TS", "CLIENT", "ACTION", "STATUS", "RESOURCE");
-    println!("{}", "-".repeat(96));
+    println!("{:<8}  {:<26}  {:<14}  {:<16}  {:<8}  {:<20}  {}",
+             "ID", "TS", "CLIENT", "ACTION", "STATUS", "RESOURCE", "MESSAGE");
+    println!("{}", "-".repeat(120));
     for e in list.entries {
-        println!("{:<26}  {:<14}  {:<16}  {:<10}  {}",
-                 e.ts,
-                 e.client_name.as_deref().unwrap_or("-"),
-                 e.action, e.status,
-                 e.resource.as_deref().unwrap_or("-"));
+        // Prefer the resolved client name; fall back to a short client_id for
+        // system/unnamed events. `message` carries the per-event detail.
+        let who = e.client_name.clone()
+            .or_else(|| e.client_id.as_deref().map(|c| short_id(c).to_string()))
+            .unwrap_or_else(|| "-".into());
+        println!("{:<8}  {:<26}  {:<14}  {:<16}  {:<8}  {:<20}  {}",
+                 e.id, e.ts, who, e.action, e.status,
+                 e.resource.as_deref().unwrap_or("-"),
+                 e.message.as_deref().unwrap_or(""));
     }
     Ok(())
 }
