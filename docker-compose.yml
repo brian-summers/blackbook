@@ -161,7 +161,14 @@ services:
       # verifies Postgres against its CA (sslmode=verify-full) AND presents its
       # own client certificate (sslcert/sslkey), so both ends are authenticated
       # on top of the SCRAM password. The superuser is NOT used.
-      DATABASE_URL: "postgresql://${DB_USER:-blackbook_app}:${DB_PASSWORD:-blackbook_dev_app_change_me}@postgres:5432/${DB_NAME:-blackbook}?sslmode=verify-full&sslrootcert=/opt/blackbook/certs/pg-ca.crt&sslcert=/opt/blackbook/certs/pg-client.crt&sslkey=/opt/blackbook/certs/pg-client.key"
+      #
+      # The password is deliberately NOT spliced into the URL: `openssl rand
+      # -base64` output contains `/`, `+` and `=`, and a raw `/` ends the URL's
+      # authority early (the username then gets parsed as the host, failing with
+      # "failed to lookup address information"). sqlx falls back to the libpq
+      # PGPASSWORD variable for a URL without a password, so any characters work.
+      DATABASE_URL: "postgresql://${DB_USER:-blackbook_app}@postgres:5432/${DB_NAME:-blackbook}?sslmode=verify-full&sslrootcert=/opt/blackbook/certs/pg-ca.crt&sslcert=/opt/blackbook/certs/pg-client.crt&sslkey=/opt/blackbook/certs/pg-client.key"
+      PGPASSWORD: ${DB_PASSWORD:-blackbook_dev_app_change_me}
 
       RUST_LOG: ${RUST_LOG:-info}
       RUST_BACKTRACE: 1

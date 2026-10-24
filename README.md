@@ -477,6 +477,7 @@ For the full cryptographic details, the persistence design, and the exact envelo
 | Env var | Required | Purpose |
 |---|---|---|
 | `DATABASE_URL` | yes (server) | PostgreSQL connection string. |
+| `PGPASSWORD` | no | Database password, used when `DATABASE_URL` carries none. The bundled `docker-compose.yml` passes it this way so a password containing `/`, `+`, `@`, etc. needs no URL-encoding. |
 | `BLACKBOOK_DATA_DIR` | no | Where the master key / CA / admin bundle live (default `/opt/blackbook/data`). |
 | `BLACKBOOK_SERVER_SANS` | no | Extra hostnames for the auto-minted server certificate. |
 | **`BLACKBOOK_MASTER_KEYFILE`** | one provider **required** | Path to a keyfile (kept off the data volume). A random data key is generated once and stored only *wrapped* under `SHA3-256(keyfile)`. |
