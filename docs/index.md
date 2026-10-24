@@ -5,7 +5,6 @@ hide:
   - navigation
   - toc
 ---
-<meta name="google-site-verification" content="EeM3Q6D09q2SgM-h-OQTQJ-oKCBCWLDRe0FDCG6nJyc" />
 <div class="bb-hero" markdown>
 
 ![Blackbook logo](assets/logo.png){ .bb-hero__logo width="144" height="144" }
