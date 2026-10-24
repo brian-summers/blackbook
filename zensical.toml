@@ -54,6 +54,9 @@ nav = [
 
 [project.theme]
 language = "en"
+# Template overrides (e.g. the Google Search Console verification meta tag in
+# overrides/main.html). Lives outside docs/ so it isn't published as a page.
+custom_dir = "overrides"
 logo = "assets/logo.png"
 favicon = "assets/favicon.png"
 features = [
