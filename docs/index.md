@@ -1,4 +1,3 @@
-<meta name="google-site-verification" content="EeM3Q6D09q2SgM-h-OQTQJ-oKCBCWLDRe0FDCG6nJyc" />
 ---
 title: Self-hosted secrets manager
 description: "Blackbook is a self-hosted, open-source secrets manager written in Rust: an end-to-end-encrypted HashiCorp Vault alternative with mTLS, ACLs, TOTP MFA, K-of-N approvals, and a tamper-evident audit log. Deploys with Docker; driven from a CLI, a web console, or AI agents over MCP."
@@ -6,7 +5,7 @@ hide:
   - navigation
   - toc
 ---
-
+<meta name="google-site-verification" content="EeM3Q6D09q2SgM-h-OQTQJ-oKCBCWLDRe0FDCG6nJyc" />
 <div class="bb-hero" markdown>
 
 ![Blackbook logo](assets/logo.png){ .bb-hero__logo width="144" height="144" }
