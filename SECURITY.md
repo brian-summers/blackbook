@@ -1,7 +1,7 @@
 # Security Policy
 
 Blackbook is a secrets engine. Its threat model and cryptographic design are
-documented in [README.md](README.md) (see *Crypto details* and *Architecture*).
+documented in [Architecture & cryptography](https://brian-summers.github.io/blackbook/security/architecture/).
 Please read this before reporting.
 
 ## Reporting a vulnerability

@@ -5,6 +5,7 @@ edition = "2021"
 description = "A Dockerized, end-to-end-encrypted secrets engine driven from a CLI: TLS 1.3 + mandatory mTLS, per-domain namespaces, group ACLs, TOTP MFA, and K-of-N threshold approvals."
 license = "AGPL-3.0-only"
 repository = "https://github.com/brian-summers/blackbook"
+homepage = "https://brian-summers.github.io/blackbook/"
 readme = "README.md"
 rust-version = "1.94"
 keywords = ["secrets", "vault", "encryption", "mtls", "cryptography"]

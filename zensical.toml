@@ -1,0 +1,139 @@
+# Documentation site for https://brian-summers.github.io/blackbook/
+#
+# Built with Zensical (the successor to Material for MkDocs) by
+# .github/workflows/docs.yml on every push to main. Preview locally with:
+#
+#   pip install zensical
+#   zensical serve
+#
+# Most pages don't hold their own text: they pull it in from README.md, MCP.md,
+# DEPLOYMENT.md, SECURITY.md and CONTRIBUTING.md via snippets (`--8<--`), so
+# those files stay the single source of truth. README sections are delimited by
+# invisible `<!-- --8<-- [start:name] -->` / `[end:name]` comments.
+
+[project]
+site_name = "Blackbook Secrets Engine"
+site_url = "https://brian-summers.github.io/blackbook/"
+site_description = "Blackbook is a self-hosted, open-source secrets manager written in Rust: an end-to-end-encrypted HashiCorp Vault alternative with mTLS, ACLs, TOTP MFA, K-of-N approvals, and a tamper-evident audit log."
+site_author = "Brian Summers"
+copyright = "Copyright &copy; 2026 Brian Summers &middot; Licensed under <a href=\"https://github.com/brian-summers/blackbook/blob/main/LICENSE\">AGPL-3.0-only</a>"
+repo_url = "https://github.com/brian-summers/blackbook"
+repo_name = "brian-summers/blackbook"
+extra_css = ["stylesheets/extra.css"]
+
+nav = [
+  { "Home" = "index.md" },
+  { "Getting started" = [
+    { "Why Blackbook" = "getting-started/why-blackbook.md" },
+    { "How it works" = "getting-started/how-it-works.md" },
+    { "Quick start" = "getting-started/quick-start.md" },
+    { "Core concepts" = "getting-started/concepts.md" },
+  ] },
+  { "Guides" = [
+    { "Turning up the protection" = "guides/protection.md" },
+    { "Web console" = "guides/web-console.md" },
+    { "AI agents (MCP)" = "guides/mcp.md" },
+    { "Secure tunnels" = "guides/tunnels.md" },
+    { "Shell completion" = "guides/shell-completion.md" },
+  ] },
+  { "Reference" = [
+    { "Command reference" = "reference/commands.md" },
+    { "Configuration" = "reference/configuration.md" },
+  ] },
+  { "Deployment" = "deployment.md" },
+  { "Security" = [
+    { "Architecture & cryptography" = "security/architecture.md" },
+    { "Known limitations" = "security/limitations.md" },
+    { "Security policy" = "security/policy.md" },
+  ] },
+  { "Project" = [
+    { "Contributing" = "project/contributing.md" },
+    { "Project layout" = "project/layout.md" },
+  ] },
+]
+
+[project.theme]
+language = "en"
+logo = "assets/logo.png"
+favicon = "assets/favicon.png"
+features = [
+  "content.code.annotate",
+  "content.code.copy",
+  "content.tabs.link",
+  "content.tooltips",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.instant",
+  "navigation.instant.prefetch",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.tabs",
+  "navigation.top",
+  "navigation.tracking",
+  "search.highlight",
+  "toc.follow",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+primary = "black"
+accent = "indigo"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "black"
+accent = "indigo"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "black"
+accent = "indigo"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/brian-summers/blackbook"
+name = "Blackbook on GitHub"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/rust"
+link = "https://crates.io/crates/blackbook"
+name = "Blackbook on crates.io"
+
+[project.markdown_extensions]
+abbr = {}
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+md_in_html = {}
+tables = {}
+toc.permalink = true
+pymdownx.betterem = {}
+pymdownx.details = {}
+pymdownx.emoji.emoji_generator = "zensical.extensions.emoji.to_svg"
+pymdownx.emoji.emoji_index = "zensical.extensions.emoji.twemoji"
+pymdownx.highlight.anchor_linenums = true
+pymdownx.highlight.line_spans = "__span"
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.inlinehilite = {}
+pymdownx.keys = {}
+pymdownx.mark = {}
+pymdownx.smartsymbols = {}
+# Pull README/MCP/DEPLOYMENT/... from the repo root; fail the build if a file
+# or section marker goes missing rather than silently publishing a blank page.
+pymdownx.snippets.base_path = ["."]
+pymdownx.snippets.check_paths = true
+pymdownx.superfences.custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
+pymdownx.tabbed.alternate_style = true
+pymdownx.tabbed.combine_header_slug = true
+pymdownx.tasklist.custom_checkbox = true

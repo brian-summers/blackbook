@@ -24,6 +24,8 @@ That's the whole idea. Everything below is about *how hard Blackbook works to ke
 
 ## You don't have to be a security expert
 
+<!-- --8<-- [start:why] -->
+
 Most tools make you *opt in* to safety: turn on encryption, enable two-factor, configure TLS, set permissions. It's easy to forget a step, and one forgotten step is often the whole breach.
 
 **Blackbook flips that around. The strongest option is simply the default.** There's usually no "secure mode" to switch on, because there's no insecure mode to begin with. Out of the box, with zero configuration:
@@ -41,9 +43,13 @@ Most tools make you *opt in* to safety: turn on encryption, enable two-factor, c
 
 You *can* turn the dial up even further when a particular secret deserves it — require a fresh two-factor code on every read, demand approval from your teammates, make it self-destruct after one read, or encrypt it so that **even the server operator can't read it**. Those are covered later. But you never have to reach for them just to be safe. Safe is the floor.
 
+<!-- --8<-- [end:why] -->
+
 ---
 
 ## How it fits together
+
+<!-- --8<-- [start:how-it-works] -->
 
 At a high level there are only a few moving parts: **you** (using the CLI or the web console), the **Blackbook server** running in Docker, and its **PostgreSQL database** — everything encrypted and authenticated between them.
 
@@ -89,9 +95,13 @@ sequenceDiagram
     Server-->>You: sk_live_...
 ```
 
+<!-- --8<-- [end:how-it-works] -->
+
 ---
 
 ## Quick start
+
+<!-- --8<-- [start:quick-start] -->
 
 You need **Docker** (with Compose) and, to build the CLI, **Rust** (`cargo`). On Windows, building the CLI also needs `perl` (for the bundled OpenSSL).
 
@@ -134,9 +144,13 @@ bbk ls                                  # list what you have
 
 > **A note on the `login` passphrase.** Blackbook encrypts your saved credentials on *your* disk, so it asks for a passphrase to seal them. So you're not prompted on every command, `bbk unlock` caches the derived key for a while (default 15 minutes); `bbk lock` clears it. For scripts, set `$BLACKBOOK_PASSPHRASE`.
 
+<!-- --8<-- [end:quick-start] -->
+
 ---
 
 ## Core concepts, in plain language
+
+<!-- --8<-- [start:concepts] -->
 
 Four ideas cover almost everything you'll do.
 
@@ -211,9 +225,13 @@ flowchart LR
     eng -->|"permission: read + update prod-*"| items
 ```
 
+<!-- --8<-- [end:concepts] -->
+
 ---
 
 ## Turning up the protection
+
+<!-- --8<-- [start:protection] -->
 
 Everything above is already secure. When a particular secret deserves *more*, add a flag when you store it — the server enforces the rest. These compose freely (you can stack several on one secret), and they apply equally to secrets and files.
 
@@ -251,7 +269,7 @@ bbk -P carol approve <REQUEST_ID>
 bbk -P alice get prod-rootkey --request-id <REQUEST_ID>   # now it's released
 ```
 
-Approvers can also **pre-authorize** a reader for a whole category of secrets ahead of time (with an expiry and optional use cap), so routine reads don't need live approval — see [`grants add`](#every-command-at-a-glance).
+Approvers can also **pre-authorize** a reader for a whole category of secrets ahead of time (with an expiry and optional use cap), so routine reads don't need live approval — see [`grants add`](https://brian-summers.github.io/blackbook/reference/commands/).
 
 **Encrypt it so even the server can't read it.** With `--external`, the value is encrypted *on your machine* before it's sent. The server stores only an opaque blob it has no way to open — yet you still can't read it without going through all the normal permission checks *and* holding the key. Two independent locks, neither enough alone:
 
@@ -260,11 +278,15 @@ bbk put my-secret "value" --external      # server stores ciphertext it can't de
 bbk get my-secret                          # decrypted locally, on your machine
 ```
 
-There's a lot of flexibility here (managed keys vs. your own passphrase; keeping file ciphertext on the server or resident on your own disk). If you just want "the server can never read this," `--external` is the one to remember. The full model is in [Client-side encryption](#client-side-external-encryption-advanced).
+There's a lot of flexibility here (managed keys vs. your own passphrase; keeping file ciphertext on the server or resident on your own disk). If you just want "the server can never read this," `--external` is the one to remember. The full model is in [Client-side encryption](https://brian-summers.github.io/blackbook/security/architecture/#client-side-external-encryption-advanced).
+
+<!-- --8<-- [end:protection] -->
 
 ---
 
 ## The web console
+
+<!-- --8<-- [start:web-console] -->
 
 Prefer buttons to typing? `bbk web` serves a small local page that **is** the CLI — it runs your `bbk` commands for you, so every command and flag stays in sync automatically. Dark by default, with colorized output, a command history, and `Tab` completion.
 
@@ -273,6 +295,8 @@ bbk web                      # → http://127.0.0.1:8088
 ```
 
 It runs as *you*, at the same trust level as your terminal, and never invokes a shell (so there's no command-injection surface). Passphrases typed into the page stay in that browser tab and are passed to commands as environment variables, never on the command line. Bind it to loopback (the default) unless you deliberately intend to expose it.
+
+<!-- --8<-- [end:web-console] -->
 
 ---
 
@@ -296,6 +320,8 @@ Full tool list, security model, and Claude Desktop setup: **[MCP.md](MCP.md)**.
 
 ## Secure tunnels
 
+<!-- --8<-- [start:tunnels] -->
+
 Blackbook can also act as a **trusted introducer** between two of its clients, opening an end-to-end-encrypted tunnel that the server relays but *cannot read*. It's like `ssh -L` port forwarding, but the two ends authenticate each other using the certificates Blackbook already issued them, and the server only ever sees encrypted frames.
 
 ```powershell
@@ -308,9 +334,13 @@ bbk -P alice tunnel forward bob --listen 127.0.0.1:5432 --to 10.0.0.5:5432
 
 Anything hitting `127.0.0.1:5432` on alice's machine is encrypted end-to-end to bob, who connects onward to `10.0.0.5:5432`. Carries TCP or UDP, no VPN software or admin rights required.
 
+<!-- --8<-- [end:tunnels] -->
+
 ---
 
 ## Shell completion
+
+<!-- --8<-- [start:shell-completion] -->
 
 Tab-complete commands, flags, and even your local values (profiles, domains, resident files). It's all computed locally — no network call, nothing sent to the server.
 
@@ -326,9 +356,13 @@ source <(bbk completions zsh)      # zsh
 bbk completions fish | source      # fish
 ```
 
+<!-- --8<-- [end:shell-completion] -->
+
 ---
 
 ## Every command, at a glance
+
+<!-- --8<-- [start:commands] -->
 
 Three flags are **global** — valid on any subcommand, before or after it:
 
@@ -373,9 +407,13 @@ Three flags are **global** — valid on any subcommand, before or after it:
 
 Store-time protection flags (for `put` and `file put`): `-o/--overwrite`, `-i/--no-overwrite`, `-M/--mfa-required`, `-d/--delete-on-read`, `--max-reads N`, `-r/--rotate-on-read`, `-p/--preserve-on-cleanup`, `-q/--quorum K -s/--signatories a,b,c`, and the client-side options `-e/--external-key`, `--external-passphrase P`, `-E/--external-data` (files), `--external`.
 
+<!-- --8<-- [end:commands] -->
+
 ---
 
 ## For the security-curious: under the hood
+
+<!-- --8<-- [start:architecture] -->
 
 Everything below is *optional reading*. Blackbook is safe without you understanding any of it — but it's open source precisely so you can verify the claims. This is a faithful summary of what the code actually does.
 
@@ -390,7 +428,7 @@ Everything below is *optional reading*. Blackbook is safe without you understand
 
 ### The key hierarchy
 
-One `PrimaryKey` (pure CSPRNG secret material) is the root. From it, six named `SecondaryKey`s are derived, each bound to a distinct, immutable domain string (`secret/layer1/v1`, `secret/layer2/v1`, `file/dek-kek/v1`, `index/v1`, `hmac/v1`, `mfa/secret-kek/v1`), so two call sites can never accidentally share a key. Wrapping uses 30 iterations of RFC 3394 AES-256 key wrap, each iteration re-deriving its KEK. The whole bundle is self-encrypted and carries an Ed25519 identity key. See [`src/blackbook_core.rs`](src/blackbook_core.rs).
+One `PrimaryKey` (pure CSPRNG secret material) is the root. From it, six named `SecondaryKey`s are derived, each bound to a distinct, immutable domain string (`secret/layer1/v1`, `secret/layer2/v1`, `file/dek-kek/v1`, `index/v1`, `hmac/v1`, `mfa/secret-kek/v1`), so two call sites can never accidentally share a key. Wrapping uses 30 iterations of RFC 3394 AES-256 key wrap, each iteration re-deriving its KEK. The whole bundle is self-encrypted and carries an Ed25519 identity key. See [`src/blackbook_core.rs`](https://github.com/brian-summers/blackbook/blob/main/src/blackbook_core.rs).
 
 ### Client-side ("external") encryption (advanced)
 
@@ -405,7 +443,7 @@ Normally the server encrypts your data (and can therefore serve it back). With *
 
 The server authenticates each connection's client certificate (Common Name + fingerprint) and bearer token, resolves the target domain and checks membership, evaluates permission rules (admin? domain-admin? a direct or group rule that's in-window and under its use cap?), enforces per-resource policy flags and K-of-N approvals, and audits every operation, denial, approval, and admin action. It stores encrypted rows in PostgreSQL and encrypted file blobs on the data volume.
 
-<details>
+<details markdown>
 <summary>Full data model (click to expand)</summary>
 
 | Table | Holds |
@@ -426,11 +464,15 @@ Permission action bits: `create=1, read=2, update=4, delete=8`.
 
 </details>
 
-For the full cryptographic details, the persistence design, and the exact envelope formats, read the source — it's heavily commented. Deployment and operations (backups, hardening, scaling, Postgres TLS) live in [DEPLOYMENT.md](DEPLOYMENT.md).
+For the full cryptographic details, the persistence design, and the exact envelope formats, read the source — it's heavily commented. Deployment and operations (backups, hardening, scaling, Postgres TLS) live in the [deployment guide](https://brian-summers.github.io/blackbook/deployment/).
+
+<!-- --8<-- [end:architecture] -->
 
 ---
 
 ## Configuration
+
+<!-- --8<-- [start:configuration] -->
 
 | Env var | Required | Purpose |
 |---|---|---|
@@ -444,18 +486,26 @@ For the full cryptographic details, the persistence design, and the exact envelo
 
 > **The master data key is never stored raw.** The server requires exactly one provider (keyfile *or* passphrase) and **refuses to start** without one. Losing the provider, or the data volume, makes the data unrecoverable — back the provider up **separately** from the volume.
 
-Database hardening (mutual TLS to PostgreSQL, a least-privilege application role, loaded config) is set up by the scripts in `scripts/` and documented in [DEPLOYMENT.md](DEPLOYMENT.md). Copy `.env.example` to `.env` and change every password before first boot.
+Database hardening (mutual TLS to PostgreSQL, a least-privilege application role, loaded config) is set up by the scripts in `scripts/` and documented in the [deployment guide](https://brian-summers.github.io/blackbook/deployment/). Copy `.env.example` to `.env` and change every password before first boot.
+
+<!-- --8<-- [end:configuration] -->
 
 ---
 
 ## Known limitations / future work
 
+<!-- --8<-- [start:limitations] -->
+
 - **True client-side Shamir shares.** Today's K-of-N approval is server-mediated: the server enforces the policy while the data key stays whole. Splitting the key into per-signatory client-encrypted shares — so the *server itself* can't reconstruct it — is the next defense-in-depth step, and the one remaining item from the original roadmap.
 - **Audit verification cost is linear** in the number of *live* rows. Archival bounds that set, but a single `audit --verify` still recomputes the whole live chain; there is no incremental/checkpointed verifier yet.
+
+<!-- --8<-- [end:limitations] -->
 
 ---
 
 ## Project layout
+
+<!-- --8<-- [start:layout] -->
 
 ```
 src/
@@ -473,6 +523,8 @@ src/
 ├── webui.rs (+webui/) ─ local browser console that re-invokes the CLI
 └── tunnel_*.rs        ─ end-to-end-encrypted client-to-client tunnels
 ```
+
+<!-- --8<-- [end:layout] -->
 
 ---
 

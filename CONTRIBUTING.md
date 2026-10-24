@@ -9,9 +9,9 @@ are welcome, and held to a correspondingly high bar.
   `user*.json`), the `secrets/` directory, and `.env` are gitignored — keep it
   that way. Double-check `git status` before pushing.
 - **Do not report security vulnerabilities in public issues or PRs.** See
-  [SECURITY.md](SECURITY.md).
+  the [security policy](https://brian-summers.github.io/blackbook/security/policy/).
 - By contributing you agree your work is licensed under the project's
-  [AGPL-3.0-only](LICENSE) license.
+  [AGPL-3.0-only](https://github.com/brian-summers/blackbook/blob/main/LICENSE) license.
 
 ## Development setup
 

@@ -1,6 +1,7 @@
 # Blackbook Docker Deployment Guide
 
 ## Table of Contents
+
 1. [Overview](#overview)
 2. [Architecture](#architecture)
 3. [Quick Start](#quick-start)
@@ -26,6 +27,7 @@ The Blackbook Docker setup provides a secure, production-ready deployment of the
 - **Data Persistence**: Docker volumes for database durability
 
 **Key Files**:
+
 - `Dockerfile` - Multi-stage build (build + runtime)
 - `docker-compose.yml` - Service orchestration and networking
 - `config/postgres.conf` - PostgreSQL config (SSL, SCRAM, logging), loaded via `-c config_file`
@@ -127,6 +129,7 @@ nano .env
 ```
 
 **Important changes**:
+
 - `DB_ADMIN_PASSWORD` - Change to strong password
 - `DB_PASSWORD` - Change to strong password
 - `BACKUP_PASSWORD` - Change to strong password
@@ -187,6 +190,7 @@ curl --cacert ca.crt https://localhost:8443/health
 **File**: `config/blackbook.env`
 
 Expected variables:
+
 - `DB_ADMIN_PASSWORD` - PostgreSQL admin password
 - `DB_PASSWORD` - Application database password
 - `BACKUP_PASSWORD` - Backup user password
@@ -198,12 +202,14 @@ Expected variables:
 **File**: `config/postgres.conf`
 
 Key settings:
+
 - **Security**: SCRAM-SHA-256 password hashing, connection logging
 - **Logging**: All statements logged for audit trail
 - **Performance**: Tuned for 1GB shared buffers
 - **WAL**: Write-Ahead Logging enabled for recovery
 
 To customize:
+
 1. Edit `config/postgres.conf`
 2. Restart PostgreSQL: `docker-compose restart postgres`
 
@@ -248,6 +254,7 @@ If you place an nginx or other TLS-terminating proxy in front of Blackbook you c
 ```
 
 Creates:
+
 - `.certs/server.crt` — Certificate (public key)
 - `.certs/server.key` — Private key (keep secure, mode 0600)
 
@@ -260,6 +267,7 @@ For production reverse-proxy certs obtain them from a trusted CA (DigiCert, Let'
 ### Network Security
 
 **Current Setup**:
+
 - ✅ PostgreSQL not exposed to host (no port mapping)
 - ✅ PostgreSQL only accessible from Blackbook container
 - ✅ Blackbook accessible on localhost:8443 only (127.0.0.1)
@@ -281,12 +289,14 @@ ssh -L 8443:localhost:8443 user@host
 ### User Privilege Separation
 
 **PostgreSQL**:
+
 - Runs as `postgres` user (UID 999)
 - Cannot execute system commands
 - Limited to database operations only
 - Cannot modify Docker configuration
 
 **Blackbook**:
+
 - Runs as `blackbook` user (UID 1000)
 - Cannot read private keys (owned by system)
 - Cannot modify database schema
@@ -310,6 +320,7 @@ openssl rand -base64 32
 ```
 
 **Update Passwords**:
+
 1. Generate new password
 2. Update `.env` file
 3. Restart containers: `docker-compose restart`
@@ -326,6 +337,7 @@ cap_add:
 ```
 
 This prevents:
+
 - ✅ Container breakout
 - ✅ System command execution
 - ✅ Network sniffing
@@ -342,6 +354,7 @@ tmpfs:
 ```
 
 This prevents:
+
 - ✅ Malicious file creation
 - ✅ Configuration changes
 - ✅ Persistence of attacks
@@ -359,6 +372,7 @@ docker-compose logs blackbook
 ```
 
 Log storage:
+
 - PostgreSQL: `/var/log/postgresql/` in container (ephemeral)
 - Blackbook: stdout (Docker logs)
 
@@ -686,6 +700,7 @@ find "$BACKUP_DIR" -name "blackbook_*.sql.gz" -mtime +30 -delete
 ### Scaling for Production
 
 **Docker Compose** (Single host):
+
 - Suitable for: Dev, test, small production
 - Limitations: Single point of failure
 
@@ -725,6 +740,7 @@ scrape_configs:
 ```
 
 **Alert Rules**:
+
 - Service down (health check failed)
 - Database full (>90% disk)
 - High error rate (>1%)
@@ -773,6 +789,7 @@ docker network inspect <network>         # Network details
 ### File Locations
 
 Inside containers:
+
 - App binary: `/opt/blackbook/bin/bbk`
 - Config: `/opt/blackbook/config/`
 - Certificates: `/opt/blackbook/certs/`
@@ -780,6 +797,7 @@ Inside containers:
 - Database logs: `/var/log/postgresql/`
 
 On host:
+
 - Docker config: `./docker-compose.yml`
 - Application code: `./src/`
 - Configuration: `./config/`

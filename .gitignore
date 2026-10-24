@@ -30,3 +30,6 @@ user*.json
 # MemPalace per-project files
 mempalace.yaml
 entities.json
+
+# Built docs site (zensical build) — published by .github/workflows/docs.yml.
+/site/
