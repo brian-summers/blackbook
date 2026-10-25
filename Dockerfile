@@ -53,6 +53,14 @@ RUN mkdir -p /opt/blackbook/bin \
     && chmod 700 /opt/blackbook \
     && chmod 700 /opt/blackbook/data
 
+# The image doubles as the CLI (scripts/bbk runs it), which keeps its encrypted
+# profiles in ~/.bbk. Give the user a home holding only that directory: an
+# empty named volume mounted over it (`-v bbk-home:/home/blackbook/.bbk`)
+# inherits its owner and 0700 mode, so the unprivileged user can write to it.
+RUN mkdir -p /home/blackbook/.bbk \
+    && chown -R blackbook:blackbook /home/blackbook \
+    && chmod 700 /home/blackbook/.bbk
+
 # Copy compiled binary from builder (installed as /opt/blackbook/bin/bbk)
 COPY --from=builder --chown=blackbook:blackbook /build/target/release/bbk /opt/blackbook/bin/bbk
 

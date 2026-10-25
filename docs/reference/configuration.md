@@ -1,5 +1,5 @@
 ---
-description: "Blackbook server environment variables: database URL, data directory, master key providers, and rate limiting."
+description: "Blackbook environment variables: the server's database URL, data directory, master key providers, and rate limiting, plus the CLI's passphrase, profile, and loopback settings."
 ---
 
 # Configuration

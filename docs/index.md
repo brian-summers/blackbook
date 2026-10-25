@@ -22,13 +22,13 @@ A self-hosted, open-source **secrets manager** written in Rust. An end-to-end-en
 </div>
 
 ```bash
-cargo install blackbook                # installs the bbk CLI
+docker compose up -d                   # start the server
 bbk put api-key "sk_live_abc123"       # save a secret
 bbk get api-key                        # read it back
 bbk file put ./id_rsa --name ssh-key   # save a file
 ```
 
-No Rust toolchain? The Docker image is the CLI too: [run `bbk` from Docker](getting-started/docker-cli.md).
+All you need is Docker: `bbk` runs from the same image, with nothing to compile ([Quick start](getting-started/quick-start.md)). Prefer a native binary? `cargo install blackbook`.
 
 ## Secure by default, not by configuration
 

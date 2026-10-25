@@ -738,9 +738,10 @@ impl BlackbookClient {
         }
 
         let http = builder.build()?;
+        let alias = std::env::var(LOOPBACK_SERVER_ENV).ok();
         Ok(Self {
             http,
-            server: session.server.trim_end_matches('/').to_string(),
+            server: redirect_loopback(&session.server, alias.as_deref()),
             token: session.token.clone(),
             domain: "default".to_string(),
             mfa: None,
@@ -1257,6 +1258,51 @@ pub struct KeySummary {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeyList { pub keys: Vec<KeySummary>, pub count: usize }
 
+/// Names the server to reach in place of a loopback address; see
+/// [`redirect_loopback`]. `scripts/bbk` sets it when it runs the CLI in a
+/// container next to a local server.
+const LOOPBACK_SERVER_ENV: &str = "BLACKBOOK_LOOPBACK_SERVER";
+
+/// If `server` points at a loopback address (`127.0.0.0/8`, `::1`, or
+/// `localhost`) and `alias` names a `host[:port]` (or a full URL), return the
+/// URL with that host, and that port if one is given, in its place.
+///
+/// Bundles name `https://127.0.0.1:8443` by default, which is right on the
+/// server's host but means the container itself when the CLI runs in Docker.
+/// Swapping the address is safe: the server is still authenticated against the
+/// profile's pinned CA, so its certificate must name the new host.
+fn redirect_loopback(server: &str, alias: Option<&str>) -> String {
+    let server = server.trim_end_matches('/');
+    let Some(alias) = alias.map(str::trim).filter(|a| !a.is_empty()) else {
+        return server.to_string();
+    };
+    let Ok(mut url) = reqwest::Url::parse(server) else { return server.to_string() };
+    let loopback = match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host.trim_start_matches('[').trim_end_matches(']')
+            .parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    };
+    if !loopback {
+        return server.to_string();
+    }
+    let alias_url = if alias.contains("://") { alias.to_string() } else { format!("https://{alias}") };
+    let target = match reqwest::Url::parse(&alias_url) {
+        Ok(t) if t.host_str().is_some() => t,
+        _ => {
+            log::warn!("ignoring ${LOOPBACK_SERVER_ENV}={alias:?}: expected host[:port]");
+            return server.to_string();
+        }
+    };
+    if url.set_host(target.host_str()).is_err() {
+        return server.to_string();
+    }
+    if let Some(port) = target.port() {
+        let _ = url.set_port(Some(port));
+    }
+    url.as_str().trim_end_matches('/').to_string()
+}
+
 /// Percent-encode a path segment (handles spaces, slashes-in-name, etc.).
 /// Pulled in-line to avoid yet another crate.
 fn urlencoding_simple(s: &str) -> String {
@@ -1270,4 +1316,32 @@ fn urlencoding_simple(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redirect_loopback;
+
+    #[test]
+    fn loopback_redirect() {
+        let alias = Some("blackbook-app:8443");
+        // Unset or empty alias: unchanged (minus a trailing slash).
+        assert_eq!(redirect_loopback("https://127.0.0.1:8443/", None), "https://127.0.0.1:8443");
+        assert_eq!(redirect_loopback("https://127.0.0.1:8443", Some(" ")), "https://127.0.0.1:8443");
+        // Every loopback spelling is redirected.
+        for s in ["https://127.0.0.1:8443", "https://127.0.0.2:8443", "https://localhost:8443", "https://[::1]:8443"] {
+            assert_eq!(redirect_loopback(s, alias), "https://blackbook-app:8443", "{s}");
+        }
+        // Anything else is left alone.
+        for s in ["https://vault.example.com:8443", "https://10.0.0.5:8443", "https://blackbook-app:8443"] {
+            assert_eq!(redirect_loopback(s, alias), s);
+        }
+        // No port in the alias keeps the profile's; a path prefix survives;
+        // a full URL works as the alias too.
+        assert_eq!(redirect_loopback("https://localhost:9443", Some("bb")), "https://bb:9443");
+        assert_eq!(redirect_loopback("https://127.0.0.1:8443/bb", alias), "https://blackbook-app:8443/bb");
+        assert_eq!(redirect_loopback("https://127.0.0.1:8443", Some("https://bb:1234")), "https://bb:1234");
+        // A malformed alias is ignored rather than breaking the connection.
+        assert_eq!(redirect_loopback("https://127.0.0.1:8443", Some("bad host:x")), "https://127.0.0.1:8443");
+    }
 }

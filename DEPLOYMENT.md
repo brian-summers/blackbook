@@ -255,8 +255,10 @@ If you place an nginx or other TLS-terminating proxy in front of Blackbook you c
 
 Creates:
 
-- `.certs/server.crt` — Certificate (public key)
+- `.certs/server.crt` — Certificate (public key), valid for `blackbook.local`, `localhost`, and `127.0.0.1`
 - `.certs/server.key` — Private key (keep secure, mode 0600)
+
+Both scripts carry their own OpenSSL config, so they work with any OpenSSL build, including Windows builds (such as the one bundled with Strawberry Perl) whose default `openssl.cnf` is missing. To serve other names, edit `subjectAltName` in the script.
 
 For production reverse-proxy certs obtain them from a trusted CA (DigiCert, Let's Encrypt, your organisation's CA). The Blackbook server itself will continue to use its own internal CA regardless of what the proxy presents to external clients.
 

@@ -103,178 +103,152 @@ sequenceDiagram
 
 <!-- --8<-- [start:quick-start] -->
 
-You need **Docker** (with Compose) and, to build the CLI, **Rust** (`cargo`). On Windows, building the CLI also needs `perl` (for the bundled OpenSSL). No Rust toolchain? The Docker image is the CLI too, so you can skip step 6 and [run `bbk` from Docker](https://brian-summers.github.io/blackbook/getting-started/docker-cli/) instead.
+All you need is **Docker** with Compose. The server runs in a container, and the `bbk` CLI runs from the same image, so there's nothing to compile.
 
-```powershell
-# 1. One-time: create the master keyfile. This single 32-byte file is what
-#    ultimately protects everything. It is mounted as a Docker secret and kept
-#    OFF the data volume, so a copy of the volume alone can't decrypt anything.
-#    Back it up somewhere safe and separate — if you lose it, the data is gone.
-mkdir secrets; openssl rand 32 > secrets/master_keyfile
+**1. Get the code and create its secrets** (one time; on Windows, run this step in Git Bash or WSL):
 
-# 2. One-time: generate the TLS certificates for the server-to-database link.
+```bash
+git clone https://github.com/brian-summers/blackbook
+cd blackbook
+
+# The master keyfile: this one 32-byte file ultimately protects everything.
+# It's mounted as a Docker secret and kept OFF the data volume, so a copy of
+# the volume alone can't decrypt anything. Back it up somewhere safe and
+# separate. If you lose it, the data is gone.
+mkdir secrets
+openssl rand -out secrets/master_keyfile 32
+
+# TLS certificates for the server-to-database link.
 ./scripts/generate-postgres-certs.sh
 
-# 3. One-time: set your database passwords (change every value in the file).
-cp .env.example .env    # then edit .env
+# Database passwords: copy the template, then change every value in .env.
+cp .env.example .env
+```
 
-# 4. Start it up.
+**2. Start the server:**
+
+```bash
 docker compose up -d
+```
 
-# 5. Grab your admin login. On first start the server writes a complete
-#    "bundle" (server address + token + certificate + key + CA) to the volume.
-#    This file is the ONLY place the admin token ever appears — it is never logged.
+**3. Install the `bbk` command.** It's a small script that runs the CLI from the image you just built. It finds the local server on its own and keeps your saved logins in a Docker volume.
+
+```bash
+# Linux, macOS, WSL, Git Bash (make sure ~/.local/bin is on your PATH)
+mkdir -p ~/.local/bin && install -m 755 scripts/bbk ~/.local/bin/
+```
+
+```powershell
+# Windows PowerShell: any folder on your PATH works; this creates one
+New-Item -ItemType Directory -Force "$HOME\bin" | Out-Null
+Copy-Item scripts\bbk.ps1, scripts\bbk.cmd "$HOME\bin"
+[Environment]::SetEnvironmentVariable('Path', "$([Environment]::GetEnvironmentVariable('Path', 'User'));$HOME\bin", 'User')
+```
+
+Then open a new terminal. Prefer a native binary? `cargo install --path .` builds one instead (on Windows it also needs `perl`, for the bundled OpenSSL), and every step below is the same.
+
+**4. Log in.** On first start the server writes an admin "bundle" (server address, token, certificate, key, and CA) to its volume. It's the only place the admin token ever appears; it's never logged. Copy it out, log in, and delete the copy:
+
+```bash
 docker cp blackbook-app:/opt/blackbook/data/admin-bundle.json .
-
-# 6. Build and install the CLI on your machine (or run it from Docker; see
-#    "Run the CLI with Docker").
-cargo install --path .
-
-# 7. Log in from the bundle. You'll be asked for a passphrase — this encrypts
-#    the login that gets saved on your machine (nothing is stored in the clear).
 bbk login admin-bundle.json
+rm admin-bundle.json
 ```
 
 You're ready:
 
-```powershell
+```bash
 bbk put api-key sk_live_super_secret   # save a secret
 bbk get api-key                         # read it back
 bbk ls                                  # list what you have
 ```
 
-> **A note on the `login` passphrase.** Blackbook encrypts your saved credentials on *your* disk, so it asks for a passphrase to seal them. So you're not prompted on every command, `bbk unlock` caches the derived key for a while (default 15 minutes); `bbk lock` clears it. For scripts, set `$BLACKBOOK_PASSPHRASE`.
+> **A note on the `login` passphrase.** Blackbook encrypts your saved credentials on *your* disk, so `login` asks you to choose a passphrase to seal them. So you're not prompted on every command, `bbk unlock` caches the derived key for a while (default 15 minutes); `bbk lock` clears it. For scripts, set `$BLACKBOOK_PASSPHRASE`.
 
 <!-- --8<-- [end:quick-start] -->
 
 ---
 
-## Run the CLI with Docker (no Rust toolchain)
+## Run the CLI with Docker
 
 <!-- --8<-- [start:docker-cli] -->
 
-The server image also contains the complete `bbk` CLI. Run it with Docker and you can use any Blackbook server, with every client command (secrets, files, managed keys, the crypto toolkit, MCP, tunnels, and the web console), without installing Rust or compiling anything. The image is published on Docker Hub:
+The server image also contains the complete `bbk` CLI, and the `bbk` wrapper script in `scripts/` runs it as if it were installed. With the wrapper on your PATH, every `bbk` command in these docs works as written, including pipes, `bbk mcp`, and `bbk web`, with no Rust toolchain and nothing to compile.
+
+### Install the wrapper
+
+From a checkout, as in the [Quick start](https://brian-summers.github.io/blackbook/getting-started/quick-start/):
 
 ```bash
-docker pull briansummers/blackbook:latest    # or pin a release, e.g. :v0.1.0
+mkdir -p ~/.local/bin && install -m 755 scripts/bbk ~/.local/bin/   # Linux, macOS, WSL, Git Bash
 ```
-
-The image is built for `linux/amd64`. On Apple silicon, Docker Desktop runs it under emulation; add `--platform linux/amd64` to silence the warning.
-
-Already running the server with Compose? Then you have the same binary locally, under Compose's name for the image. `docker inspect -f '{{.Config.Image}}' blackbook-app` prints that name (usually `blackbook-blackbook`). Use it in place of `briansummers/blackbook:latest` below to keep the CLI on exactly the server's version.
-
-### What the container needs
-
-| Need | Flags | Why |
-|---|---|---|
-| A place to keep your profiles | `-v bbk-home:/opt/blackbook/config -e HOME=/opt/blackbook/config` | The image's `blackbook` user has no home directory, so `HOME` points at a named volume instead. Your `~/.bbk` folder (encrypted profiles and the `unlock` cache) lives there between runs. |
-| A route to the server | `--network blackbook_blackbook_network`, and the address `https://blackbook-app:8443` | Inside a container, `127.0.0.1` means the container itself. For a server on the same machine, join the Compose network; `docker network ls` shows its name, `<checkout folder>_blackbook_network`. The server certificate already covers `blackbook-app`. A server on another machine needs no network flag, but its hostname must be in that server's `BLACKBOOK_SERVER_SANS`. |
-| Your files | `-v "$PWD:/work" -w /work` | Mounts the current directory, so commands can read bundles and files and write their output. Use relative paths: host paths outside this directory don't exist inside the container. |
-| A terminal, for passphrase prompts | `-t` | Add it only when you're typing at the prompt. Leave it off when piping data in or out: a TTY rewrites line endings and refuses piped input. |
-
-### Make `bbk` a shell function
-
-Define this once, for example in your shell profile, and every `bbk` command in these docs works as written.
-
-bash or zsh (Linux, macOS):
-
-```bash
-bbk() {
-  local tty=; [ -t 0 ] && [ -t 1 ] && tty=-t
-  docker run --rm -i $tty \
-    --read-only --cap-drop ALL --security-opt no-new-privileges \
-    -v bbk-home:/opt/blackbook/config -e HOME=/opt/blackbook/config \
-    -v "$PWD:/work" -w /work \
-    -e BLACKBOOK_PASSPHRASE -e BLACKBOOK_PROFILE -e BLACKBOOK_DOMAIN \
-    --network blackbook_blackbook_network \
-    briansummers/blackbook:latest "$@"
-}
-```
-
-PowerShell (Windows; add it to `$PROFILE`):
 
 ```powershell
-function bbk {
-    $opts = @(
-        '--rm', '-i',
-        '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-        '-v', 'bbk-home:/opt/blackbook/config', '-e', 'HOME=/opt/blackbook/config',
-        '-v', "${PWD}:/work", '-w', '/work',
-        '-e', 'BLACKBOOK_PASSPHRASE', '-e', 'BLACKBOOK_PROFILE', '-e', 'BLACKBOOK_DOMAIN',
-        '--network', 'blackbook_blackbook_network'
-    )
-    $image = 'briansummers/blackbook:latest'
-    if ($MyInvocation.ExpectingInput) { $input | docker run @opts $image @args }
-    elseif ($MyInvocation.PipelinePosition -lt $MyInvocation.PipelineLength) { docker run @opts $image @args }
-    else { docker run @opts -t $image @args }
-}
+Copy-Item scripts\bbk.ps1, scripts\bbk.cmd "$HOME\bin"   # Windows: any folder on your PATH
 ```
 
-- **Server on another machine?** Delete the `--network` line.
-- **Passphrases stay off the command line.** `-e NAME` with no value forwards a variable only when it's set on your machine. Add `-e BLACKBOOK_CRYPTO_PASSPHRASE` and `-e BLACKBOOK_EXTERNAL_PASSPHRASE` if you script passphrase encryption or external secrets.
-- **Locked down.** The root filesystem is read-only and every Linux capability is dropped. The CLI needs nothing beyond the two mounts.
-- **On Windows, use the PowerShell function.** Git Bash rewrites `$PWD` into a path Docker can't mount.
-- **On Linux, mind file ownership.** The container runs as uid 1000, so commands that write files (`-o`, `file get`) need the current directory to be writable by that uid.
-
-### Log in and use it
+Without a checkout, for example on a laptop that only talks to a remote server, download it instead:
 
 ```bash
-# Server on this machine: copy the admin bundle out of the server's volume and
-# log in over the Compose network. The bundle's default address, 127.0.0.1,
-# would point at the CLI container itself.
-docker cp blackbook-app:/opt/blackbook/data/admin-bundle.json .
-bbk login admin-bundle.json -s https://blackbook-app:8443
-rm admin-bundle.json    # it holds the admin token; your profile is now sealed in bbk-home
-
-# A bundle from `bbk client create` already names the server the admin uses.
-# Add -s if you reach it by a different address.
-bbk login alice.json
-
-bbk unlock                                   # cache the unlock key in bbk-home for 15 minutes
-bbk put api-key sk_live_abc123
-bbk get api-key
-bbk file put ./service-account.json --name gcp-sa
-bbk crypto encrypt -k payroll report.pdf -o report.pdf.bbk
+curl -fsSL https://raw.githubusercontent.com/brian-summers/blackbook/main/scripts/bbk -o ~/.local/bin/bbk && chmod +x ~/.local/bin/bbk
 ```
 
-`bbk unlock` works across runs because its cache lives in the `bbk-home` volume, not in the container. In scripts and CI, set `BLACKBOOK_PASSPHRASE` instead; the function forwards it. Piping works as usual:
+```powershell
+foreach ($f in 'bbk.ps1', 'bbk.cmd') { Invoke-WebRequest "https://raw.githubusercontent.com/brian-summers/blackbook/main/scripts/$f" -OutFile "$HOME\bin\$f" }
+```
+
+With no local server, the first run pulls `briansummers/blackbook:latest` from Docker Hub. The image is built for `linux/amd64`; Docker Desktop on Apple silicon runs it under emulation.
+
+### What it does for you
+
+| | |
+|---|---|
+| **Your logins** | Profiles live in the `bbk-home` Docker volume (`~/.bbk` inside the container), encrypted under your passphrase as always. `bbk unlock` carries over from one command to the next. |
+| **Your files** | The current directory is mounted at `/work`, so relative paths work. Files outside it aren't visible to the container. |
+| **A server on this machine** | While the `blackbook-app` container runs, the CLI uses the same image (so CLI and server versions match), joins its network, and reaches it at the address bundles name by default, `https://127.0.0.1:8443`. |
+| **Remote servers** | Reached directly, the same as from a native install. |
+| **A terminal** | Attached only when you're at one, so pipes and MCP's stdin and stdout stay byte-exact. |
+| **Passphrases** | `BLACKBOOK_PASSPHRASE` and the other `BLACKBOOK_*` variables are forwarded when set, so passphrases never appear on a command line. |
+| **`bbk web`** | The console is published on `http://127.0.0.1:8088`, reachable from your machine only. |
+| **Hardening** | Read-only root filesystem, every Linux capability dropped, and `no-new-privileges`. |
+
+Optional settings:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `BBK_IMAGE` | the local server's image, else `briansummers/blackbook:latest` | Image to run. Pin a release with, e.g., `briansummers/blackbook:v0.1.0`. |
+| `BBK_VOLUME` | `bbk-home` | Volume that holds your profiles. |
+| `BBK_NETWORK` | the local server's network | Docker network to join. `none` cuts the container off entirely. |
+| `BBK_SERVER` | `blackbook-app` | Container name of the local server. |
+| `BBK_PUBLISH` | none | Extra ports to publish, space-separated, e.g. `127.0.0.1:5432:5432` for a tunnel. |
+
+### AI agents (MCP)
+
+An MCP client only needs the wrapper on PATH:
 
 ```bash
-printf '%s' "$payload" | bbk crypto hash
-bbk get registry-token | docker login -u ci --password-stdin registry.example.com
+bbk -P agent unlock --ttl-minutes 60
+claude mcp add blackbook -- bbk -P agent mcp                        # native Windows: -- cmd /c bbk -P agent mcp
+claude mcp add blackbook -e BBK_NETWORK=none -- bbk mcp --offline   # crypto tools only, no network at all
 ```
 
-In PowerShell, piping a string to a program appends a CRLF line ending. Use `--text` or a file when the exact bytes matter.
+### Good to know
 
-To keep a bundle off the host disk entirely, pipe it straight in. With stdin taken by the bundle there's no terminal for a prompt, so set `BLACKBOOK_PASSPHRASE` first:
+- **Tunnels** listen inside the container, so listen on all interfaces there and publish the port: `BBK_PUBLISH=127.0.0.1:5432:5432 bbk tunnel forward bob --listen 0.0.0.0:5432 --to 10.0.0.5:5432`. On the accepting side, the container dials the `--to` address.
+- **On Linux**, the container runs as uid 1000, so commands that write files (`-o`, `file get`) need the current directory to be writable by that uid.
+- **In PowerShell**, piping a string to a program appends a CRLF line ending, so use `--text` or a file when the exact bytes matter. If PowerShell refuses to run `bbk.ps1`, allow local scripts once with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+- **To keep a bundle off the disk**, pipe it in. There's no terminal for a prompt then, so set `BLACKBOOK_PASSPHRASE` first: `docker exec blackbook-app cat /opt/blackbook/data/admin-bundle.json | bbk login -`
+
+### Without the wrapper
+
+For CI, or anywhere you'd rather spell it out, it's one `docker run`:
 
 ```bash
-docker exec blackbook-app cat /opt/blackbook/data/admin-bundle.json | bbk login - -s https://blackbook-app:8443
+docker run --rm -i -v bbk-home:/home/blackbook/.bbk -v "$PWD:/work" -w /work \
+  -e BLACKBOOK_PASSPHRASE briansummers/blackbook:latest get api-key
 ```
 
-### AI agents, the web console, and tunnels
-
-To run the **MCP server** from Docker, register the container as the command. Use `-i` without `-t`, because stdin and stdout carry the protocol:
-
-```bash
-# Offline crypto tools, with no network interface at all
-claude mcp add blackbook -- docker run --rm -i --network none briansummers/blackbook:latest mcp --offline
-
-# Read-only as the `agent` profile. Log in and run `bbk -P agent unlock` first;
-# the unlock cache is shared through the bbk-home volume.
-claude mcp add blackbook -- docker run --rm -i -v bbk-home:/opt/blackbook/config -e HOME=/opt/blackbook/config --network blackbook_blackbook_network briansummers/blackbook:latest -P agent mcp
-```
-
-The **web console** has to listen on all interfaces inside the container. Publishing its port on `127.0.0.1` keeps it reachable from your machine only:
-
-```bash
-docker run --rm -it -p 127.0.0.1:8088:8088 \
-  -v bbk-home:/opt/blackbook/config -e HOME=/opt/blackbook/config \
-  --network blackbook_blackbook_network \
-  briansummers/blackbook:latest web -b 0.0.0.0:8088
-```
-
-**Tunnels** follow the same pattern. On the forwarding side, pass `--listen 0.0.0.0:PORT` and publish it with `-p 127.0.0.1:PORT:PORT`. On the accepting side, the container dials the `--to` address, so name the target the way the container sees it.
+Add `-t` for passphrase prompts. To reach a server on the same machine, also join its network (`docker network ls` shows the name) and point loopback addresses at it: `--network blackbook_blackbook_network -e BLACKBOOK_LOOPBACK_SERVER=blackbook-app:8443`.
 
 <!-- --8<-- [end:docker-cli] -->
 
@@ -702,6 +676,15 @@ For the full cryptographic details, the persistence design, and the exact envelo
 > **The master data key is never stored raw.** The server requires exactly one provider (keyfile *or* passphrase) and **refuses to start** without one. Losing the provider, or the data volume, makes the data unrecoverable — back the provider up **separately** from the volume.
 
 Database hardening (mutual TLS to PostgreSQL, a least-privilege application role, loaded config) is set up by the scripts in `scripts/` and documented in the [deployment guide](https://brian-summers.github.io/blackbook/deployment/). Copy `.env.example` to `.env` and change every password before first boot.
+
+The CLI reads a few variables of its own:
+
+| Env var | Purpose |
+|---|---|
+| `BLACKBOOK_PASSPHRASE` | The profile passphrase, for scripts, instead of a prompt or `bbk unlock`. |
+| `BLACKBOOK_PROFILE` / `BLACKBOOK_DOMAIN` | Default profile / domain; the same as `-P` / `-D`. |
+| `BLACKBOOK_NO_PROMPT` | Fail instead of prompting for a passphrase. |
+| `BLACKBOOK_LOOPBACK_SERVER` | A `host[:port]` to connect to whenever a profile's server is a loopback address (`127.0.0.1`, `::1`, `localhost`). It's for running the CLI in a container next to a local server, where loopback means the container itself; `scripts/bbk` sets it for you. The server is still verified against the profile's pinned CA, so its certificate must cover that host. |
 
 <!-- --8<-- [end:configuration] -->
 

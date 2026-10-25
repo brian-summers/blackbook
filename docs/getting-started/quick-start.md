@@ -1,5 +1,5 @@
 ---
-description: "Install and run the Blackbook secrets manager with Docker Compose, then store and read your first secret with the bbk CLI."
+description: "Run the Blackbook secrets manager with Docker Compose and use the bbk CLI straight from the same image, with nothing to compile: store and read your first secret in minutes."
 ---
 
 # Quick start

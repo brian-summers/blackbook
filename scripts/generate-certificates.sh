@@ -48,33 +48,52 @@ echo "  Validity Period: $DAYS_VALID days"
 echo "  Key Size: $KEY_SIZE bits"
 echo ""
 
+# Subject and extensions, passed with -config rather than relying on the
+# build's default openssl.cnf (some builds don't ship one) or on -subj (Git
+# Bash rewrites "/C=US/..." as a file path). Modern TLS clients ignore the CN
+# and match only the subjectAltName, so the names to serve go there.
+# Keep in sync with generate-certificates.ps1.
+CONFIG="$(mktemp)"
+trap 'rm -f "$CONFIG"' EXIT
+cat > "$CONFIG" <<'EOF'
+[req]
+prompt             = no
+distinguished_name = dn
+x509_extensions    = v3
+
+[dn]
+C            = US
+ST           = State
+L            = City
+O            = Organization
+CN           = blackbook.local
+emailAddress = admin@blackbook.local
+
+[v3]
+basicConstraints     = critical, CA:FALSE
+keyUsage             = critical, digitalSignature, keyEncipherment
+extendedKeyUsage     = serverAuth
+subjectAltName       = DNS:blackbook.local, DNS:localhost, IP:127.0.0.1
+subjectKeyIdentifier = hash
+EOF
+
+# A previous run left these read-only (0400/0444), which openssl can't overwrite.
+rm -f "$CERT_DIR/$CERT_NAME.key" "$CERT_DIR/$CERT_NAME.crt"
+
 # Generate private key
 echo -e "${YELLOW}→${NC} Generating private key..."
-openssl genrsa -out "$CERT_DIR/$CERT_NAME.key" "$KEY_SIZE" 2>/dev/null
+openssl genrsa -out "$CERT_DIR/$CERT_NAME.key" "$KEY_SIZE"
 echo -e "${GREEN}✓${NC} Private key generated"
 
-# Generate certificate signing request
-echo -e "${YELLOW}→${NC} Generating certificate signing request..."
-openssl req -new \
-    -key "$CERT_DIR/$CERT_NAME.key" \
-    -out "$CERT_DIR/$CERT_NAME.csr" \
-    -subj "/C=US/ST=State/L=City/O=Organization/CN=blackbook.local/emailAddress=admin@blackbook.local" \
-    2>/dev/null
-echo -e "${GREEN}✓${NC} Certificate signing request generated"
-
-# Generate self-signed certificate
+# Generate self-signed certificate (no CSR needed when self-signing)
 echo -e "${YELLOW}→${NC} Generating self-signed certificate..."
-openssl x509 -req \
-    -days "$DAYS_VALID" \
-    -in "$CERT_DIR/$CERT_NAME.csr" \
-    -signkey "$CERT_DIR/$CERT_NAME.key" \
+openssl req -new -x509 \
+    -key "$CERT_DIR/$CERT_NAME.key" \
     -out "$CERT_DIR/$CERT_NAME.crt" \
+    -days "$DAYS_VALID" \
     -sha256 \
-    2>/dev/null
+    -config "$CONFIG"
 echo -e "${GREEN}✓${NC} Self-signed certificate generated"
-
-# Clean up CSR
-rm -f "$CERT_DIR/$CERT_NAME.csr"
 
 # Set secure permissions
 chmod 400 "$CERT_DIR/$CERT_NAME.key"
@@ -88,6 +107,7 @@ openssl x509 -text -noout -in "$CERT_DIR/$CERT_NAME.crt" | grep -A 2 "Subject:"
 openssl x509 -text -noout -in "$CERT_DIR/$CERT_NAME.crt" | grep -A 2 "Issuer:"
 openssl x509 -text -noout -in "$CERT_DIR/$CERT_NAME.crt" | grep -A 2 "Public-Key:"
 openssl x509 -text -noout -in "$CERT_DIR/$CERT_NAME.crt" | grep -A 2 "Not Before\|Not After"
+openssl x509 -text -noout -in "$CERT_DIR/$CERT_NAME.crt" | grep -A 1 "Subject Alternative Name"
 
 echo ""
 echo -e "${GREEN}=== Certificate Generation Complete ===${NC}"

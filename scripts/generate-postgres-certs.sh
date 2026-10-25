@@ -19,6 +19,13 @@
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
+# Git Bash on Windows rewrites arguments that look like POSIX paths, which
+# turns `-subj "/CN=..."` into "C:/Program Files/Git/CN=...". Every path below
+# is relative, so switch that off (no effect anywhere else).
+export MSYS_NO_PATHCONV=1
+# openssl's chatter is silenced below, so name the step that failed.
+trap 'echo "error: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
+
 OUT="$(cd "$(dirname "$0")/.." && pwd)/secrets/postgres"
 mkdir -p "$OUT"
 cd "$OUT"

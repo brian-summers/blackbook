@@ -8,8 +8,12 @@
 Dockerfile text eol=lf
 *.conf  text eol=lf
 
-# PowerShell scripts are used on Windows — keep CRLF.
+# The extensionless Docker wrapper is a bash script.
+scripts/bbk text eol=lf
+
+# PowerShell and batch scripts are used on Windows — keep CRLF.
 *.ps1   text eol=crlf
+*.cmd   text eol=crlf
 
 # Binary / non-diffable assets.
 *.png   binary

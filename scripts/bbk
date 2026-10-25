@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# bbk — run the Blackbook CLI from its Docker image, as if it were installed.
+#
+#   mkdir -p ~/.local/bin && install -m 755 scripts/bbk ~/.local/bin/
+#
+# Every argument goes to the real `bbk` in the container. Around it, this adds:
+#   - your profiles, kept in the `bbk-home` volume (~/.bbk in the container);
+#   - the current directory, mounted at /work, so relative paths just work;
+#   - a terminal only when you're at one, so pipes and MCP stay byte-exact;
+#   - the local server: while the `blackbook-app` container runs, the CLI uses
+#     its image and network, and reaches it at the address bundles name by
+#     default (https://127.0.0.1:8443), so `login` needs no `-s`;
+#   - for `bbk web`, the console published on http://127.0.0.1:8088.
+#
+# Optional settings:
+#   BBK_IMAGE    image to run (default: the local server's, else
+#                briansummers/blackbook:latest)
+#   BBK_VOLUME   volume holding your profiles (default: bbk-home)
+#   BBK_NETWORK  Docker network to join (default: the local server's, if any;
+#                `none` for no network at all)
+#   BBK_SERVER   the local server's container name (default: blackbook-app)
+#   BBK_PUBLISH  extra ports to publish, space-separated (127.0.0.1:5432:5432)
+#
+# https://brian-summers.github.io/blackbook/getting-started/docker-cli/
+set -euo pipefail
+
+# GUI apps (an MCP client, say) may start this with a bare PATH.
+PATH="$PATH:/usr/local/bin:/opt/homebrew/bin:/Applications/Docker.app/Contents/Resources/bin"
+
+server=${BBK_SERVER:-blackbook-app}
+image=${BBK_IMAGE:-}
+network=${BBK_NETWORK:-}
+workdir=$PWD
+# Git Bash: hand Docker a Windows path and stop MSYS rewriting /work et al.
+if [ -n "${MSYSTEM:-}" ]; then workdir=$(pwd -W); export MSYS_NO_PATHCONV=1; fi
+
+opts=(--rm -i --read-only --cap-drop ALL --security-opt no-new-privileges
+      -v "${BBK_VOLUME:-bbk-home}:/home/blackbook/.bbk"
+      -v "$workdir:/work" -w /work)
+
+# `-e NAME` forwards a variable only if it's set here, so values (passphrases
+# especially) never appear on a command line.
+for v in BLACKBOOK_PASSPHRASE BLACKBOOK_PROFILE BLACKBOOK_DOMAIN BLACKBOOK_NO_PROMPT \
+         BLACKBOOK_CRYPTO_PASSPHRASE BLACKBOOK_EXTERNAL_PASSPHRASE \
+         BLACKBOOK_OLD_PASSPHRASE BLACKBOOK_NEW_PASSPHRASE RUST_LOG; do
+  opts+=(-e "$v")
+done
+
+# A server running on this machine: join its network and send loopback
+# profile addresses to it by name (inside a container, 127.0.0.1 is the
+# container itself). The server's certificate already covers that name.
+fmt='{{if .State.Running}}{{.Config.Image}} {{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}{{end}}'
+if found=$(docker container inspect -f "$fmt" "$server" 2>/dev/null) && [ -n "$found" ]; then
+  read -r server_image server_network _ <<<"$found"
+  image=${image:-$server_image}
+  network=${network:-$server_network}
+  opts+=(-e "BLACKBOOK_LOOPBACK_SERVER=$server:8443")
+fi
+[ -n "$network" ] && opts+=(--network "$network")
+[ -t 0 ] && [ -t 1 ] && opts+=(-t)
+for p in ${BBK_PUBLISH:-}; do opts+=(-p "$p"); done
+
+# `bbk web` has to listen on all interfaces inside the container to be
+# reachable through a published port; publishing on 127.0.0.1 keeps it local.
+# Find the subcommand by skipping global options and their values.
+args=("$@") sub= i=0
+while [ "$i" -lt "$#" ]; do
+  case ${args[$i]} in
+    -P|--profile|-D|--domain|-m|--mfa|-d|--database-url|-L|--log-level) i=$((i + 2)) ;;
+    -*) i=$((i + 1)) ;;
+    *) sub=${args[$i]}; break ;;
+  esac
+done
+if [ "$sub" = web ] && [[ " $* " != *" -b"* && " $* " != *" --bind"* ]]; then
+  opts+=(-p 127.0.0.1:8088:8088)
+  set -- "$@" --bind 0.0.0.0:8088
+  echo "bbk: web console → http://127.0.0.1:8088" >&2
+fi
+
+exec docker run "${opts[@]}" "${image:-briansummers/blackbook:latest}" "$@"
