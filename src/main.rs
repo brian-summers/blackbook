@@ -9,6 +9,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub mod blackbook_core;
+mod crypto_ops;
+mod crypto_cli;
+mod keys_api;
 mod audit_archive;
 mod net_ratelimit;
 mod presentation;
@@ -279,6 +282,20 @@ enum Commands {
     /// Manage encrypted files.
     #[command(subcommand)]
     File(FileCmd),
+
+    /// Managed keys: named, versioned AES-256-GCM / Ed25519 / HMAC keys held
+    /// by the server. Their secret material never leaves it — use them with
+    /// `bbk crypto … -k NAME`. Gated by domain ACLs (read = use), optional MFA,
+    /// and audited like every other resource.
+    #[command(subcommand)]
+    Key(crypto_cli::KeyCmd),
+
+    /// Cryptographic operations: encrypt / decrypt, sign / verify, hash and
+    /// HMAC, signed tokens (JWT), key generation, passwords, randomness. Use a
+    /// managed key (-k), this profile's client master key (--cmk), a local key
+    /// file (--key-file), or a passphrase (-p).
+    #[command(subcommand)]
+    Crypto(crypto_cli::CryptoCmd),
 
     /// Secure end-to-end tunnels between two clients (the server relays opaque
     /// frames but cannot read or modify them; peers are positively identified
@@ -905,6 +922,37 @@ impl Database {
             .execute(&self.pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_access_grants_signatory ON blackbook_access_grants(signatory_id) WHERE revoked_at IS NULL")
             .execute(&self.pool).await?;
+
+        // Managed keys: named, versioned keys whose material never leaves the
+        // server (see keys_api). Name is AEAD-encrypted + HMAC-indexed like
+        // every other identifier; `key_type` is a low-entropy enum. Each
+        // version's material is sealed under the managed-key KEK with
+        // (key id, version) as AAD; `public_key` is the Ed25519 public half
+        // (public by definition, so stored in the clear).
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS blackbook_keys (
+                id             TEXT PRIMARY KEY,
+                name_enc       BYTEA NOT NULL,
+                name_id        CHAR(64) NOT NULL,
+                domain_id      TEXT NOT NULL REFERENCES blackbook_domains(id),
+                key_type       VARCHAR(16) NOT NULL CHECK (key_type IN ('aes256-gcm','ed25519','hmac')),
+                latest_version INTEGER NOT NULL DEFAULT 1,
+                flags          JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (domain_id, name_id)
+            )"#,
+        ).execute(&self.pool).await?;
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS blackbook_key_versions (
+                key_id       TEXT NOT NULL REFERENCES blackbook_keys(id) ON DELETE CASCADE,
+                version      INTEGER NOT NULL,
+                material_enc BYTEA NOT NULL,
+                public_key   BYTEA,
+                created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (key_id, version)
+            )"#,
+        ).execute(&self.pool).await?;
 
         log::info!("Database schema initialized successfully");
         Ok(())
@@ -3317,6 +3365,12 @@ async fn main() -> Result<()> {
                     .map_err(|e| AppError::Config(format!("derive metadata-enc key: {e}")))?,
             );
 
+            // KEK for managed-key material at rest. Same root, distinct info tag.
+            let managed_key_kek = std::sync::Arc::new(
+                keys.file_dek_kek.handle_with_info(b"managed-keys/v1")
+                    .map_err(|e| AppError::Config(format!("derive managed-key kek: {e}")))?,
+            );
+
             // Auto-provision the `default` domain on first boot so secrets /
             // files / ACL rows (which have a NOT NULL FK to blackbook_domains)
             // can be created against the default `?domain=` query parameter.
@@ -3331,6 +3385,7 @@ async fn main() -> Result<()> {
                 audit_hmac_key,
                 name_index_key,
                 metadata_enc_key,
+                managed_key_kek,
                 tunnels: tunnel_relay::TunnelHub::new(),
             };
 
@@ -3366,6 +3421,8 @@ async fn main() -> Result<()> {
             cmd_rekey(name, old_external_passphrase, external_key, external_passphrase,
                       effective_domain.clone(), cli.mfa.clone()).await?,
         Commands::File(cmd) => cmd_file(cmd, effective_domain.clone(), cli.mfa.clone()).await?,
+        Commands::Key(cmd) => crypto_cli::cmd_key(cmd, effective_domain.clone(), cli.mfa.clone()).await?,
+        Commands::Crypto(cmd) => crypto_cli::cmd_crypto(cmd, effective_domain.clone(), cli.mfa.clone()).await?,
         Commands::Tunnel(cmd) => cmd_tunnel(cmd).await?,
         Commands::Client(cmd) => cmd_client(cmd).await?,
         Commands::Acl(cmd) => cmd_acl(cmd, effective_domain.clone()).await?,

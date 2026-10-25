@@ -590,6 +590,42 @@ pub fn aead_open_nonce(frame: &[u8], dek: &[u8], expected: &[u8; 12]) -> CryptoR
         .map_err(|_| CryptoError::Decryption("AES-GCM open failed".into()))
 }
 
+/// [`aead_seal`] with associated data: `aad` is authenticated but not
+/// encrypted, and the exact same bytes must be presented again to open. An
+/// empty `aad` yields output byte-compatible with [`aead_seal`] (GCM treats
+/// absent and empty AAD identically), so callers can adopt this freely.
+///
+/// Output: `nonce(12) ‖ ciphertext-with-tag`.
+pub fn aead_seal_aad(plaintext: &[u8], dek: &[u8], aad: &[u8]) -> CryptoResult<Vec<u8>> {
+    if dek.len() != 32 {
+        return Err(CryptoError::Encryption("DEK must be 32 bytes".into()));
+    }
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill(&mut nonce);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
+    let ct = cipher
+        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .map_err(|_| CryptoError::Encryption("AES-GCM seal failed".into()))?;
+    let mut out = Vec::with_capacity(12 + ct.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Inverse of [`aead_seal_aad`]; fails unless `aad` matches what was sealed.
+pub fn aead_open_aad(envelope: &[u8], dek: &[u8], aad: &[u8]) -> CryptoResult<Vec<u8>> {
+    if dek.len() != 32 {
+        return Err(CryptoError::Decryption("DEK must be 32 bytes".into()));
+    }
+    if envelope.len() < 12 + 16 {
+        return Err(CryptoError::Decryption("envelope too short".into()));
+    }
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
+    cipher
+        .decrypt(Nonce::from_slice(&envelope[..12]), Payload { msg: &envelope[12..], aad })
+        .map_err(|_| CryptoError::Decryption("AES-GCM open failed".into()))
+}
+
 /// Inverse of [`aead_seal`].
 pub fn aead_open(envelope: &[u8], dek: &[u8]) -> CryptoResult<Vec<u8>> {
     if dek.len() != 32 {

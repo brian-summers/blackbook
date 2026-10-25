@@ -304,8 +304,8 @@ It runs as *you*, at the same trust level as your terminal, and never invokes a 
 
 `bbk mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io) server so AI agents (Claude Code, Claude Desktop, …) can use Blackbook as tools. It's **secure by default** — the safe option is the default and you opt in to more:
 
-- **Offline crypto tools** always work and never touch the network: hash, encrypt/decrypt under a passphrase, derive keys, secure random, visual fingerprints.
-- **Online tools** (read/list secrets) appear only when you point it at a profile, and go through the normal authenticated client — so the **server still enforces that profile's ACLs, MFA, and K-of-N**. Give the agent a least-privilege profile and its reach is bounded.
+- **Offline crypto tools** always work and never touch the network: hash and HMAC, encrypt/decrypt under a passphrase, derive keys, secure random, visual fingerprints, and Ed25519 signature / token verification.
+- **Online tools** (read/list secrets, and encrypt / decrypt / sign / HMAC / issue tokens with managed keys) appear only when you point it at a profile, and go through the normal authenticated client — so the **server still enforces that profile's ACLs, MFA, and K-of-N**. Give the agent a least-privilege profile and its reach is bounded.
 - **Writes are off** unless you pass `--allow-write`; `--offline` disables the network entirely.
 
 ```powershell
@@ -335,6 +335,62 @@ bbk -P alice tunnel forward bob --listen 127.0.0.1:5432 --to 10.0.0.5:5432
 Anything hitting `127.0.0.1:5432` on alice's machine is encrypted end-to-end to bob, who connects onward to `10.0.0.5:5432`. Carries TCP or UDP, no VPN software or admin rights required.
 
 <!-- --8<-- [end:tunnels] -->
+
+---
+
+## Crypto toolkit: encrypt, sign, hash, and tokens
+
+<!-- --8<-- [start:crypto] -->
+
+The cryptography Blackbook uses to protect your secrets is also yours to use directly: encrypt and decrypt data, sign and verify it, hash it (with or without a key), and issue signed tokens that anyone holding the right key can verify.
+
+Every operation takes one **key source**:
+
+| Key source | Flag | Where the key lives |
+|---|---|---|
+| **Managed key** | `-k NAME` | On the server, in a domain. Its secret material **never leaves the server** — you send data in and get results back. Protected by the same ACLs, MFA, and audit log as your secrets, and rotatable without breaking anything already produced. |
+| **Your profile's key** | `--cmk` | Your profile's client master key: local, sealed inside your encrypted profile, never sent anywhere. |
+| **A key file** | `--key-file PATH` | A key you hold yourself (unmanaged). Make one with `bbk crypto keygen`, or bring your own: an Ed25519 PEM or 32 raw / hex / base64 bytes. |
+| **A passphrase** | `-p` | Typed at a prompt (or `$BLACKBOOK_CRYPTO_PASSPHRASE`), stretched with Argon2id. Encrypt / decrypt only. |
+
+Managed keys come in three types: `aes256-gcm` (encrypt / decrypt), `ed25519` (sign / verify / tokens, with a shareable public key), and `hmac` (keyed hashes / tokens).
+
+```powershell
+# Make managed keys in your domain
+bbk key create payroll                       # AES-256-GCM
+bbk key create releases -t ed25519           # signing key; prints its public key
+bbk key create webhooks -t hmac -M           # -M: every use needs an MFA code
+
+# Encrypt / decrypt. With -k, your data is encrypted locally under a one-time
+# data key that the managed key wraps, so the data itself never reaches the server.
+bbk crypto encrypt -k payroll salaries.csv -o salaries.csv.bbk
+bbk crypto decrypt -k payroll salaries.csv.bbk -o salaries.csv
+bbk crypto encrypt -p notes.txt              # passphrase instead; decrypt asks for it
+
+# Sign and verify (exit status 0 = valid, 1 = invalid)
+bbk crypto sign -k releases app.tar.gz > app.sig
+bbk crypto verify -k releases app.tar.gz -s (Get-Content app.sig)
+bbk key show releases                        # prints the public key (base64 + PEM) to share
+bbk crypto verify --public-key PUBKEY app.tar.gz -s (Get-Content app.sig)   # offline, no server
+
+# Hash, or HMAC with a key
+bbk crypto hash big.iso                      # SHA3-256 (also -a sha3-512 / sha256 / sha512)
+bbk crypto hash -k webhooks -m 123456 --text "payload"
+
+# Signed tokens (standard JWTs: EdDSA for Ed25519 keys, HS256 for HMAC keys)
+bbk crypto token issue -k releases --sub ci-runner --aud deploy --ttl 15m -c env=prod
+bbk crypto token verify -k releases --aud deploy eyJhbGciOiJFZERTQSIs...
+bbk key jwks releases                        # JWK Set for any JWT library to verify with
+
+# Rotate: new output uses v2; anything made with v1 still decrypts and verifies
+bbk key rotate payroll
+```
+
+Also in the toolkit: `crypto keygen` (local key files), `crypto datakey` (a fresh data key for your own envelope encryption), `crypto random`, `crypto derive-key` (Argon2id / scrypt / PBKDF2), `crypto password-hash` / `password-verify` (Argon2id, standard PHC format), `crypto fingerprint`, and `--aad` on encrypt / decrypt to bind ciphertext to a context. Everything works over the API too (`/api/v1/keys/...`) and as MCP tools for AI agents.
+
+Permissions for managed keys use the normal ACL rules, matched against the key name: **create** makes a key, **read** lets you see it *and use it*, **update** rotates it, and **delete** destroys it. Deleting a key makes everything it encrypted unrecoverable, so `key rm` asks you to type the name back.
+
+<!-- --8<-- [end:crypto] -->
 
 ---
 
@@ -402,6 +458,15 @@ Three flags are **global** — valid on any subcommand, before or after it:
 | `cleanup` | **Admin.** Purge self-destructed (tombstoned) secrets and files in the current domain. |
 | `web [-b ADDR]` | Launch the local web console (default `127.0.0.1:8088`). |
 | `tunnel forward PEER ...` / `tunnel accept ...` / `tunnel ls` | Open / accept / list end-to-end-encrypted tunnels. |
+| `key create NAME [-t TYPE] [-M] [--import PATH]` | Create a managed key (`aes256-gcm`, `ed25519`, or `hmac`) in the current domain, or import your own. |
+| `key ls` / `key show NAME` / `key jwks NAME` | List keys / show versions and public key / print an Ed25519 key's JWK Set. |
+| `key rotate NAME` / `key rm NAME` | Add a new key version (old ones keep working) / destroy a key and every version. |
+| `crypto encrypt` / `crypto decrypt [FILE] [KEY] [--aad A] [-o OUT]` | Encrypt / decrypt with `-k NAME`, `--cmk`, `--key-file PATH`, or `-p` (passphrase). |
+| `crypto sign` / `crypto verify -s SIG [FILE] [KEY]` | Ed25519 signatures and HMAC checks; verify also takes `--public-key`. |
+| `crypto hash [FILE] [-a ALG] [KEY]` | SHA3 / SHA-2 digest, or an HMAC when a key is given. |
+| `crypto token issue [KEY] [--sub/--aud/--iss] [--ttl] [-c K=V]` / `crypto token verify TOKEN [KEY]` | Issue / verify signed JWTs (EdDSA or HS256). |
+| `crypto keygen -t TYPE -o PATH` / `crypto datakey -k NAME` | Make a local key file / get a data key for your own envelope encryption. |
+| `crypto random` / `derive-key` / `password-hash` / `password-verify HASH` / `fingerprint` | Secure random bytes / passphrase KDFs / Argon2id password hashes / visual fingerprints. |
 | `server [-b ADDR]` / `health` | Run the server / ping the database. |
 | `rekey-dek` | **Admin/operator.** Rotate the master data-encryption key in one command. |
 
@@ -438,6 +503,22 @@ Normally the server encrypts your data (and can therefore serve it back). With *
 - **Data location** (files only). By default the ciphertext still lives in Blackbook (opaque to it). `--external-data` (`-E`) keeps the ciphertext **resident on your machine**, and the server holds only a manifest plus *its half of a split key* — true mutual custody, where neither side can decrypt alone.
 
 `--external` is the shorthand for "managed key, and (for files) resident data." Reading still requires passing every permission gate *and* holding the client-side key — both factors, neither sufficient alone. (`--rotate-on-read` is refused for external items, since the server can't re-key what it can't read.)
+
+### Managed keys and the crypto toolkit
+
+A managed key is a named row in a domain with one or more **versions**. Each version's 32 bytes of material are sealed with AES-256-GCM under a KEK derived from the master key (`file/dek-kek/v1` with the info tag `managed-keys/v1`), with the key's id and version number as associated data, so material copied between rows or versions in the database fails to decrypt rather than working silently. The key's name is column-encrypted and HMAC-indexed like every other identifier; only Ed25519 public keys are stored in the clear. Material is generated server-side (or imported once) and is never returned by any endpoint.
+
+Output from a managed key is tagged with the version that made it (`bbk:v3:…`), so `rotate` adds a version for new output while every older version keeps decrypting and verifying. Every operation passes the usual gates (mTLS + token, domain membership, the ACL on the key name, optional MFA) and writes an audit row. With `-k`, `crypto encrypt` uses envelope encryption: the server issues a one-time data key wrapped under the managed key, the CLI encrypts locally, and only the wrapped 32-byte data key is ever sent back for decryption.
+
+| Prefix | What it is |
+|---|---|
+| `bbk:v<N>:` | Ciphertext, signature, or MAC from managed-key version N (`base64(nonce ‖ ct ‖ tag)` for ciphertext). |
+| `bbkd1:` | Envelope: the managed-key-wrapped data key plus the locally sealed payload. |
+| `bbkx1:` | Passphrase envelope: `Argon2id(passphrase, salt)` → AES-256-GCM (same format as the MCP `bbk_encrypt` tool). |
+| `bbkc1:` | Profile envelope: an HKDF-SHA256 subkey of your client master key → AES-256-GCM. |
+| `bbkk1:` | Raw-key envelope: standard AES-256-GCM, `nonce(12) ‖ ct ‖ tag`, openable by any AES-GCM library. |
+
+Tokens are standard compact JWTs: `EdDSA` (Ed25519, RFC 8037) or `HS256`, with `kid` set to `<key>:v<N>`. `iat`, `exp`, and `jti` are always set by the issuer and can't be overridden by caller claims. Verification accepts only the algorithm that matches the key (never `none`), and checks `exp` / `nbf` with 60 seconds of clock-skew allowance plus the audience when one is given. Ed25519 verification uses strict mode, which rejects malleable signatures and small-order keys. Password hashes are Argon2id PHC strings (64 MiB, t=3, p=1). See [`src/crypto_ops.rs`](https://github.com/brian-summers/blackbook/blob/main/src/crypto_ops.rs).
 
 ### Architecture and data model
 
@@ -518,6 +599,10 @@ src/
 ├── persistence.rs     ─ master-key provider, DEK, CA + server cert load/init/rekey
 ├── tls.rs             ─ CA + certificate issuance
 ├── blackbook_core.rs  ─ key hierarchy, AES-GCM envelopes, KDFs
+├── crypto_ops.rs      ─ crypto toolkit primitives + byte formats (shared)
+├── keys_api.rs        ─ managed-key endpoints (encrypt/sign/HMAC/tokens)
+├── crypto_cli.rs      ─ `bbk key` / `bbk crypto` commands
+├── mcp.rs             ─ MCP server for AI agents
 ├── net_ratelimit.rs   ─ per-client rate limiter (anti-DoS)
 ├── audit_archive.rs   ─ encrypted, verifiable audit-log archives
 ├── presentation.rs    ─ fingerprint rendering (display only)

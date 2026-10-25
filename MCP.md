@@ -6,14 +6,17 @@ Blackbook's data-security features as tools.
 
 It has two tiers:
 
-- **Offline tools** — hashing, passphrase encryption/decryption, key derivation,
-  secure random, and visual fingerprints. These run entirely locally, need no
-  server, and never send data anywhere. They use the exact same cryptographic
-  primitives as the rest of Blackbook.
+- **Offline tools** — hashing and HMAC, passphrase encryption/decryption, key
+  derivation, secure random, visual fingerprints, and Ed25519 signature / token
+  verification. These run entirely locally, need no server, and never send data
+  anywhere. They use the exact same cryptographic primitives as the rest of
+  Blackbook.
 - **Online tools** — read, list, and (optionally) write secrets on a Blackbook
-  server. These go through the normal authenticated client, so **the server
-  still enforces mTLS, tokens, ACLs, MFA, and K-of-N**. The agent is just
-  another client, and can only reach what the chosen profile is allowed to.
+  server, and encrypt / decrypt / sign / HMAC / issue tokens with **managed
+  keys** whose material never leaves the server. These go through the normal
+  authenticated client, so **the server still enforces mTLS, tokens, ACLs, MFA,
+  and K-of-N**. The agent is just another client, and can only reach what the
+  chosen profile is allowed to.
 
 ## Security model (secure by default)
 
@@ -24,8 +27,8 @@ default, and you opt *in* to more power:
 |---|---|
 | `bbk mcp --offline` | Offline crypto tools only. **No network, ever.** |
 | `bbk mcp` (no unlocked profile) | Offline crypto tools only, until a profile is available. |
-| `bbk -P NAME mcp` | Offline tools **+ read** secrets/files the profile is authorized for. |
-| `bbk -P NAME mcp --allow-write` | The above **+ write/delete** secrets. |
+| `bbk -P NAME mcp` | Offline tools **+ read** secrets/files and **use** managed keys the profile is authorized for. |
+| `bbk -P NAME mcp --allow-write` | The above **+ write/delete** secrets and create/rotate managed keys. |
 
 Additional guarantees:
 
@@ -55,8 +58,11 @@ Additional guarantees:
 | `bbk_random` | CSPRNG bytes as hex / base64 / URL-safe token (keys, passwords). |
 | `bbk_encrypt` | Encrypt text under a passphrase (Argon2id → AES-256-GCM); returns a portable `bbkx1:` envelope. |
 | `bbk_decrypt` | Decrypt a `bbkx1:` envelope with its passphrase. |
-| `bbk_derive_key` | Derive a 256-bit key from a passphrase (Argon2id or scrypt); returns key + salt so it's reproducible. |
+| `bbk_derive_key` | Derive a 256-bit key from a passphrase (Argon2id, scrypt, or PBKDF2-HMAC-SHA3-512); returns key + salt so it's reproducible. |
 | `bbk_fingerprint` | Human-verifiable fingerprint: OpenSSH-style randomart + braille + SHA3-256. |
+| `bbk_hmac` | HMAC (SHA3-256/512, SHA-256/512) of data under a caller-supplied base64 key. |
+| `bbk_verify_signature` | Verify an Ed25519 signature with a public key (base64/hex, PEM, or JWK). |
+| `bbk_token_verify` | Verify an EdDSA JWT with a public key; returns its claims (checks expiry, not-before, audience). |
 
 ### Online (need a profile; listed only when available)
 
@@ -66,8 +72,19 @@ Additional guarantees:
 | `bbk_secret_list` | profile | Secret names + metadata in a domain (no values). |
 | `bbk_secret_get` | profile | Read a secret value (subject to ACL/MFA/K-of-N). |
 | `bbk_file_list` | profile | List files (metadata only). |
+| `bbk_key_list` | profile | Managed keys in a domain (name, type, version; never material). |
+| `bbk_key_encrypt` / `bbk_key_decrypt` | profile | Encrypt to / decrypt from `bbk:v<N>:` ciphertext with a managed AES key. |
+| `bbk_key_sign` | profile | Ed25519-sign data with a managed key. |
+| `bbk_key_hmac` | profile | HMAC data with a managed HMAC key. |
+| `bbk_key_verify` | profile | Check a managed-key signature or MAC. |
+| `bbk_key_token_issue` / `bbk_key_token_verify` | profile | Issue / verify JWTs (EdDSA or HS256) with a managed key. |
 | `bbk_secret_put` | `--allow-write` | Store/overwrite a secret. |
 | `bbk_secret_delete` | `--allow-write` | Delete a secret. |
+| `bbk_key_create` / `bbk_key_rotate` | `--allow-write` | Create / rotate a managed key. (Deleting keys is CLI-only.) |
+
+Every `bbk_key_*` tool takes `key` (the managed key name), and optionally
+`domain` and `mfa` (a TOTP code, for keys created with `--mfa-required`).
+Using a managed key needs `read` on its name, just like reading a secret.
 
 ## Running it
 

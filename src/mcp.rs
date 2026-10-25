@@ -21,11 +21,10 @@
 //!     return a clear "run `bbk unlock`" error when the profile is locked.
 //!   * stdout carries ONLY protocol messages; all logging goes to stderr.
 
-use crate::{client, credstore};
+use crate::client;
+use crate::crypto_ops::{self, HashAlg, KdfAlg, TokenVerifier};
 use base64::Engine as _;
-use rand::RngCore;
 use serde_json::{json, Value};
-use sha2::Digest as _;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Protocol versions we understand. We echo the client's if it's one of these,
@@ -33,8 +32,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 const PROTO_LATEST: &str = "2025-06-18";
 const PROTO_SUPPORTED: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
-const ENVELOPE_PREFIX: &str = "bbkx1:";
-const ENVELOPE_MAGIC: &[u8] = b"BBKX1";
+/// Online tools that change server state — hidden unless `--allow-write`.
+const WRITE_TOOLS: &[&str] = &["bbk_secret_put", "bbk_secret_delete", "bbk_key_create", "bbk_key_rotate"];
 
 /// How the server was launched — decides which tools exist and what they can do.
 pub struct McpConfig {
@@ -155,10 +154,12 @@ fn initialize_result(requested: Option<&str>) -> Value {
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "blackbook", "version": env!("CARGO_PKG_VERSION") },
         "instructions":
-            "Blackbook data-security tools. Offline tools (bbk_hash, bbk_random, \
-             bbk_encrypt, bbk_decrypt, bbk_derive_key, bbk_fingerprint) run locally \
-             and never send data anywhere. Online tools talk to a Blackbook server \
-             as an authenticated client; the server enforces its own ACLs/MFA, so \
+            "Blackbook data-security tools. Offline tools (bbk_hash, bbk_hmac, bbk_random, \
+             bbk_encrypt, bbk_decrypt, bbk_derive_key, bbk_fingerprint, bbk_verify_signature, \
+             bbk_token_verify) run locally and never send data anywhere. Online tools talk \
+             to a Blackbook server as an authenticated client — including bbk_key_* tools \
+             that encrypt, sign, MAC and issue tokens with server-managed keys whose \
+             material never leaves the server. The server enforces its own ACLs/MFA, so \
              you can only reach what this profile is allowed to. Never paste real \
              secrets into a shared transcript."
     })
@@ -204,10 +205,10 @@ fn tools_list(cfg: &McpConfig) -> Vec<Value> {
                 "passphrase":{"type":"string"}
             },"required":["envelope","passphrase"]})),
         tool("bbk_derive_key",
-            "Derive a 256-bit key from a passphrase with Argon2id (default) or scrypt. Returns key + salt so it's reproducible. Offline.",
+            "Derive a 256-bit key from a passphrase with Argon2id (default), scrypt, or PBKDF2-HMAC-SHA3-512. Returns key + salt so it's reproducible. Offline.",
             json!({"type":"object","properties":{
                 "passphrase":{"type":"string"},
-                "algorithm":{"type":"string","enum":["argon2id","scrypt"],"default":"argon2id"},
+                "algorithm":{"type":"string","enum":["argon2id","scrypt","pbkdf2"],"default":"argon2id"},
                 "salt_base64":{"type":"string","description":"Reuse a salt (base64). Omit to generate a fresh random 16-byte salt."}
             },"required":["passphrase"]})),
         tool("bbk_fingerprint",
@@ -216,6 +217,29 @@ fn tools_list(cfg: &McpConfig) -> Vec<Value> {
                 "data":{"type":"string"},
                 "data_base64":{"type":"boolean","default":false}
             },"required":["data"]})),
+        tool("bbk_hmac",
+            "Keyed hash (HMAC) of data with a caller-supplied key. Offline. For a server-held key use bbk_key_hmac.",
+            json!({"type":"object","properties":{
+                "data":{"type":"string"},
+                "data_base64":{"type":"boolean","default":false},
+                "key_base64":{"type":"string","description":"The HMAC key, base64."},
+                "algorithm":{"type":"string","enum":["sha3-256","sha3-512","sha256","sha512"],"default":"sha3-256"}
+            },"required":["data","key_base64"]})),
+        tool("bbk_verify_signature",
+            "Verify an Ed25519 signature with a public key (e.g. from `bbk key show`). Offline.",
+            json!({"type":"object","properties":{
+                "data":{"type":"string"},
+                "data_base64":{"type":"boolean","default":false},
+                "signature":{"type":"string","description":"bbk:v<N>:…, base64, or hex."},
+                "public_key":{"type":"string","description":"Base64/hex key, PEM, or JWK."}
+            },"required":["data","signature","public_key"]})),
+        tool("bbk_token_verify",
+            "Verify an EdDSA (Ed25519) JWT with a public key and return its claims: checks signature, expiry, not-before, and optional audience. Offline.",
+            json!({"type":"object","properties":{
+                "token":{"type":"string"},
+                "public_key":{"type":"string","description":"Base64/hex key, PEM, or JWK."},
+                "audience":{"type":"string"}
+            },"required":["token","public_key"]})),
     ];
 
     if cfg.online() {
@@ -240,8 +264,34 @@ fn tools_list(cfg: &McpConfig) -> Vec<Value> {
             json!({"type":"object","properties":{
                 "domain":{"type":"string"}
             }})));
+        for (name, desc, props, required) in key_tools() {
+            let mut props = props;
+            props["key"] = json!({"type":"string","description":"Managed key name."});
+            props["domain"] = json!({"type":"string"});
+            props["mfa"] = json!({"type":"string","description":"Current 6-digit TOTP code, if the key requires MFA."});
+            let mut req = vec!["key"];
+            req.extend(required);
+            t.push(tool(name, desc, json!({"type":"object","properties":props,"required":req})));
+        }
+        t.push(tool("bbk_key_list",
+            "List managed keys (name, type, latest version) in a domain. No key material is returned.",
+            json!({"type":"object","properties":{ "domain":{"type":"string"} }})));
 
         if cfg.allow_write {
+            t.push(tool("bbk_key_create",
+                "Create a managed key on the Blackbook server. Requires --allow-write.",
+                json!({"type":"object","properties":{
+                    "name":{"type":"string"},
+                    "key_type":{"type":"string","enum":["aes256-gcm","ed25519","hmac"],"default":"aes256-gcm"},
+                    "mfa_required":{"type":"boolean","default":false},
+                    "domain":{"type":"string"}
+                },"required":["name"]})));
+            t.push(tool("bbk_key_rotate",
+                "Rotate a managed key (new version for new output; old versions still decrypt/verify). Requires --allow-write.",
+                json!({"type":"object","properties":{
+                    "key":{"type":"string"},
+                    "domain":{"type":"string"}
+                },"required":["key"]})));
             t.push(tool("bbk_secret_put",
                 "Store (or overwrite) a secret on the Blackbook server. Requires --allow-write.",
                 json!({"type":"object","properties":{
@@ -266,6 +316,46 @@ fn tools_list(cfg: &McpConfig) -> Vec<Value> {
 
 fn tool(name: &str, description: &str, schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": schema })
+}
+
+/// The managed-key operation tools (online, read tier): name, description,
+/// properties beyond the shared `key`/`domain`/`mfa`, and required fields.
+fn key_tools() -> Vec<(&'static str, &'static str, Value, Vec<&'static str>)> {
+    let data = json!({"type":"string"});
+    let b64 = json!({"type":"boolean","default":false,"description":"Treat `data` as base64 rather than UTF-8 text."});
+    let alg = json!({"type":"string","enum":["sha3-256","sha3-512","sha256","sha512"],"default":"sha3-256"});
+    vec![
+        ("bbk_key_encrypt",
+         "Encrypt data with a server-managed AES-256-GCM key. Returns 'bbk:v<N>:' ciphertext; the key never leaves the server.",
+         json!({"data":data,"data_base64":b64,"aad":{"type":"string","description":"Associated data (text) that must match at decrypt."}}),
+         vec!["data"]),
+        ("bbk_key_decrypt",
+         "Decrypt 'bbk:v<N>:' ciphertext made by bbk_key_encrypt with the same managed key.",
+         json!({"ciphertext":{"type":"string"},"aad":{"type":"string"}}),
+         vec!["ciphertext"]),
+        ("bbk_key_sign",
+         "Sign data with a server-managed Ed25519 key. Returns 'bbk:v<N>:' signature and the public key.",
+         json!({"data":data,"data_base64":b64}),
+         vec!["data"]),
+        ("bbk_key_hmac",
+         "Keyed hash (HMAC) of data with a server-managed HMAC key. Returns 'bbk:v<N>:' MAC.",
+         json!({"data":data,"data_base64":b64,"algorithm":alg}),
+         vec!["data"]),
+        ("bbk_key_verify",
+         "Verify a 'bbk:v<N>:' signature (Ed25519 key) or MAC (HMAC key) over data.",
+         json!({"data":data,"data_base64":b64,"signature":{"type":"string"},"algorithm":alg}),
+         vec!["data","signature"]),
+        ("bbk_key_token_issue",
+         "Issue a signed JWT with a managed Ed25519 (EdDSA) or HMAC (HS256) key.",
+         json!({"claims":{"type":"object","description":"Extra claims."},"subject":{"type":"string"},
+                "audience":{"type":"string"},"issuer":{"type":"string"},
+                "ttl_secs":{"type":"integer","minimum":1,"default":3600}}),
+         vec![]),
+        ("bbk_key_token_verify",
+         "Verify a JWT issued by a managed key (signature, expiry, not-before, optional audience) and return its claims.",
+         json!({"token":{"type":"string"},"audience":{"type":"string"}}),
+         vec!["token"]),
+    ]
 }
 
 /// Compact human-readable uptime from a second count.
@@ -298,12 +388,17 @@ async fn call_tool(cfg: &McpConfig, params: Option<&Value>) -> Value {
         "bbk_decrypt" => tool_decrypt(args),
         "bbk_derive_key" => tool_derive_key(args),
         "bbk_fingerprint" => tool_fingerprint(args),
+        "bbk_hmac" => tool_hmac(args),
+        "bbk_verify_signature" => tool_verify_signature(args),
+        "bbk_token_verify" => tool_token_verify(args),
         // --- online --------------------------------------------------------
         "bbk_status" | "bbk_secret_list" | "bbk_secret_get" | "bbk_file_list"
-        | "bbk_secret_put" | "bbk_secret_delete" => {
+        | "bbk_secret_put" | "bbk_secret_delete" | "bbk_key_list" | "bbk_key_create" | "bbk_key_rotate"
+        | "bbk_key_encrypt" | "bbk_key_decrypt" | "bbk_key_sign" | "bbk_key_hmac" | "bbk_key_verify"
+        | "bbk_key_token_issue" | "bbk_key_token_verify" => {
             if !cfg.online() {
                 Err("online tools are disabled — this MCP server was started offline or with no profile".into())
-            } else if matches!(name, "bbk_secret_put" | "bbk_secret_delete") && !cfg.allow_write {
+            } else if WRITE_TOOLS.contains(&name) && !cfg.allow_write {
                 Err("writes are disabled — restart the MCP server with `--allow-write` to enable this tool".into())
             } else {
                 call_online(cfg, name, args).await
@@ -345,15 +440,32 @@ fn arg_data(args: &Value) -> Result<Vec<u8>, String> {
 
 fn tool_hash(args: &Value) -> Result<String, String> {
     let data = arg_data(args)?;
-    let algo = arg_str_opt(args, "algorithm").unwrap_or("sha3-256");
-    let digest = match algo {
-        "sha3-256" => sha3::Sha3_256::digest(&data).to_vec(),
-        "sha3-512" => sha3::Sha3_512::digest(&data).to_vec(),
-        "sha256" => sha2::Sha256::digest(&data).to_vec(),
-        "sha512" => sha2::Sha512::digest(&data).to_vec(),
-        other => return Err(format!("unknown algorithm '{other}' (use sha3-256, sha3-512, sha256, sha512)")),
-    };
-    Ok(format!("{algo}: {}", hex::encode(digest)))
+    let alg = HashAlg::parse(arg_str_opt(args, "algorithm").unwrap_or("sha3-256"))?;
+    Ok(format!("{}: {}", alg.as_str(), hex::encode(crypto_ops::digest(alg, &data))))
+}
+
+fn tool_hmac(args: &Value) -> Result<String, String> {
+    let data = arg_data(args)?;
+    let key = base64::engine::general_purpose::STANDARD.decode(arg_str(args, "key_base64")?.trim())
+        .map_err(|e| format!("key_base64 is not valid base64: {e}"))?;
+    let alg = HashAlg::parse(arg_str_opt(args, "algorithm").unwrap_or("sha3-256"))?;
+    Ok(format!("hmac-{}: {}", alg.as_str(), hex::encode(crypto_ops::hmac(alg, &key, &data))))
+}
+
+fn tool_verify_signature(args: &Value) -> Result<String, String> {
+    let data = arg_data(args)?;
+    let pk = crypto_ops::parse_public_key(arg_str(args, "public_key")?)?;
+    let sig = crypto_ops::parse_tag(arg_str(args, "signature")?)?;
+    Ok(if crypto_ops::ed25519_verify(&pk, &data, &sig) { "valid" } else { "INVALID" }.into())
+}
+
+fn tool_token_verify(args: &Value) -> Result<String, String> {
+    let pk = crypto_ops::parse_public_key(arg_str(args, "public_key")?)?;
+    match crypto_ops::token_verify(arg_str(args, "token")?, &TokenVerifier::Ed25519(pk),
+                                   crypto_ops::now_unix(), arg_str_opt(args, "audience")) {
+        Ok(claims) => Ok(format!("valid token\n{}", serde_json::to_string_pretty(&claims).unwrap_or_default())),
+        Err(reason) => Ok(format!("INVALID token: {reason}")),
+    }
 }
 
 fn tool_random(args: &Value) -> Result<String, String> {
@@ -361,98 +473,46 @@ fn tool_random(args: &Value) -> Result<String, String> {
     if n == 0 || n > 4096 {
         return Err("bytes must be between 1 and 4096".into());
     }
-    let mut buf = vec![0u8; n as usize];
-    rand::thread_rng().fill_bytes(&mut buf);
-    let enc = arg_str_opt(args, "encoding").unwrap_or("base64url");
-    let out = match enc {
-        "hex" => hex::encode(&buf),
-        "base64" => base64::engine::general_purpose::STANDARD.encode(&buf),
-        "base64url" | "token" => base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf),
-        other => return Err(format!("unknown encoding '{other}' (use hex, base64, base64url, token)")),
-    };
-    Ok(out)
+    crypto_ops::encode(&crypto_ops::random_bytes(n as usize), arg_str_opt(args, "encoding").unwrap_or("base64url"))
 }
 
 fn tool_encrypt(args: &Value) -> Result<String, String> {
     let plaintext = arg_str(args, "plaintext")?;
     let passphrase = arg_str(args, "passphrase")?;
-    seal_envelope(plaintext.as_bytes(), passphrase)
+    crypto_ops::passphrase_seal(plaintext.as_bytes(), passphrase, b"")
 }
 
 fn tool_decrypt(args: &Value) -> Result<String, String> {
     let envelope = arg_str(args, "envelope")?;
     let passphrase = arg_str(args, "passphrase")?;
-    let pt = open_envelope(envelope, passphrase)?;
+    let pt = crypto_ops::passphrase_open(envelope, passphrase, b"")?;
     String::from_utf8(pt).map_err(|_| "decrypted bytes are not valid UTF-8 text".into())
 }
 
 fn tool_derive_key(args: &Value) -> Result<String, String> {
-    let passphrase = arg_str(args, "passphrase")?;
-    let algo = arg_str_opt(args, "algorithm").unwrap_or("argon2id");
-    let salt = match arg_str_opt(args, "salt_base64") {
-        Some(s) => base64::engine::general_purpose::STANDARD.decode(s.trim())
-            .map_err(|e| format!("salt_base64 is not valid base64: {e}"))?,
-        None => {
-            let mut s = vec![0u8; 16];
-            rand::thread_rng().fill_bytes(&mut s);
-            s
-        }
-    };
-    let key = match algo {
-        "argon2id" => {
-            let (k, _, _, _) = credstore::argon2_key(passphrase, &salt).map_err(|e| e.to_string())?;
-            k.to_vec()
-        }
-        "scrypt" => crate::blackbook_core::scrypt_dek(passphrase.as_bytes(), &salt)
-            .map_err(|e| e.to_string())?
-            .to_vec(),
-        other => return Err(format!("unknown algorithm '{other}' (use argon2id or scrypt)")),
-    };
     use base64::engine::general_purpose::STANDARD as B64;
+    let passphrase = arg_str(args, "passphrase")?;
+    let alg = KdfAlg::parse(arg_str_opt(args, "algorithm").unwrap_or("argon2id"))?;
+    let salt = match arg_str_opt(args, "salt_base64") {
+        Some(s) => B64.decode(s.trim()).map_err(|e| format!("salt_base64 is not valid base64: {e}"))?,
+        None => crypto_ops::random_bytes(16).to_vec(),
+    };
+    let key = crypto_ops::derive_key(alg, passphrase, &salt)?;
     Ok(format!(
-        "algorithm: {algo}\nkey_base64: {}\nkey_hex: {}\nsalt_base64: {}",
-        B64.encode(&key), hex::encode(&key), B64.encode(&salt)
+        "algorithm: {}\nkey_base64: {}\nkey_hex: {}\nsalt_base64: {}",
+        alg.as_str(), B64.encode(key.as_slice()), hex::encode(key.as_slice()), B64.encode(&salt)
     ))
 }
 
 fn tool_fingerprint(args: &Value) -> Result<String, String> {
     let data = arg_data(args)?;
-    let fp = sha3::Sha3_256::digest(&data);
+    let fp = crypto_ops::digest(HashAlg::Sha3_256, &data);
     Ok(format!(
         "{}\nbraille: {}\nsha3-256: {}",
         crate::presentation::randomart(&fp, "bbk"),
         crate::presentation::braille(&fp),
         hex::encode(fp),
     ))
-}
-
-/// `bbkx1:` + base64( MAGIC | salt(16) | AES-256-GCM(Argon2id(passphrase,salt), plaintext) ).
-fn seal_envelope(plaintext: &[u8], passphrase: &str) -> Result<String, String> {
-    let mut salt = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut salt);
-    let (key, _, _, _) = credstore::argon2_key(passphrase, &salt).map_err(|e| e.to_string())?;
-    let sealed = crate::blackbook_core::aead_seal(plaintext, key.as_slice()).map_err(|e| e.to_string())?;
-    let mut buf = Vec::with_capacity(ENVELOPE_MAGIC.len() + 16 + sealed.len());
-    buf.extend_from_slice(ENVELOPE_MAGIC);
-    buf.extend_from_slice(&salt);
-    buf.extend_from_slice(&sealed);
-    Ok(format!("{ENVELOPE_PREFIX}{}", base64::engine::general_purpose::STANDARD.encode(buf)))
-}
-
-fn open_envelope(envelope: &str, passphrase: &str) -> Result<Vec<u8>, String> {
-    let b64 = envelope.trim().strip_prefix(ENVELOPE_PREFIX)
-        .ok_or_else(|| format!("not a Blackbook envelope (expected a '{ENVELOPE_PREFIX}' prefix)"))?;
-    let buf = base64::engine::general_purpose::STANDARD.decode(b64)
-        .map_err(|e| format!("envelope is not valid base64: {e}"))?;
-    let min = ENVELOPE_MAGIC.len() + 16;
-    if buf.len() <= min || &buf[..ENVELOPE_MAGIC.len()] != ENVELOPE_MAGIC {
-        return Err("corrupted or truncated envelope".into());
-    }
-    let salt = &buf[ENVELOPE_MAGIC.len()..ENVELOPE_MAGIC.len() + 16];
-    let sealed = &buf[ENVELOPE_MAGIC.len() + 16..];
-    let (key, _, _, _) = credstore::argon2_key(passphrase, salt).map_err(|e| e.to_string())?;
-    crate::blackbook_core::aead_open(sealed, key.as_slice())
-        .map_err(|_| "decryption failed — wrong passphrase or a corrupted envelope".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +621,80 @@ async fn call_online(cfg: &McpConfig, name: &str, args: &Value) -> Result<String
             bb.delete(n).await.map_err(|e| e.to_string())?;
             Ok(format!("deleted '{n}'"))
         }
-        other => Err(format!("unknown online tool: {other}")),
+        "bbk_key_list" => {
+            let list = bb.key_list().await.map_err(|e| e.to_string())?;
+            if list.keys.is_empty() {
+                return Ok("(no managed keys in this domain)".into());
+            }
+            let mut lines = vec![format!("{} key(s):", list.count)];
+            for k in &list.keys {
+                lines.push(format!("  {} [{}] v{}{}", k.name, k.key_type, k.latest_version,
+                                   if k.mfa_required { " (MFA required)" } else { "" }));
+            }
+            Ok(lines.join("\n"))
+        }
+        "bbk_key_create" => {
+            let k = bb.key_create(arg_str(args, "name")?, arg_str_opt(args, "key_type").unwrap_or("aes256-gcm"),
+                                  arg_bool(args, "mfa_required", false), None).await.map_err(|e| e.to_string())?;
+            let mut s = format!("created {} key '{}' (v{})", k.key_type, k.name, k.latest_version);
+            if let Some(pk) = k.public_key { s.push_str(&format!("\npublic key: {pk}")); }
+            Ok(s)
+        }
+        "bbk_key_rotate" => {
+            let k = bb.key_rotate(arg_str(args, "key")?).await.map_err(|e| e.to_string())?;
+            Ok(format!("rotated '{}' — new output uses v{}", k.name, k.latest_version))
+        }
+        _ => call_key_op(bb, name, args).await,
+    }
+}
+
+/// The managed-key operation tools: translate MCP arguments into one
+/// `/api/v1/keys/{key}/<op>` call and render the answer as text.
+async fn call_key_op(bb: client::BlackbookClient, name: &str, args: &Value) -> Result<String, String> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    let mut bb = bb;
+    if let Some(code) = arg_str_opt(args, "mfa") {
+        bb = bb.with_mfa(code.to_string());
+    }
+    let key = arg_str(args, "key")?;
+    let aad = arg_str_opt(args, "aad").map(|a| B64.encode(a.as_bytes()));
+    let field = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string)
+        .ok_or_else(|| format!("server response is missing '{k}'"));
+    let (op, body) = match name {
+        "bbk_key_encrypt" => ("encrypt", json!({ "plaintext": B64.encode(arg_data(args)?), "aad": aad })),
+        "bbk_key_decrypt" => ("decrypt", json!({ "ciphertext": arg_str(args, "ciphertext")?, "aad": aad })),
+        "bbk_key_sign" => ("sign", json!({ "input": B64.encode(arg_data(args)?) })),
+        "bbk_key_hmac" => ("hmac", json!({ "input": B64.encode(arg_data(args)?),
+                                          "algorithm": arg_str_opt(args, "algorithm") })),
+        "bbk_key_verify" => ("verify", json!({ "input": B64.encode(arg_data(args)?),
+                                              "signature": arg_str(args, "signature")?,
+                                              "algorithm": arg_str_opt(args, "algorithm") })),
+        "bbk_key_token_issue" => ("token", json!({
+            "claims": args.get("claims"), "subject": arg_str_opt(args, "subject"),
+            "audience": arg_str_opt(args, "audience"), "issuer": arg_str_opt(args, "issuer"),
+            "ttl_secs": args.get("ttl_secs").and_then(Value::as_i64),
+        })),
+        "bbk_key_token_verify" => ("token/verify", json!({ "token": arg_str(args, "token")?,
+                                                          "audience": arg_str_opt(args, "audience") })),
+        other => return Err(format!("unknown online tool: {other}")),
+    };
+    let r = bb.key_op(key, op, &body).await.map_err(|e| e.to_string())?;
+    match op {
+        "encrypt" => field(&r, "ciphertext"),
+        "decrypt" => {
+            let pt = B64.decode(field(&r, "plaintext")?).map_err(|_| "server returned bad base64")?;
+            Ok(String::from_utf8(pt.clone())
+                .unwrap_or_else(|_| format!("(binary plaintext, base64) {}", B64.encode(&pt))))
+        }
+        "sign" => Ok(format!("signature: {}\npublic key: {}", field(&r, "signature")?, field(&r, "public_key")?)),
+        "hmac" => field(&r, "hmac"),
+        "verify" => Ok(if r.get("valid").and_then(Value::as_bool) == Some(true) { "valid" } else { "INVALID" }.into()),
+        "token" => Ok(format!("{}\n(expires {})", field(&r, "token")?, field(&r, "expires_at")?)),
+        _ => Ok(if r.get("valid").and_then(Value::as_bool) == Some(true) {
+            format!("valid token\n{}", serde_json::to_string_pretty(&r["claims"]).unwrap_or_default())
+        } else {
+            format!("INVALID token: {}", r.get("reason").and_then(Value::as_str).unwrap_or("unknown"))
+        }),
     }
 }
 
@@ -570,16 +703,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn envelope_roundtrips_and_rejects_wrong_passphrase() {
-        let env = seal_envelope(b"top secret", "correct horse").unwrap();
-        assert!(env.starts_with(ENVELOPE_PREFIX));
-        // The plaintext must not appear in the envelope.
+    fn encrypt_tool_output_opens_with_the_shared_envelope_code() {
+        // bbk_encrypt output must stay decryptable by `bbk crypto decrypt -p`.
+        let env = tool_encrypt(&json!({"plaintext":"top secret","passphrase":"correct horse"})).unwrap();
+        assert!(env.starts_with(crypto_ops::PASSPHRASE_PREFIX));
         assert!(!env.contains("top secret"));
-        let out = open_envelope(&env, "correct horse").unwrap();
-        assert_eq!(out, b"top secret");
-        assert!(open_envelope(&env, "wrong").is_err());
-        assert!(open_envelope("bbkx1:not-base64!!", "x").is_err());
-        assert!(open_envelope("no-prefix", "x").is_err());
+        assert_eq!(crypto_ops::passphrase_open(&env, "correct horse", b"").unwrap(), b"top secret");
+        assert_eq!(tool_decrypt(&json!({"envelope":env,"passphrase":"correct horse"})).unwrap(), "top secret");
+        assert!(tool_decrypt(&json!({"envelope":env,"passphrase":"wrong"})).is_err());
+    }
+
+    #[test]
+    fn hmac_and_signature_tools() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        let out = tool_hmac(&json!({"data":"what do ya want for nothing?","key_base64":B64.encode("Jefe"),
+                                    "algorithm":"sha256"})).unwrap();
+        assert!(out.ends_with("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
+        let seed = [4u8; 32];
+        let pk = B64.encode(crypto_ops::ed25519_public(&seed).unwrap());
+        let sig = B64.encode(crypto_ops::ed25519_sign(&seed, b"msg").unwrap());
+        assert_eq!(tool_verify_signature(&json!({"data":"msg","signature":sig,"public_key":pk})).unwrap(), "valid");
+        assert_eq!(tool_verify_signature(&json!({"data":"msh","signature":sig,"public_key":pk})).unwrap(), "INVALID");
     }
 
     #[test]
@@ -613,5 +757,15 @@ mod tests {
         assert!(names.contains(&"bbk_secret_get".to_string()));
         assert!(!names.contains(&"bbk_secret_put".to_string()));
         assert!(!names.contains(&"bbk_secret_delete".to_string()));
+        assert!(names.contains(&"bbk_key_encrypt".to_string()));
+        assert!(!names.contains(&"bbk_key_create".to_string()));
+        assert!(!names.contains(&"bbk_key_rotate".to_string()));
+        // Every tool's schema requires only properties it declares.
+        for t in tools_list(&ro) {
+            let props = t["inputSchema"]["properties"].as_object().unwrap();
+            for r in t["inputSchema"]["required"].as_array().into_iter().flatten() {
+                assert!(props.contains_key(r.as_str().unwrap()), "{} requires undeclared {r}", t["name"]);
+            }
+        }
     }
 }

@@ -1175,7 +1175,87 @@ impl BlackbookClient {
         let resp = self.req(reqwest::Method::GET, "/api/v1/audit/archives").send().await?;
         self.handle(resp).await
     }
+
+    // Managed keys
+
+    /// Create a managed key; `import_b64` imports existing material (BYOK).
+    pub async fn key_create(
+        &self, name: &str, key_type: &str, mfa_required: bool, import_b64: Option<&str>,
+    ) -> Result<KeySummary> {
+        let body = serde_json::json!({
+            "name": name, "key_type": key_type, "mfa_required": mfa_required,
+            "import_material": import_b64,
+        });
+        let resp = self.req_in_domain(reqwest::Method::POST, "/api/v1/keys").json(&body).send().await?;
+        self.handle(resp).await
+    }
+
+    pub async fn key_list(&self) -> Result<KeyList> {
+        let resp = self.req_in_domain(reqwest::Method::GET, "/api/v1/keys").send().await?;
+        self.handle(resp).await
+    }
+
+    pub async fn key_show(&self, name: &str) -> Result<KeySummary> {
+        let url = format!("/api/v1/keys/{}", urlencoding_simple(name));
+        let resp = self.req_in_domain(reqwest::Method::GET, &url).send().await?;
+        self.handle(resp).await
+    }
+
+    pub async fn key_jwks(&self, name: &str) -> Result<serde_json::Value> {
+        let url = format!("/api/v1/keys/{}/jwks", urlencoding_simple(name));
+        let resp = self.req_in_domain(reqwest::Method::GET, &url).send().await?;
+        self.handle(resp).await
+    }
+
+    pub async fn key_rotate(&self, name: &str) -> Result<KeySummary> {
+        let url = format!("/api/v1/keys/{}/rotate", urlencoding_simple(name));
+        let resp = self.req_in_domain(reqwest::Method::POST, &url).send().await?;
+        self.handle(resp).await
+    }
+
+    pub async fn key_delete(&self, name: &str) -> Result<serde_json::Value> {
+        let url = format!("/api/v1/keys/{}", urlencoding_simple(name));
+        let resp = self.req_in_domain(reqwest::Method::DELETE, &url).send().await?;
+        self.handle(resp).await
+    }
+
+    /// Run an operation on a managed key: `op` is `encrypt`, `decrypt`,
+    /// `datakey`, `sign`, `hmac`, `verify`, `token` or `token/verify`, and
+    /// `body` is that endpoint's JSON request (binary fields base64).
+    pub async fn key_op(&self, name: &str, op: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+        let url = format!("/api/v1/keys/{}/{op}", urlencoding_simple(name));
+        let resp = self.req_in_domain(reqwest::Method::POST, &url).json(body).send().await?;
+        self.handle(resp).await
+    }
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeyVersionView {
+    pub version: i32,
+    pub created_at: String,
+    #[serde(default)]
+    pub public_key: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeySummary {
+    pub name: String,
+    pub key_type: String,
+    pub latest_version: i32,
+    #[serde(default)]
+    pub mfa_required: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<KeyVersionView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key_pem: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KeyList { pub keys: Vec<KeySummary>, pub count: usize }
 
 /// Percent-encode a path segment (handles spaces, slashes-in-name, etc.).
 /// Pulled in-line to avoid yet another crate.

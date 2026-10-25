@@ -20,6 +20,7 @@ use crate::blackbook_core::{
     aead_open, aead_seal, decrypt_aes_gcm, encrypt_aes_gcm, AclAction, BlackbookKey, Id,
 };
 use crate::audit_archive;
+use crate::keys_api;
 use crate::tls::SharedCa;
 
 // ---------------------------------------------------------------------------
@@ -308,6 +309,10 @@ pub struct AppState {
     /// `dec_field`. A DB-only attacker without this key sees only opaque
     /// IDs, ciphertext, and timestamps.
     pub metadata_enc_key: Arc<Vec<u8>>,
+    /// 32-byte KEK derived from `BlackbookKey::file_dek_kek.handle_with_info(
+    /// b"managed-keys/v1")`. Seals every managed-key version's material at
+    /// rest (see [`crate::keys_api`]); derived once at boot like the others.
+    pub managed_key_kek: Arc<Vec<u8>>,
     /// In-memory registry of live client↔client tunnels (the relay pairs two
     /// mTLS-authenticated clients and forwards opaque E2E frames). Ephemeral —
     /// no DB row; see [`crate::tunnel_relay`].
@@ -488,7 +493,7 @@ impl FilePolicyQuery {
 
 /// Resolve the domain or return a 404 response. Also enforces membership for
 /// non-global-admins (admins skip this check).
-async fn resolve_and_gate_domain(
+pub(crate) async fn resolve_and_gate_domain(
     state: &AppState, client: &AuthenticatedClient, q: &DomainQuery,
 ) -> std::result::Result<(String, String), HttpResponse> {
     let domain_name = q.name();
@@ -507,7 +512,7 @@ async fn resolve_and_gate_domain(
     Ok((id, domain_name.to_string()))
 }
 
-fn err(status: StatusCode, code: &str, message: impl Into<String>) -> HttpResponse {
+pub(crate) fn err(status: StatusCode, code: &str, message: impl Into<String>) -> HttpResponse {
     HttpResponse::build(status).json(ErrorResponse {
         error: code.into(), message: message.into(), request_id: request_id(),
     })
@@ -3862,6 +3867,21 @@ pub async fn run_server(
             .route("/api/v1/files/{name}", web::get().to(download_file))
             .route("/api/v1/files/{name}", web::delete().to(delete_file))
             .route("/api/v1/files/{name}/rotate", web::post().to(rotate_file))
+            // Managed keys — encryption / signing / HMAC / tokens as a service
+            .route("/api/v1/keys", web::post().to(keys_api::create_key))
+            .route("/api/v1/keys", web::get().to(keys_api::list_keys))
+            .route("/api/v1/keys/{name}", web::get().to(keys_api::show_key))
+            .route("/api/v1/keys/{name}", web::delete().to(keys_api::delete_key))
+            .route("/api/v1/keys/{name}/jwks", web::get().to(keys_api::key_jwks))
+            .route("/api/v1/keys/{name}/rotate", web::post().to(keys_api::rotate_key))
+            .route("/api/v1/keys/{name}/encrypt", web::post().to(keys_api::encrypt))
+            .route("/api/v1/keys/{name}/decrypt", web::post().to(keys_api::decrypt))
+            .route("/api/v1/keys/{name}/datakey", web::post().to(keys_api::datakey))
+            .route("/api/v1/keys/{name}/sign", web::post().to(keys_api::sign))
+            .route("/api/v1/keys/{name}/hmac", web::post().to(keys_api::hmac))
+            .route("/api/v1/keys/{name}/verify", web::post().to(keys_api::verify))
+            .route("/api/v1/keys/{name}/token", web::post().to(keys_api::issue_token))
+            .route("/api/v1/keys/{name}/token/verify", web::post().to(keys_api::verify_token))
             // Admin
             .route("/api/v1/clients", web::post().to(create_client_endpoint))
             .route("/api/v1/clients", web::get().to(list_clients_endpoint))

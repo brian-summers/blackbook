@@ -525,6 +525,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hkdf",
+ "hmac",
  "home",
  "libc",
  "log",

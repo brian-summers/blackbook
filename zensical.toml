@@ -34,6 +34,7 @@ nav = [
     { "Web console" = "guides/web-console.md" },
     { "AI agents (MCP)" = "guides/mcp.md" },
     { "Secure tunnels" = "guides/tunnels.md" },
+    { "Crypto toolkit" = "guides/crypto.md" },
     { "Shell completion" = "guides/shell-completion.md" },
   ] },
   { "Reference" = [

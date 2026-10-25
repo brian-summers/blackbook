@@ -78,6 +78,10 @@ base32 = "0.4"
 # reqwest-websocket, so the tunnel reuses the same cert + pinned CA as the REST
 # API (no separate TLS config needed).
 hkdf = "0.12"
+# Real HMAC (RFC 2104) over SHA-2/SHA-3 for the user-facing crypto toolkit:
+# keyed hashes, managed `hmac` keys, and HS256 tokens. Already in the tree via
+# hkdf/pbkdf2; listed directly because crypto_ops uses it.
+hmac = "0.12"
 actix-ws = "0.3"
 reqwest-websocket = "0.4"
 # gzip for audit-log archives: old rows are exported to a compressed, encrypted,
