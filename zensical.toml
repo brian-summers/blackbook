@@ -27,6 +27,7 @@ nav = [
     { "Why Blackbook" = "getting-started/why-blackbook.md" },
     { "How it works" = "getting-started/how-it-works.md" },
     { "Quick start" = "getting-started/quick-start.md" },
+    { "CLI with Docker" = "getting-started/docker-cli.md" },
     { "Core concepts" = "getting-started/concepts.md" },
   ] },
   { "Guides" = [

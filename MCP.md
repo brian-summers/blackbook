@@ -137,8 +137,42 @@ isn't kept unlocked via `bbk unlock`, you can supply the passphrase in the
 server's environment (`"env": { "BLACKBOOK_PASSPHRASE": "…" }`), but prefer the
 unlock agent so the passphrase isn't stored in a config file.
 
+## Running it from Docker
+
+No local `bbk`? Run the published image as the MCP server instead. Use `-i`
+without `-t`: stdin and stdout carry the protocol.
+
+```bash
+# Offline crypto tools, in a container with no network interface at all:
+claude mcp add blackbook -- docker run --rm -i --network none briansummers/blackbook:latest mcp --offline
+
+# Read-only as the `agent` profile, kept in the `bbk-home` volume. Log in and
+# run `bbk -P agent unlock` through the same volume first. For a server on
+# another machine, drop the --network flag.
+claude mcp add blackbook -- docker run --rm -i -v bbk-home:/opt/blackbook/config -e HOME=/opt/blackbook/config --network blackbook_blackbook_network briansummers/blackbook:latest -P agent mcp
+```
+
+For Claude Desktop, make `docker` the command and pass the rest as `args`:
+
+```json
+{
+  "mcpServers": {
+    "blackbook": {
+      "command": "docker",
+      "args": ["run", "--rm", "-i",
+               "-v", "bbk-home:/opt/blackbook/config", "-e", "HOME=/opt/blackbook/config",
+               "--network", "blackbook_blackbook_network",
+               "briansummers/blackbook:latest", "-P", "agent", "mcp"]
+    }
+  }
+}
+```
+
+The volume, the network name, and logging in from Docker are covered in
+[Run the CLI with Docker](https://brian-summers.github.io/blackbook/getting-started/docker-cli/).
+
 ## Notes
 
-- Use the **release** build. (Provide `bbk` on `PATH`, e.g. via `cargo install --path .`.)
+- Use the **release** build. (Provide `bbk` on `PATH`, e.g. via `cargo install --path .`, or run the Docker image as above.)
 - The `bbkx1:` envelope is: `base64( "BBKX1" ‖ salt(16) ‖ AES-256-GCM(Argon2id(passphrase, salt), plaintext) )`.
   Anyone with the passphrase and `bbk_decrypt` (or the same construction) can open it — no server required.

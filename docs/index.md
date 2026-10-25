@@ -28,6 +28,8 @@ bbk get api-key                        # read it back
 bbk file put ./id_rsa --name ssh-key   # save a file
 ```
 
+No Rust toolchain? The Docker image is the CLI too: [run `bbk` from Docker](getting-started/docker-cli.md).
+
 ## Secure by default, not by configuration
 
 There's no "secure mode" to switch on, because there's no insecure mode to begin with. Every one of these is on out of the box:
