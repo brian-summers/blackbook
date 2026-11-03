@@ -260,6 +260,8 @@ Creates:
 
 Both scripts carry their own OpenSSL config, so they work with any OpenSSL build, including Windows builds (such as the one bundled with Strawberry Perl) whose default `openssl.cnf` is missing. To serve other names, edit `subjectAltName` in the script.
 
+`bbk` offers only the post-quantum `X25519MLKEM768` key exchange, so a proxy that terminates TLS must support it (nginx or HAProxy built on OpenSSL 3.5 or later).
+
 For production reverse-proxy certs obtain them from a trusted CA (DigiCert, Let's Encrypt, your organisation's CA). The Blackbook server itself will continue to use its own internal CA regardless of what the proxy presents to external clients.
 
 ---

@@ -3932,7 +3932,9 @@ pub async fn run_server(
                     .subject_name()
                     .entries_by_nid(openssl::nid::Nid::COMMONNAME)
                     .next()
-                    .and_then(|e| e.data().as_utf8().ok().map(|s| s.to_string()))
+                    // `to_string` keeps interior NULs, so a CN like
+                    // "alice\0x" can't be read back as "alice".
+                    .and_then(|e| e.data().to_string().ok())
                 {
                     ext.insert(PeerCertInfo { common_name: cn, fingerprint });
                 }

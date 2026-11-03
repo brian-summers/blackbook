@@ -40,7 +40,7 @@ There's no "secure mode" to switch on, because there's no insecure mode to begin
 
     ---
 
-    TLS 1.3 only, with *mandatory* mutual TLS. Every request must present both a client certificate and a token, and both must belong to the same identity.
+    TLS 1.3 only, with *mandatory* mutual TLS and, from the CLI, post-quantum key exchange. Every request must present both a client certificate and a token, and both must belong to the same identity.
 
 -   :lucide-database:{ .lg .middle } **Encrypted at rest, names included**
 

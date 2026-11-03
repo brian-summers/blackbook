@@ -32,7 +32,7 @@ Most tools make you *opt in* to safety: turn on encryption, enable two-factor, c
 
 | You get this, automatically | In plain terms |
 |---|---|
-| **Encrypted in transit (TLS 1.3)** | Nobody on the network can read what you send or receive. There is no unencrypted way to connect. |
+| **Encrypted in transit (TLS 1.3, post-quantum)** | Nobody on the network can read what you send or receive, now or later: the CLI's connection uses post-quantum key exchange, so traffic recorded today can't be decrypted by a future quantum computer. There is no unencrypted way to connect. |
 | **Two credentials required for every request** | Every command must prove itself with *both* a certificate *and* a token. A stolen token alone — or a copied certificate alone — is useless. |
 | **Encrypted at rest** | Secrets and files are encrypted before they're written to disk. A stolen copy of the database is just noise. |
 | **Even the *names* are hidden** | The database doesn't just hide your secret *values* — it also encrypts the *names* of your secrets, files, users, and groups. An attacker with full database access can't even tell what you're storing. |
@@ -590,7 +590,7 @@ Everything below is *optional reading*. Blackbook is safe without you understand
 
 ### The layered defense
 
-- **In transit:** TLS 1.3 only, modern AEAD ciphers, with compression and renegotiation disabled. Every request must present *both* a CA-issued client certificate (its Common Name and SHA3-256 fingerprint pinned to the client's row) *and* a matching bearer token — and both must resolve to the *same* client. There is no cert-only or token-only path.
+- **In transit:** TLS 1.3 only, modern AEAD ciphers, with compression and renegotiation disabled. The `bbk` CLI (REST calls and the tunnel WebSocket alike) offers only the hybrid post-quantum key exchange `X25519MLKEM768` (ML-KEM-768 combined with X25519), so traffic recorded today can't be decrypted by a future quantum computer; it refuses a server that can't negotiate it rather than fall back. It trusts only the Blackbook CA pinned in its profile, never public roots, and refuses a profile that has none (run `bbk login` again with the full bundle). The server prefers `X25519MLKEM768` too, but still accepts classical X25519 or P-256 from other TLS clients, such as `curl` for a health check; their requests still need the client certificate and token. Every request must present *both* a CA-issued client certificate (its Common Name and SHA3-256 fingerprint pinned to the client's row) *and* a matching bearer token — and both must resolve to the *same* client. There is no cert-only or token-only path.
 - **Credentials at rest (on your machine):** each profile is sealed with `Argon2id(passphrase, salt)` (64 MiB, t=3, p=1) → key → `AES-256-GCM` over the bundle. The passphrase is never stored; a stolen `~/.bbk` is inert without it. Each profile also carries a rotation-stable **Client Master Key**, so client-side-encrypted data survives credential rotation.
 - **Secrets at rest (on the server):** string secrets use a two-layer `AES-256-GCM` envelope (scrypt-derived, domain-separated keys); files use a random per-file key, AES-256-GCM, with the plaintext's SHA3-256 stored separately and verified on retrieval.
 - **Metadata at rest:** the database encrypts not just values but every user-supplied *identifier* — secret names, client names, domain names, permission patterns, file metadata, and audit messages — at the column level. Stable lookups go through domain-separated HMAC index columns. An attacker with full SQL access sees only opaque IDs, ciphertext, and timestamps.
@@ -695,6 +695,10 @@ The CLI reads a few variables of its own:
 <!-- --8<-- [start:limitations] -->
 
 - **True client-side Shamir shares.** Today's K-of-N approval is server-mediated: the server enforces the policy while the data key stays whole. Splitting the key into per-signatory client-encrypted shares — so the *server itself* can't reconstruct it — is the next defense-in-depth step, and the one remaining item from the original roadmap.
+- **Post-quantum protection covers confidentiality, not yet signatures.** Traffic between the CLI and the server uses a hybrid ML-KEM key exchange, and data at rest is AES-256, which quantum computers don't meaningfully weaken. Still classical:
+    - Certificates and signatures (ECDSA P-256, Ed25519). A quantum computer could forge these once it exists, but that wouldn't decrypt traffic recorded earlier.
+    - The end-to-end layer inside tunnels (X25519). Both hops to the server are post-quantum TLS, so only the relaying server itself could record that layer for later decryption.
+    - The server's link to PostgreSQL, because PostgreSQL 16 only negotiates P-256. PostgreSQL 18 on OpenSSL 3.5+ with `ssl_groups = 'X25519MLKEM768:X25519:prime256v1'` negotiates `X25519MLKEM768`, which Blackbook already offers first.
 - **Audit verification cost is linear** in the number of *live* rows. Archival bounds that set, but a single `audit --verify` still recomputes the whole live chain; there is no incremental/checkpointed verifier yet.
 
 <!-- --8<-- [end:limitations] -->

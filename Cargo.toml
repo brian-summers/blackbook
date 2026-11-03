@@ -24,7 +24,9 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # disk. Linux-gated, best-effort.
 libc = "0.2"
 tokio = { version = "1.35", features = ["full"] }
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "json"] }
+# TLS to Postgres runs on rustls with aws-lc-rs, the same crypto backend as
+# the CLI's HTTPS client below.
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "chrono", "json"] }
 zeroize = "1.6"
 scrypt = "0.11.0"
 # Argon2id for the password paths only (credential-bundle unlock + explicit
@@ -57,12 +59,18 @@ actix-web = { version = "4.4", features = ["openssl"] }
 actix-tls = { version = "3.0", features = ["openssl"] }
 actix-rt = "2.8"
 openssl = { version = "0.10", features = ["vendored"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# The CLI's HTTPS client. reqwest brings no crypto backend or root store of its
+# own: client.rs hands it a rustls config on aws-lc-rs that pins the Blackbook
+# CA and offers only the hybrid post-quantum X25519MLKEM768 key exchange (ring,
+# the previous backend, has no ML-KEM). `prefer-post-quantum` also puts that
+# group first for the Postgres link, so a Postgres that supports it picks it.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-manual-roots-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "logging"] }
 tokio-util = "0.7"
 futures-util = "0.3"
 dirs = "6"
 # Cert generation (CA + server + per-client) for TLS / mTLS.
-rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
 time = "0.3"
 # File uploads come in via raw PUT bodies, not multipart, so we don't need
 # actix-multipart. mime_guess sniffs Content-Type from filenames when the

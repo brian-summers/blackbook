@@ -5,9 +5,9 @@
 //! server issues that client a leaf certificate whose CN is the client name;
 //! the CN is later read out of the TLS handshake to identify the caller.
 //!
-//! We use rcgen (which uses ring) so we don't need OpenSSL just to mint a
-//! cert — that keeps the build self-contained. The certs are still consumed
-//! by the openssl-backed actix-tls acceptor at serve time.
+//! We use rcgen (on aws-lc-rs, the same backend as the CLI's TLS) so we don't
+//! need OpenSSL just to mint a cert. The certs are still consumed by the
+//! openssl-backed actix-tls acceptor at serve time.
 //!
 //! All keys/certs are ECDSA P-256 / SHA-256 — well-supported, ~2x faster
 //! than RSA, smaller than RSA, mature in every TLS 1.3 stack.

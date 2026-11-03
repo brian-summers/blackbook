@@ -16,7 +16,7 @@
 //! A legacy single-session file at `~/.bbk/session.json` is still read as the
 //! `default` profile if no `profiles/default.json` exists yet.
 
-use reqwest::{Client, Identity};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use zeroize::Zeroize;
@@ -55,7 +55,7 @@ pub enum ClientError {
     #[error("session file at {path}: {detail}")]
     SessionIo { path: String, detail: String },
 
-    #[error("http: {0}")]
+    #[error("http: {}", http_error_detail(.0))]
     Http(#[from] reqwest::Error),
 
     #[error("api error ({status}): {message}")]
@@ -72,6 +72,42 @@ pub enum ClientError {
 
     #[error("{0}")]
     Cred(#[from] crate::credstore::CredError),
+}
+
+/// A reqwest error with its causes. reqwest's own message for a failed
+/// connection is only "error sending request for url (…)"; why it failed (a
+/// TLS alert, an untrusted server certificate) is further down the chain.
+fn http_error_detail(e: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut out = e.to_string();
+    let mut no_common_tls = false;
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        let msg = c.to_string();
+        if !out.contains(&msg) {
+            out.push_str(": ");
+            out.push_str(&msg);
+        }
+        // rustls errors reach us wrapped in nested io::Errors (tokio-rustls's,
+        // then hyper-util's).
+        let mut inner: &(dyn std::error::Error + 'static) = c;
+        while let Some(next) = inner.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()) {
+            inner = next;
+        }
+        no_common_tls |= matches!(inner.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::PeerIncompatible(_))
+            | Some(rustls::Error::AlertReceived(
+                rustls::AlertDescription::HandshakeFailure
+                | rustls::AlertDescription::ProtocolVersion
+                | rustls::AlertDescription::InsufficientSecurity)));
+        cause = c.source();
+    }
+    if no_common_tls {
+        out.push_str(" (bbk connects only with TLS 1.3 and the post-quantum X25519MLKEM768 key \
+                      exchange; the server, or a proxy in front of it, must offer both, which \
+                      takes OpenSSL 3.5 or later)");
+    }
+    out
 }
 
 pub type Result<T> = std::result::Result<T, ClientError>;
@@ -707,37 +743,17 @@ pub struct MemberList { pub members: Vec<MemberSummary>, pub count: usize }
 
 impl BlackbookClient {
     pub fn from_session(session: &Session) -> Result<Self> {
-        let mut builder = reqwest::ClientBuilder::new()
+        // `login` refuses a bundle without the CA, so only a legacy profile can
+        // lack one. Refuse it too rather than connect without authenticating
+        // the server.
+        let ca_pem = session.ca_pem.as_deref().ok_or_else(|| ClientError::TlsConfig(
+            "this profile has no pinned Blackbook CA; run `bbk login` again with a full \
+             credential bundle".into()))?;
+        let tls = tls_config(ca_pem, session.cert_pem.as_deref(), session.key_pem.as_deref())?;
+        let http = reqwest::ClientBuilder::new()
             .timeout(std::time::Duration::from_secs(60))
-            .use_rustls_tls()
-            .min_tls_version(reqwest::tls::Version::TLS_1_3);
-
-        // Pin to the Blackbook CA if available; otherwise fall back to
-        // accept-invalid (only used during the very first `login` against
-        // a fresh server with self-signed certs).
-        if let Some(ca_pem) = &session.ca_pem {
-            let ca_cert = reqwest::Certificate::from_pem(ca_pem.as_bytes())
-                .map_err(|e| ClientError::TlsConfig(format!("ca cert: {e}")))?;
-            builder = builder
-                .add_root_certificate(ca_cert)
-                .tls_built_in_root_certs(false);
-        } else {
-            // First contact — operator has the CA, we don't yet. Allow the
-            // session to be created; the CA gets pinned on subsequent calls
-            // if the operator passes --ca to `login`.
-            builder = builder.danger_accept_invalid_certs(true);
-        }
-
-        // mTLS client identity, if we have one.
-        if let (Some(cert), Some(key)) = (&session.cert_pem, &session.key_pem) {
-            // reqwest's rustls backend wants a single PEM containing cert + key.
-            let combined = format!("{cert}\n{key}");
-            let identity = Identity::from_pem(combined.as_bytes())
-                .map_err(|e| ClientError::TlsConfig(format!("client identity: {e}")))?;
-            builder = builder.identity(identity);
-        }
-
-        let http = builder.build()?;
+            .use_preconfigured_tls(tls)
+            .build()?;
         let alias = std::env::var(LOOPBACK_SERVER_ENV).ok();
         Ok(Self {
             http,
@@ -1258,6 +1274,61 @@ pub struct KeySummary {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeyList { pub keys: Vec<KeySummary>, pub count: usize }
 
+/// The TLS policy for every connection to a Blackbook server, REST calls and
+/// the tunnel WebSocket alike:
+/// - TLS 1.3 only.
+/// - Key exchange: the hybrid post-quantum X25519MLKEM768 only, so recorded
+///   traffic can't be decrypted later by a quantum computer. There is no
+///   classical fallback: a server without it (built on OpenSSL < 3.5) fails
+///   the handshake.
+/// - The server's chain must lead to `ca_pem`, the profile's pinned Blackbook
+///   CA. No public roots are trusted.
+/// - The profile's mTLS client identity, if it has one. The private key's DER
+///   copy is wiped as soon as aws-lc has loaded it.
+fn tls_config(ca_pem: &str, cert_pem: Option<&str>, key_pem: Option<&str>) -> Result<rustls::ClientConfig> {
+    use rustls::crypto::aws_lc_rs;
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    use rustls::sign::{CertifiedKey, SingleCertAndKey};
+    use std::sync::Arc;
+
+    let bad = |what: &str, e: &dyn std::fmt::Display| ClientError::TlsConfig(format!("{what}: {e}"));
+
+    let mut provider = aws_lc_rs::default_provider();
+    provider.kx_groups = vec![aws_lc_rs::kx_group::X25519MLKEM768];
+
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+        roots.add(cert.map_err(|e| bad("ca cert", &e))?).map_err(|e| bad("ca cert", &e))?;
+    }
+    if roots.is_empty() {
+        return Err(ClientError::TlsConfig("ca cert: no certificate in the profile's CA PEM".into()));
+    }
+
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| bad("tls", &e))?
+        .with_root_certificates(roots);
+    let mut config = match (cert_pem, key_pem) {
+        (Some(cert), Some(key)) => {
+            let chain = CertificateDer::pem_slice_iter(cert.as_bytes())
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| bad("client cert", &e))?;
+            let mut key = PrivateKeyDer::from_pem_slice(key.as_bytes())
+                .map_err(|e| bad("client key", &e))?;
+            let signer = aws_lc_rs::sign::any_supported_type(&key);
+            key.zeroize();
+            let identity = CertifiedKey::new(chain, signer.map_err(|e| bad("client key", &e))?);
+            identity.keys_match().map_err(|e| bad("client identity", &e))?;
+            builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(identity)))
+        }
+        _ => builder.with_no_client_auth(),
+    };
+    // reqwest is built without HTTP/2, and the tunnel's WebSocket upgrade
+    // needs HTTP/1.1 anyway.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
 /// Names the server to reach in place of a loopback address; see
 /// [`redirect_loopback`]. `scripts/bbk` sets it when it runs the CLI in a
 /// container next to a local server.
@@ -1320,7 +1391,136 @@ fn urlencoding_simple(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::redirect_loopback;
+    use super::{redirect_loopback, tls_config, BlackbookClient, Session};
+    use crate::tls::{issue_client_cert, issue_server_cert, Ca, CertBundle};
+    use rustls::crypto::{aws_lc_rs, SupportedKxGroup};
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    use std::sync::Arc;
+
+    /// A server for `localhost`, with a cert from `ca`, that requires a client
+    /// cert from `ca` and offers only `groups` for key exchange.
+    fn server(ca: &Ca, groups: Vec<&'static dyn SupportedKxGroup>) -> rustls::ServerConnection {
+        let mut provider = aws_lc_rs::default_provider();
+        provider.kx_groups = groups;
+        let provider = Arc::new(provider);
+        let leaf = issue_server_cert(ca, &["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).unwrap()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots), provider.clone()).build().unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions().unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![CertificateDer::from_pem_slice(leaf.cert_pem.as_bytes()).unwrap()],
+                PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).unwrap())
+            .unwrap();
+        rustls::ServerConnection::new(Arc::new(config)).unwrap()
+    }
+
+    fn client(ca_pem: &str, id: &CertBundle) -> rustls::ClientConnection {
+        let config = tls_config(ca_pem, Some(&id.cert_pem), Some(&id.key_pem)).unwrap();
+        rustls::ClientConnection::new(Arc::new(config), "localhost".try_into().unwrap()).unwrap()
+    }
+
+    /// Run the handshake in memory; the first side to fail returns its error.
+    fn handshake(c: &mut rustls::ClientConnection, s: &mut rustls::ServerConnection) -> Result<(), rustls::Error> {
+        let mut buf = Vec::new();
+        for _ in 0..10 {
+            if !c.is_handshaking() && !s.is_handshaking() { return Ok(()); }
+            buf.clear();
+            c.write_tls(&mut buf).unwrap();
+            let mut rd = buf.as_slice();
+            while !rd.is_empty() { s.read_tls(&mut rd).unwrap(); s.process_new_packets()?; }
+            buf.clear();
+            s.write_tls(&mut buf).unwrap();
+            let mut rd = buf.as_slice();
+            while !rd.is_empty() { c.read_tls(&mut rd).unwrap(); c.process_new_packets()?; }
+        }
+        panic!("handshake did not finish");
+    }
+
+    #[test]
+    fn tls_negotiates_hybrid_pq_with_client_identity() {
+        let ca = Ca::generate().unwrap();
+        let alice = issue_client_cert(&ca, "alice", 1).unwrap();
+        let (mut c, mut s) = (client(&ca.cert_pem, &alice), server(&ca, aws_lc_rs::ALL_KX_GROUPS.to_vec()));
+        handshake(&mut c, &mut s).unwrap();
+        assert_eq!(c.negotiated_key_exchange_group().map(|g| g.name()), Some(rustls::NamedGroup::X25519MLKEM768));
+        assert_eq!(c.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
+        assert_eq!(s.peer_certificates().map(<[_]>::len), Some(1), "client cert presented");
+    }
+
+    #[test]
+    fn tls_refuses_classical_only_server() {
+        let ca = Ca::generate().unwrap();
+        let alice = issue_client_cert(&ca, "alice", 1).unwrap();
+        let classical = vec![aws_lc_rs::kx_group::X25519, aws_lc_rs::kx_group::SECP256R1, aws_lc_rs::kx_group::SECP384R1];
+        let (mut c, mut s) = (client(&ca.cert_pem, &alice), server(&ca, classical));
+        assert!(handshake(&mut c, &mut s).is_err());
+    }
+
+    /// Over a real connection, the CLI's message for that server says why
+    /// instead of just "error sending request".
+    #[tokio::test]
+    async fn classical_only_server_error_explains_why() {
+        let ca = Ca::generate().unwrap();
+        let alice = issue_client_cert(&ca, "alice", 1).unwrap();
+        let mut s = server(&ca, vec![aws_lc_rs::kx_group::X25519, aws_lc_rs::kx_group::SECP256R1]);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            assert!(s.complete_io(&mut sock).is_err());
+        });
+        let session = Session {
+            server: format!("https://localhost:{port}"), token: Some("t".into()),
+            cert_pem: Some(alice.cert_pem.clone()), key_pem: Some(alice.key_pem.clone()),
+            ca_pem: Some(ca.cert_pem.clone()), cmk: None,
+        };
+        let err = BlackbookClient::from_session(&session).unwrap().health().await.unwrap_err().to_string();
+        srv.join().unwrap();
+        assert!(err.contains("HandshakeFailure") && err.contains("X25519MLKEM768"), "{err}");
+    }
+
+    #[test]
+    fn tls_refuses_server_from_another_ca() {
+        let (ca, other) = (Ca::generate().unwrap(), Ca::generate().unwrap());
+        let alice = issue_client_cert(&ca, "alice", 1).unwrap();
+        let (mut c, mut s) = (client(&other.cert_pem, &alice), server(&ca, aws_lc_rs::ALL_KX_GROUPS.to_vec()));
+        let err = handshake(&mut c, &mut s).unwrap_err();
+        assert!(matches!(err, rustls::Error::InvalidCertificate(_)), "{err:?}");
+    }
+
+    #[test]
+    fn tls_config_policy_and_bad_material() {
+        let ca = Ca::generate().unwrap();
+        let (alice, bob) = (issue_client_cert(&ca, "alice", 1).unwrap(), issue_client_cert(&ca, "bob", 1).unwrap());
+        let cfg = tls_config(&ca.cert_pem, None, None).unwrap();
+        let groups: Vec<_> = cfg.crypto_provider().kx_groups.iter().map(|g| g.name()).collect();
+        assert_eq!(groups, [rustls::NamedGroup::X25519MLKEM768]);
+        assert_eq!(cfg.alpn_protocols, [b"http/1.1".to_vec()]);
+        assert!(!cfg.client_auth_cert_resolver.has_certs());
+        assert!(tls_config(&ca.cert_pem, Some(&alice.cert_pem), Some(&alice.key_pem)).unwrap()
+            .client_auth_cert_resolver.has_certs());
+        assert!(tls_config("not a pem", None, None).is_err(), "no CA");
+        assert!(tls_config(&ca.cert_pem, Some(&alice.cert_pem), Some(&bob.key_pem)).is_err(), "key mismatch");
+        assert!(tls_config(&ca.cert_pem, Some(&alice.cert_pem), Some("junk")).is_err(), "bad key");
+    }
+
+    #[test]
+    fn profile_without_ca_is_refused() {
+        let ca = Ca::generate().unwrap();
+        let alice = issue_client_cert(&ca, "alice", 1).unwrap();
+        let mut session = Session {
+            server: "https://127.0.0.1:8443".into(), token: Some("t".into()),
+            cert_pem: Some(alice.cert_pem.clone()), key_pem: Some(alice.key_pem.clone()),
+            ca_pem: None, cmk: None,
+        };
+        assert!(BlackbookClient::from_session(&session).is_err());
+        session.ca_pem = Some(ca.cert_pem.clone());
+        assert!(BlackbookClient::from_session(&session).is_ok());
+    }
 
     #[test]
     fn loopback_redirect() {
