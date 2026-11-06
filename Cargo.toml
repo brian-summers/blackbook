@@ -96,3 +96,32 @@ reqwest-websocket = "0.4"
 # hash-chain-verifiable file on the data volume so the live chain stays bounded.
 flate2 = "1"
 
+# Lints. CI and scripts/check.sh run `cargo clippy --all-targets -- -D warnings`,
+# so any warning not allowed here fails the build.
+[lints.rust]
+# The one audited `unsafe` block (process hardening in main.rs) carries an
+# explicit #[allow(unsafe_code)]; any other `unsafe` has to argue for its own.
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# Findings that predate the gate, allowed so it can block everything new from
+# the start. To burn one down, delete its line and fix what clippy reports.
+doc_lazy_continuation = "allow"
+io_other_error = "allow"
+manual_is_multiple_of = "allow"
+needless_borrow = "allow"
+needless_borrows_for_generic_args = "allow"
+print_literal = "allow"
+redundant_closure = "allow"
+result_large_err = "allow"
+single_match = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+unnecessary_map_or = "allow"
+useless_format = "allow"
+useless_vec = "allow"
+while_let_loop = "allow"
+

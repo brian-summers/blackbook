@@ -34,6 +34,22 @@ release. Pin to a tag and watch releases for advisories.
 | `main` / latest tag | ✅ |
 | older tags | ❌ |
 
+## Verifying a release image
+
+Release images are built only by `.github/workflows/release.yml`, from a tag on
+`main`, after the full test suite, a vulnerability scan and an end-to-end test
+have passed. Each one carries a build-provenance attestation signed through
+Sigstore, which ties the image digest to this repository, the workflow and the
+commit. Check it before you deploy:
+
+```bash
+gh attestation verify oci://ghcr.io/brian-summers/blackbook:<version> --repo brian-summers/blackbook
+```
+
+In production, deploy by digest (`ghcr.io/brian-summers/blackbook@sha256:…`,
+as printed in the release notes) rather than by a tag, so the image can't
+change underneath you.
+
 ## Scope
 
 In scope: the Blackbook server and CLI, the cryptographic envelopes, the

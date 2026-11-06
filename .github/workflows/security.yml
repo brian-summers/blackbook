@@ -1,0 +1,71 @@
+name: Security
+
+# Nightly checks for problems that appear without anyone pushing: a new RustSec
+# advisory against a crate already in Cargo.lock, or a new CVE in the published
+# image's OS packages. A failure here means "cut a patch release": update the
+# crate or the base-image digest, merge, tag. Image findings also appear under
+# Security → Code scanning.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security
+  cancel-in-progress: true
+
+jobs:
+  advisories:
+    name: advisories (cargo-deny, main)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked check advisories
+
+  image:
+    name: published image (Grype)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read # pull the published image
+      security-events: write # upload the SARIF report
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: pull
+        name: pull the latest release
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:latest"
+          if docker pull "$image"; then
+            echo "image=$image" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no published image yet; nothing to scan"
+          fi
+      - id: scan
+        if: steps.pull.outputs.image != ''
+        run: bash scripts/check.sh scan
+        env:
+          CI: "true"
+          BBK_IMAGE: ${{ steps.pull.outputs.image }}
+          BBK_SARIF: grype.sarif
+      - if: always() && steps.pull.outputs.image != '' && hashFiles('grype.sarif') != ''
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: grype.sarif
+          category: published-image

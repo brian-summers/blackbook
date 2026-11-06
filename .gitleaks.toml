@@ -1,0 +1,15 @@
+# gitleaks: secret scanning for commits (pre-commit hook, when gitleaks is
+# installed) and for the whole history (CI, `scripts/check.sh gitleaks`).
+# Gitleaks' default rules cover private keys and well-known cloud and SaaS
+# tokens; the rules below add Blackbook's own credentials, which no generic
+# scanner (GitHub's included) knows about.
+title = "Blackbook"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "blackbook-bearer-token"
+description = "Blackbook API bearer token (bbk_ + 32 random bytes, base64url); found in credential bundles"
+regex = '''bbk_[A-Za-z0-9_-]{43}(?:[^A-Za-z0-9_-]|$)'''
+keywords = ["bbk_"]

@@ -2,6 +2,9 @@
 
 <img width="1024" height="1024" alt="Blackbook secrets engine logo" src="https://github.com/user-attachments/assets/fb60334e-c31f-42ff-a29b-bf4f5b70cba8" />
 
+[![CI](https://github.com/brian-summers/blackbook/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/brian-summers/blackbook/actions/workflows/ci.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/brian-summers/blackbook/badge)](https://scorecard.dev/viewer/?uri=github.com/brian-summers/blackbook)
+
 The utmost in paranoid security. **Blackbook** is a self-hosted, open-source secrets manager written in Rust: an end-to-end-encrypted alternative to HashiCorp Vault with highest-security defaults, layers of encryption, rich ACLs, and a tamper-evident audit log, all served over mTLS. Stores secrets as strings or file objects. Open source for security's sake, with in-depth documentation on the internal workings. Deploys as a Docker container and can be driven from a pure CLI, a local web console, or AI agents over MCP.
 
 ---

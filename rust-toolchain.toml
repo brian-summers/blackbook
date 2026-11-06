@@ -1,0 +1,14 @@
+# The Rust toolchain for local builds, CI and the Docker image.
+#
+# Pinned so that rustfmt and `cargo clippy -- -D warnings` give the same verdict
+# on every machine: each stable release adds lints, and an unpinned toolchain
+# would turn CI red on an unrelated pull request the day one ships. Upgrades
+# arrive instead as one Dependabot pull request, which CI checks like any other.
+#
+# Keep the `rust:` builder image in the Dockerfile on the same version (CI fails
+# if they differ). `rust-version` in Cargo.toml is the separate minimum
+# supported version, checked by the `msrv` CI job.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

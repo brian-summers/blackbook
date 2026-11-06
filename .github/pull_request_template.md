@@ -20,7 +20,7 @@ allowed/denied paths you tested.
 
 How you verified the change (commands, added tests, manual steps).
 
-- [ ] `cargo test` passes
-- [ ] `cargo clippy --all-targets` reviewed
+- [ ] `scripts/check.sh` passes (the pre-push hook runs it)
+- [ ] Denied paths are tested, and assert why they're denied
 - [ ] Docs updated (`README.md` / `DEPLOYMENT.md`) if behavior or flags changed
 - [ ] No secrets, tokens, or bundle contents committed

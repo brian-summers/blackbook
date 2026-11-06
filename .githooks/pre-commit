@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Runs on `git commit` once hooks are enabled:  git config core.hooksPath .githooks
+# Seconds, not minutes: no secrets or credential bundles in the commit, and the
+# Rust code formatted. `git commit --no-verify` skips it, and CI runs the same
+# checks either way.
+exec bash "$(git rev-parse --show-toplevel)/scripts/check.sh" staged

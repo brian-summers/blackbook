@@ -1,0 +1,70 @@
+# cargo-deny: the dependency policy. CI runs `cargo deny check` on every push
+# and pull request and again every night against main (security.yml), and
+# scripts/check.sh runs it locally. Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Evaluate the dependency graph for every platform bbk ships on, so a crate that
+# only builds on Windows or macOS can't slip past a check run on Linux.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]
+
+[advisories]
+# RustSec advisories: vulnerabilities and unsound crates fail the check, and so
+# do unmaintained crates anywhere in the tree and yanked versions in Cargo.lock.
+unmaintained = "all"
+yanked = "deny"
+# Every exception names the advisory, why it doesn't apply or can't be fixed
+# yet, and when to look again. Remove the entry as soon as a fix is possible.
+ignore = [
+    # h2 0.3 (via actix-http's HTTP/2 support): a peer can make the server
+    # queue empty frames without limit, growing memory. Low severity; fixed only
+    # in h2 0.4, which actix-http 3 doesn't use. Remedy: serve HTTP/1.1 only, or
+    # move to an actix-http release on h2 0.4.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via actix-http; no 0.3 fix; see comment" },
+]
+
+[licenses]
+# Blackbook is AGPL-3.0-only, so every dependency must be under a licence that
+# can be combined with it. Anything not listed here fails the check and needs a
+# deliberate decision before it can be added.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+exceptions = [
+    # This crate.
+    { allow = ["AGPL-3.0-only"], crate = "blackbook" },
+]
+
+[bans]
+# Two versions of one crate is common in a tree this size; report it, don't fail.
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # The CLI's TLS and certificate code moved to aws-lc-rs for its post-quantum
+    # key exchange (ring has no ML-KEM). Keep ring from coming back by way of a
+    # dependency's default features.
+    { crate = "ring", reason = "TLS and rcgen run on aws-lc-rs; ring has no ML-KEM" },
+]
+
+[sources]
+# Crates come from crates.io only: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"

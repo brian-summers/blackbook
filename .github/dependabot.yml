@@ -1,0 +1,51 @@
+# Dependabot version updates. Security updates (for a dependency with a known
+# advisory) are separate: enable them under Settings → Advanced Security; they
+# ignore the schedule and cooldown below and open as soon as an advisory lands.
+#
+# Every update is an ordinary pull request, so CI (tests, cargo-deny, image
+# scan, end-to-end test) has to pass before it can merge. The cooldown lets a
+# new release age a week first: most malicious or broken releases are yanked
+# within days.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Base-image digests and the Rust builder version in the Dockerfile.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      docker:
+        patterns: ["*"]
+
+  # rust-toolchain.toml. The rust: image in the Dockerfile has to move with it
+  # (scripts/check.sh pins fails until both agree), so expect to merge this
+  # together with the matching docker update.
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday

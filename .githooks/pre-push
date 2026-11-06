@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Runs on `git push` once hooks are enabled:  git config core.hooksPath .githooks
+# The checks CI would fail a push on, minus the slow ones (Docker, MSRV, other
+# platforms): pins, rustfmt, clippy, tests, cargo-deny. A minute or two on an
+# incremental build. `git push --no-verify` skips it; CI doesn't.
+exec bash "$(git rev-parse --show-toplevel)/scripts/check.sh"

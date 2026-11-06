@@ -163,6 +163,27 @@ docker-compose down
 docker-compose down -v
 ```
 
+#### Or run a published image instead of building
+
+Each release is published as `ghcr.io/brian-summers/blackbook:<version>`, for
+`linux/amd64` and `linux/arm64`. To use it, put the release's digest (from its
+release notes) in a `docker-compose.override.yml` next to `docker-compose.yml`:
+
+```yaml
+services:
+  blackbook:
+    image: ghcr.io/brian-summers/blackbook@sha256:<digest>
+    pull_policy: always
+```
+
+Verify the image before the first start (see
+[Verifying a release image](https://brian-summers.github.io/blackbook/security/policy/#verifying-a-release-image)),
+then `docker compose up -d` pulls it rather than building:
+
+```bash
+gh attestation verify oci://ghcr.io/brian-summers/blackbook@sha256:<digest> --repo brian-summers/blackbook
+```
+
 ### 4. Verify Services
 
 ```bash
