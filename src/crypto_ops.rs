@@ -55,7 +55,9 @@ impl KeyType {
             "aes256-gcm" | "aes-256-gcm" | "aes256" | "aes" => Ok(Self::Aes256Gcm),
             "ed25519" => Ok(Self::Ed25519),
             "hmac" => Ok(Self::Hmac),
-            other => Err(format!("unknown key type '{other}' (use aes256-gcm, ed25519 or hmac)")),
+            other => Err(format!(
+                "unknown key type '{other}' (use aes256-gcm, ed25519 or hmac)"
+            )),
         }
     }
 
@@ -85,7 +87,11 @@ impl KeyType {
 
     pub fn check_material(self, material: &[u8]) -> Result<(), String> {
         if material.len() != KEY_LEN {
-            return Err(format!("{} keys are {KEY_LEN} bytes; got {}", self.as_str(), material.len()));
+            return Err(format!(
+                "{} keys are {KEY_LEN} bytes; got {}",
+                self.as_str(),
+                material.len()
+            ));
         }
         Ok(())
     }
@@ -104,7 +110,9 @@ impl KeyType {
 // ---------------------------------------------------------------------------
 
 fn ed25519_signing_key(seed: &[u8]) -> Result<ed25519_dalek::SigningKey, String> {
-    let seed: [u8; 32] = seed.try_into().map_err(|_| "Ed25519 seeds are 32 bytes".to_string())?;
+    let seed: [u8; 32] = seed
+        .try_into()
+        .map_err(|_| "Ed25519 seeds are 32 bytes".to_string())?;
     Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
 }
 
@@ -119,9 +127,14 @@ pub fn ed25519_sign(seed: &[u8], msg: &[u8]) -> Result<[u8; 64], String> {
 
 /// Strict verification (rejects small-order keys and malleable signatures).
 pub fn ed25519_verify(public: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
-    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public) else { return false };
-    let Ok(sig) = <[u8; 64]>::try_from(sig) else { return false };
-    vk.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(&sig)).is_ok()
+    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public) else {
+        return false;
+    };
+    let Ok(sig) = <[u8; 64]>::try_from(sig) else {
+        return false;
+    };
+    vk.verify_strict(msg, &ed25519_dalek::Signature::from_bytes(&sig))
+        .is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +142,12 @@ pub fn ed25519_verify(public: &[u8; 32], msg: &[u8], sig: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HashAlg { Sha3_256, Sha3_512, Sha256, Sha512 }
+pub enum HashAlg {
+    Sha3_256,
+    Sha3_512,
+    Sha256,
+    Sha512,
+}
 
 impl HashAlg {
     pub fn parse(s: &str) -> Result<Self, String> {
@@ -138,7 +156,9 @@ impl HashAlg {
             "sha3-512" | "sha3_512" => Ok(Self::Sha3_512),
             "sha256" | "sha-256" | "sha2-256" => Ok(Self::Sha256),
             "sha512" | "sha-512" | "sha2-512" => Ok(Self::Sha512),
-            other => Err(format!("unknown algorithm '{other}' (use sha3-256, sha3-512, sha256 or sha512)")),
+            other => Err(format!(
+                "unknown algorithm '{other}' (use sha3-256, sha3-512, sha256 or sha512)"
+            )),
         }
     }
 
@@ -167,21 +187,43 @@ macro_rules! with_hmac {
     ($alg:expr, $key:expr, |$m:ident| $body:expr) => {{
         use hmac::{Hmac, Mac};
         match $alg {
-            HashAlg::Sha3_256 => { let mut $m = Hmac::<sha3::Sha3_256>::new_from_slice($key).expect("HMAC accepts any key length"); $body }
-            HashAlg::Sha3_512 => { let mut $m = Hmac::<sha3::Sha3_512>::new_from_slice($key).expect("HMAC accepts any key length"); $body }
-            HashAlg::Sha256 => { let mut $m = Hmac::<sha2::Sha256>::new_from_slice($key).expect("HMAC accepts any key length"); $body }
-            HashAlg::Sha512 => { let mut $m = Hmac::<sha2::Sha512>::new_from_slice($key).expect("HMAC accepts any key length"); $body }
+            HashAlg::Sha3_256 => {
+                let mut $m = Hmac::<sha3::Sha3_256>::new_from_slice($key)
+                    .expect("HMAC accepts any key length");
+                $body
+            }
+            HashAlg::Sha3_512 => {
+                let mut $m = Hmac::<sha3::Sha3_512>::new_from_slice($key)
+                    .expect("HMAC accepts any key length");
+                $body
+            }
+            HashAlg::Sha256 => {
+                let mut $m = Hmac::<sha2::Sha256>::new_from_slice($key)
+                    .expect("HMAC accepts any key length");
+                $body
+            }
+            HashAlg::Sha512 => {
+                let mut $m = Hmac::<sha2::Sha512>::new_from_slice($key)
+                    .expect("HMAC accepts any key length");
+                $body
+            }
         }
     }};
 }
 
 pub fn hmac(alg: HashAlg, key: &[u8], data: &[u8]) -> Vec<u8> {
-    with_hmac!(alg, key, |m| { m.update(data); m.finalize().into_bytes().to_vec() })
+    with_hmac!(alg, key, |m| {
+        m.update(data);
+        m.finalize().into_bytes().to_vec()
+    })
 }
 
 /// Constant-time HMAC check.
 pub fn hmac_verify(alg: HashAlg, key: &[u8], data: &[u8], tag: &[u8]) -> bool {
-    with_hmac!(alg, key, |m| { m.update(data); m.verify_slice(tag).is_ok() })
+    with_hmac!(alg, key, |m| {
+        m.update(data);
+        m.verify_slice(tag).is_ok()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +241,9 @@ pub fn parse_versioned(s: &str) -> Result<(i32, Vec<u8>), String> {
     let rest = s.trim().strip_prefix(MANAGED_PREFIX).ok_or_else(bad)?;
     let (ver, body) = rest.split_once(':').ok_or_else(bad)?;
     let ver: i32 = ver.parse().map_err(|_| bad())?;
-    if ver < 1 { return Err(bad()); }
+    if ver < 1 {
+        return Err(bad());
+    }
     let bytes = B64.decode(body).map_err(|_| bad())?;
     Ok((ver, bytes))
 }
@@ -219,26 +263,43 @@ const PASSPHRASE_SALT_LEN: usize = 16;
 
 /// What produced a piece of ciphertext text, judged by its prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EnvelopeKind { Managed, DataKey, Passphrase, Cmk, RawKey }
+pub enum EnvelopeKind {
+    Managed,
+    DataKey,
+    Passphrase,
+    Cmk,
+    RawKey,
+}
 
 pub fn detect(s: &str) -> Option<EnvelopeKind> {
     let s = s.trim_start();
-    if s.starts_with(MANAGED_PREFIX) { Some(EnvelopeKind::Managed) }
-    else if s.starts_with(DATAKEY_PREFIX) { Some(EnvelopeKind::DataKey) }
-    else if s.starts_with(PASSPHRASE_PREFIX) { Some(EnvelopeKind::Passphrase) }
-    else if s.starts_with(CMK_PREFIX) { Some(EnvelopeKind::Cmk) }
-    else if s.starts_with(RAWKEY_PREFIX) { Some(EnvelopeKind::RawKey) }
-    else { None }
+    if s.starts_with(MANAGED_PREFIX) {
+        Some(EnvelopeKind::Managed)
+    } else if s.starts_with(DATAKEY_PREFIX) {
+        Some(EnvelopeKind::DataKey)
+    } else if s.starts_with(PASSPHRASE_PREFIX) {
+        Some(EnvelopeKind::Passphrase)
+    } else if s.starts_with(CMK_PREFIX) {
+        Some(EnvelopeKind::Cmk)
+    } else if s.starts_with(RAWKEY_PREFIX) {
+        Some(EnvelopeKind::RawKey)
+    } else {
+        None
+    }
 }
 
 fn strip_b64(s: &str, prefix: &str) -> Result<Vec<u8>, String> {
-    let body = s.trim().strip_prefix(prefix)
+    let body = s
+        .trim()
+        .strip_prefix(prefix)
         .ok_or_else(|| format!("not a Blackbook envelope (expected a '{prefix}' prefix)"))?;
-    B64.decode(body).map_err(|e| format!("envelope is not valid base64: {e}"))
+    B64.decode(body)
+        .map_err(|e| format!("envelope is not valid base64: {e}"))
 }
 
 fn open_err(_: crate::blackbook_core::CryptoError) -> String {
-    "decryption failed — wrong key/passphrase, wrong associated data, or a corrupted envelope".into()
+    "decryption failed — wrong key/passphrase, wrong associated data, or a corrupted envelope"
+        .into()
 }
 
 /// `bbkx1:` + base64(`BBKX1` ‖ salt(16) ‖ AES-256-GCM(Argon2id(pass, salt), pt)).
@@ -270,8 +331,11 @@ pub fn passphrase_open(envelope: &str, passphrase: &str, aad: &[u8]) -> Result<V
 pub fn cmk_subkey(cmk: &[u8], purpose: &str) -> Zeroizing<[u8; 32]> {
     let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, cmk);
     let mut out = Zeroizing::new([0u8; 32]);
-    hk.expand(format!("blackbook/crypto/cmk/{purpose}/v1").as_bytes(), out.as_mut_slice())
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    hk.expand(
+        format!("blackbook/crypto/cmk/{purpose}/v1").as_bytes(),
+        out.as_mut_slice(),
+    )
+    .expect("32 bytes is a valid HKDF-SHA256 output length");
     out
 }
 
@@ -304,7 +368,12 @@ pub fn rawkey_open(envelope: &str, key: &[u8], aad: &[u8]) -> Result<Vec<u8>, St
 /// `wrapped` is the data key as ciphertext of a managed key (`bbk:v<N>:…`)
 /// and the payload is sealed locally under the plaintext data key. The data
 /// never reaches the server; only the 32-byte data key is ever unwrapped there.
-pub fn datakey_seal(plaintext: &[u8], dek: &[u8], wrapped: &str, aad: &[u8]) -> Result<String, String> {
+pub fn datakey_seal(
+    plaintext: &[u8],
+    dek: &[u8],
+    wrapped: &str,
+    aad: &[u8],
+) -> Result<String, String> {
     let w = wrapped.as_bytes();
     let len = u16::try_from(w.len()).map_err(|_| "wrapped data key is too long".to_string())?;
     let sealed = aead_seal_aad(plaintext, dek, aad).map_err(|e| e.to_string())?;
@@ -321,10 +390,14 @@ pub fn datakey_parse(envelope: &str) -> Result<(String, Vec<u8>), String> {
     let buf = strip_b64(envelope, DATAKEY_PREFIX)?;
     let bad = || "corrupted or truncated envelope".to_string();
     let m = DATAKEY_MAGIC.len();
-    if buf.len() < m + 2 || &buf[..m] != DATAKEY_MAGIC { return Err(bad()); }
+    if buf.len() < m + 2 || &buf[..m] != DATAKEY_MAGIC {
+        return Err(bad());
+    }
     let len = u16::from_be_bytes([buf[m], buf[m + 1]]) as usize;
     let start = m + 2;
-    if buf.len() < start + len { return Err(bad()); }
+    if buf.len() < start + len {
+        return Err(bad());
+    }
     let wrapped = String::from_utf8(buf[start..start + len].to_vec()).map_err(|_| bad())?;
     Ok((wrapped, buf[start + len..].to_vec()))
 }
@@ -354,7 +427,10 @@ pub enum TokenVerifier<'a> {
 
 impl TokenVerifier<'_> {
     fn alg(&self) -> &'static str {
-        match self { Self::Ed25519(_) => "EdDSA", Self::Hmac(_) => "HS256" }
+        match self {
+            Self::Ed25519(_) => "EdDSA",
+            Self::Hmac(_) => "HS256",
+        }
     }
 }
 
@@ -373,18 +449,30 @@ pub struct TokenRequest {
 
 pub fn token_claims(req: TokenRequest, now: i64) -> Result<Map<String, Value>, String> {
     if req.ttl_secs < 1 || req.ttl_secs > TOKEN_MAX_TTL_SECS {
-        return Err(format!("ttl must be between 1 second and {TOKEN_MAX_TTL_SECS} seconds"));
+        return Err(format!(
+            "ttl must be between 1 second and {TOKEN_MAX_TTL_SECS} seconds"
+        ));
     }
     let mut c = req.claims;
-    if let Some(s) = req.subject { c.insert("sub".into(), json!(s)); }
-    if let Some(a) = req.audience { c.insert("aud".into(), json!(a)); }
-    if let Some(i) = req.issuer { c.insert("iss".into(), json!(i)); }
+    if let Some(s) = req.subject {
+        c.insert("sub".into(), json!(s));
+    }
+    if let Some(a) = req.audience {
+        c.insert("aud".into(), json!(a));
+    }
+    if let Some(i) = req.issuer {
+        c.insert("iss".into(), json!(i));
+    }
     c.insert("iat".into(), json!(now));
     c.insert("exp".into(), json!(now + req.ttl_secs));
     match req.not_before_secs {
         Some(n) if n < 0 => return Err("not-before offset can't be negative".into()),
-        Some(n) => { c.insert("nbf".into(), json!(now + n)); }
-        None => { c.remove("nbf"); }
+        Some(n) => {
+            c.insert("nbf".into(), json!(now + n));
+        }
+        None => {
+            c.remove("nbf");
+        }
     }
     let mut jti = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut jti);
@@ -392,10 +480,19 @@ pub fn token_claims(req: TokenRequest, now: i64) -> Result<Map<String, Value>, S
     Ok(c)
 }
 
-pub fn token_issue(signer: &TokenSigner, kid: Option<&str>, claims: &Map<String, Value>) -> Result<String, String> {
-    let alg = match signer { TokenSigner::Ed25519(_) => "EdDSA", TokenSigner::Hmac(_) => "HS256" };
+pub fn token_issue(
+    signer: &TokenSigner,
+    kid: Option<&str>,
+    claims: &Map<String, Value>,
+) -> Result<String, String> {
+    let alg = match signer {
+        TokenSigner::Ed25519(_) => "EdDSA",
+        TokenSigner::Hmac(_) => "HS256",
+    };
     let mut header = json!({ "alg": alg, "typ": "JWT" });
-    if let Some(k) = kid { header["kid"] = json!(k); }
+    if let Some(k) = kid {
+        header["kid"] = json!(k);
+    }
     let signing_input = format!(
         "{}.{}",
         B64URL.encode(serde_json::to_vec(&header).map_err(|e| e.to_string())?),
@@ -417,7 +514,9 @@ fn token_parts(token: &str) -> Result<(&str, &str, &str), String> {
 }
 
 fn token_json(part: &str, what: &str) -> Result<Map<String, Value>, String> {
-    let bytes = B64URL.decode(part).map_err(|_| format!("malformed token {what}"))?;
+    let bytes = B64URL
+        .decode(part)
+        .map_err(|_| format!("malformed token {what}"))?;
     match serde_json::from_slice::<Value>(&bytes) {
         Ok(Value::Object(m)) => Ok(m),
         _ => Err(format!("malformed token {what}")),
@@ -433,7 +532,10 @@ pub fn token_header(token: &str) -> Result<Map<String, Value>, String> {
 /// Verify signature, algorithm, `exp`, `nbf` and (when given) audience.
 /// Returns the claims on success, or the reason it's invalid.
 pub fn token_verify(
-    token: &str, verifier: &TokenVerifier, now: i64, audience: Option<&str>,
+    token: &str,
+    verifier: &TokenVerifier,
+    now: i64,
+    audience: Option<&str>,
 ) -> Result<Map<String, Value>, String> {
     let (h, p, s) = token_parts(token)?;
     let header = token_json(h, "header")?;
@@ -441,23 +543,36 @@ pub fn token_verify(
     // never an HMAC token checked against an Ed25519 public key or vice versa.
     let alg = header.get("alg").and_then(Value::as_str).unwrap_or("");
     if alg != verifier.alg() {
-        return Err(format!("algorithm mismatch: token is '{alg}' but this key verifies '{}'", verifier.alg()));
+        return Err(format!(
+            "algorithm mismatch: token is '{alg}' but this key verifies '{}'",
+            verifier.alg()
+        ));
     }
-    let sig = B64URL.decode(s).map_err(|_| "malformed token signature".to_string())?;
+    let sig = B64URL
+        .decode(s)
+        .map_err(|_| "malformed token signature".to_string())?;
     let signing_input = &token.trim()[..h.len() + 1 + p.len()];
     let ok = match verifier {
         TokenVerifier::Ed25519(pk) => ed25519_verify(pk, signing_input.as_bytes(), &sig),
-        TokenVerifier::Hmac(key) => hmac_verify(HashAlg::Sha256, key, signing_input.as_bytes(), &sig),
+        TokenVerifier::Hmac(key) => {
+            hmac_verify(HashAlg::Sha256, key, signing_input.as_bytes(), &sig)
+        }
     };
-    if !ok { return Err("bad signature".into()); }
+    if !ok {
+        return Err("bad signature".into());
+    }
     let claims = token_json(p, "payload")?;
     if let Some(exp) = claims.get("exp") {
         let exp = exp.as_i64().ok_or("malformed 'exp' claim")?;
-        if now > exp + TOKEN_LEEWAY_SECS { return Err(format!("expired at {}", fmt_unix(exp))); }
+        if now > exp + TOKEN_LEEWAY_SECS {
+            return Err(format!("expired at {}", fmt_unix(exp)));
+        }
     }
     if let Some(nbf) = claims.get("nbf") {
         let nbf = nbf.as_i64().ok_or("malformed 'nbf' claim")?;
-        if now + TOKEN_LEEWAY_SECS < nbf { return Err(format!("not valid before {}", fmt_unix(nbf))); }
+        if now + TOKEN_LEEWAY_SECS < nbf {
+            return Err(format!("not valid before {}", fmt_unix(nbf)));
+        }
     }
     if let Some(want) = audience {
         let matches = match claims.get("aud") {
@@ -465,12 +580,16 @@ pub fn token_verify(
             Some(Value::Array(v)) => v.iter().any(|a| a.as_str() == Some(want)),
             _ => false,
         };
-        if !matches { return Err(format!("audience mismatch: token is not for '{want}'")); }
+        if !matches {
+            return Err(format!("audience mismatch: token is not for '{want}'"));
+        }
     }
     Ok(claims)
 }
 
-pub fn now_unix() -> i64 { chrono::Utc::now().timestamp() }
+pub fn now_unix() -> i64 {
+    chrono::Utc::now().timestamp()
+}
 
 pub fn fmt_unix(t: i64) -> String {
     chrono::DateTime::from_timestamp(t, 0)
@@ -484,8 +603,12 @@ pub fn fmt_unix(t: i64) -> String {
 
 /// DER prefixes for Ed25519 keys (RFC 8410): SubjectPublicKeyInfo and a
 /// PKCS#8 v1 PrivateKeyInfo; each is followed by the 32 raw key bytes.
-const ED25519_SPKI_PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
-const ED25519_PKCS8_PREFIX: [u8; 16] = [0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
+const ED25519_PKCS8_PREFIX: [u8; 16] = [
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
 
 fn pem_wrap(label: &str, der: &[u8]) -> String {
     let b64 = B64.encode(der);
@@ -503,7 +626,10 @@ fn pem_body(text: &str, label: &str) -> Option<Vec<u8>> {
     let end = format!("-----END {label}-----");
     let start = text.find(&begin)? + begin.len();
     let stop = text[start..].find(&end)? + start;
-    let body: String = text[start..stop].chars().filter(|c| !c.is_whitespace()).collect();
+    let body: String = text[start..stop]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     B64.decode(body).ok()
 }
 
@@ -537,7 +663,8 @@ pub struct LocalKey {
 
 /// The JSON key-file format written by `bbk crypto keygen`.
 pub fn local_key_json(key_type: KeyType, secret: &[u8]) -> Zeroizing<String> {
-    let mut v = json!({ "blackbook_key": 1, "type": key_type.as_str(), "secret": B64.encode(secret) });
+    let mut v =
+        json!({ "blackbook_key": 1, "type": key_type.as_str(), "secret": B64.encode(secret) });
     if let Some(pk) = key_type.public_key(secret) {
         v["public"] = json!(B64.encode(pk));
     }
@@ -548,9 +675,13 @@ pub fn local_key_json(key_type: KeyType, secret: &[u8]) -> Zeroizing<String> {
 fn text_key_bytes(text: &str) -> Option<Vec<u8>> {
     let t = text.trim();
     if t.len() == 64 {
-        if let Ok(b) = hex::decode(t) { return Some(b); }
+        if let Ok(b) = hex::decode(t) {
+            return Some(b);
+        }
     }
-    B64.decode(t).ok().or_else(|| B64URL.decode(t.trim_end_matches('=')).ok())
+    B64.decode(t)
+        .ok()
+        .or_else(|| B64URL.decode(t.trim_end_matches('=')).ok())
         .filter(|b| b.len() == KEY_LEN)
 }
 
@@ -561,29 +692,48 @@ pub fn parse_local_key(bytes: &[u8], hint: Option<KeyType>) -> Result<LocalKey, 
     if let Ok(text) = std::str::from_utf8(bytes) {
         if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(text) {
             let key_type = KeyType::parse(m.get("type").and_then(Value::as_str).unwrap_or(""))?;
-            let secret = m.get("secret").and_then(Value::as_str)
+            let secret = m
+                .get("secret")
+                .and_then(Value::as_str)
                 .ok_or("this key file has no secret (it may be a public key — use --public-key)")?;
-            let secret = Zeroizing::new(B64.decode(secret).map_err(|_| "key file secret is not base64")?);
+            let secret = Zeroizing::new(
+                B64.decode(secret)
+                    .map_err(|_| "key file secret is not base64")?,
+            );
             key_type.check_material(&secret)?;
             return Ok(LocalKey { key_type, secret });
         }
         if let Some(der) = pem_body(text, "PRIVATE KEY") {
             let der = Zeroizing::new(der);
-            if der.len() == ED25519_PKCS8_PREFIX.len() + KEY_LEN && der.starts_with(&ED25519_PKCS8_PREFIX) {
+            if der.len() == ED25519_PKCS8_PREFIX.len() + KEY_LEN
+                && der.starts_with(&ED25519_PKCS8_PREFIX)
+            {
                 let secret = Zeroizing::new(der[ED25519_PKCS8_PREFIX.len()..].to_vec());
-                return Ok(LocalKey { key_type: KeyType::Ed25519, secret });
+                return Ok(LocalKey {
+                    key_type: KeyType::Ed25519,
+                    secret,
+                });
             }
             return Err("unsupported PEM private key (only Ed25519 PKCS#8 is supported)".into());
         }
         if let Some(b) = text_key_bytes(text) {
-            return Ok(LocalKey { key_type: hint.unwrap_or(KeyType::Aes256Gcm), secret: Zeroizing::new(b) });
+            return Ok(LocalKey {
+                key_type: hint.unwrap_or(KeyType::Aes256Gcm),
+                secret: Zeroizing::new(b),
+            });
         }
     }
     if bytes.len() == KEY_LEN {
-        return Ok(LocalKey { key_type: hint.unwrap_or(KeyType::Aes256Gcm), secret: Zeroizing::new(bytes.to_vec()) });
+        return Ok(LocalKey {
+            key_type: hint.unwrap_or(KeyType::Aes256Gcm),
+            secret: Zeroizing::new(bytes.to_vec()),
+        });
     }
-    Err("unrecognized key file (expected a `bbk crypto keygen` file, an Ed25519 PEM, \
-         or 32 raw / hex / base64 key bytes)".into())
+    Err(
+        "unrecognized key file (expected a `bbk crypto keygen` file, an Ed25519 PEM, \
+         or 32 raw / hex / base64 key bytes)"
+            .into(),
+    )
 }
 
 /// Parse an Ed25519 public key from text: the `keygen` JSON (public or
@@ -591,17 +741,25 @@ pub fn parse_local_key(bytes: &[u8], hint: Option<KeyType>) -> Result<LocalKey, 
 pub fn parse_public_key(text: &str) -> Result<[u8; 32], String> {
     if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(text) {
         if let Some(p) = m.get("public").and_then(Value::as_str) {
-            return B64.decode(p).ok().and_then(|b| b.try_into().ok())
+            return B64
+                .decode(p)
+                .ok()
+                .and_then(|b| b.try_into().ok())
                 .ok_or_else(|| "public key in file is not 32 base64 bytes".to_string());
         }
         if let Some(x) = m.get("x").and_then(Value::as_str) {
-            return B64URL.decode(x).ok().and_then(|b| b.try_into().ok())
+            return B64URL
+                .decode(x)
+                .ok()
+                .and_then(|b| b.try_into().ok())
                 .ok_or_else(|| "JWK 'x' is not a 32-byte Ed25519 key".to_string());
         }
     }
     if let Some(der) = pem_body(text, "PUBLIC KEY") {
         if der.len() == ED25519_SPKI_PREFIX.len() + 32 && der.starts_with(&ED25519_SPKI_PREFIX) {
-            return Ok(der[ED25519_SPKI_PREFIX.len()..].try_into().expect("length checked"));
+            return Ok(der[ED25519_SPKI_PREFIX.len()..]
+                .try_into()
+                .expect("length checked"));
         }
         return Err("unsupported PEM public key (only Ed25519 is supported)".into());
     }
@@ -610,18 +768,26 @@ pub fn parse_public_key(text: &str) -> Result<[u8; 32], String> {
     if pem_body(text, "PRIVATE KEY").is_some() {
         return ed25519_public(&parse_local_key(text.as_bytes(), None)?.secret);
     }
-    text_key_bytes(text).and_then(|b| b.try_into().ok())
-        .ok_or_else(|| "unrecognized public key (expected base64/hex, PEM, JWK or a keygen file)".into())
+    text_key_bytes(text)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| {
+            "unrecognized public key (expected base64/hex, PEM, JWK or a keygen file)".into()
+        })
 }
 
 /// Decode a signature or MAC given as `bbk:v<N>:`, base64, base64url or hex.
 pub fn parse_tag(s: &str) -> Result<Vec<u8>, String> {
     let t = s.trim();
-    if t.starts_with(MANAGED_PREFIX) { return parse_versioned(t).map(|(_, b)| b); }
-    if t.len().is_multiple_of(2) && t.chars().all(|c| c.is_ascii_hexdigit()) {
-        if let Ok(b) = hex::decode(t) { return Ok(b); }
+    if t.starts_with(MANAGED_PREFIX) {
+        return parse_versioned(t).map(|(_, b)| b);
     }
-    B64.decode(t).or_else(|_| B64URL.decode(t.trim_end_matches('=')))
+    if t.len().is_multiple_of(2) && t.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(b) = hex::decode(t) {
+            return Ok(b);
+        }
+    }
+    B64.decode(t)
+        .or_else(|_| B64URL.decode(t.trim_end_matches('=')))
         .map_err(|_| "signature is not hex, base64 or 'bbk:v<N>:' text".into())
 }
 
@@ -638,7 +804,8 @@ pub fn password_hash(password: &str) -> Result<String, String> {
     let salt = SaltString::encode_b64(&salt).map_err(|e| e.to_string())?;
     let params = argon2::Params::new(64 * 1024, 3, 1, None).map_err(|e| e.to_string())?;
     let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-    argon.hash_password(password.as_bytes(), &salt)
+    argon
+        .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| e.to_string())
 }
@@ -646,12 +813,19 @@ pub fn password_hash(password: &str) -> Result<String, String> {
 /// Check a password against a PHC string (cost parameters come from the string).
 pub fn password_verify(password: &str, phc: &str) -> Result<bool, String> {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
-    let parsed = PasswordHash::new(phc.trim()).map_err(|e| format!("not a PHC password hash: {e}"))?;
-    Ok(argon2::Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+    let parsed =
+        PasswordHash::new(phc.trim()).map_err(|e| format!("not a PHC password hash: {e}"))?;
+    Ok(argon2::Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum KdfAlg { Argon2id, Scrypt, Pbkdf2 }
+pub enum KdfAlg {
+    Argon2id,
+    Scrypt,
+    Pbkdf2,
+}
 
 impl KdfAlg {
     pub fn parse(s: &str) -> Result<Self, String> {
@@ -659,19 +833,29 @@ impl KdfAlg {
             "argon2id" | "argon2" => Ok(Self::Argon2id),
             "scrypt" => Ok(Self::Scrypt),
             "pbkdf2" | "pbkdf2-sha3-512" => Ok(Self::Pbkdf2),
-            other => Err(format!("unknown algorithm '{other}' (use argon2id, scrypt or pbkdf2)")),
+            other => Err(format!(
+                "unknown algorithm '{other}' (use argon2id, scrypt or pbkdf2)"
+            )),
         }
     }
 
     pub fn as_str(self) -> &'static str {
-        match self { Self::Argon2id => "argon2id", Self::Scrypt => "scrypt", Self::Pbkdf2 => "pbkdf2-sha3-512" }
+        match self {
+            Self::Argon2id => "argon2id",
+            Self::Scrypt => "scrypt",
+            Self::Pbkdf2 => "pbkdf2-sha3-512",
+        }
     }
 }
 
 /// Derive a 256-bit key from a passphrase with the same parameters Blackbook
 /// uses internally: Argon2id (64 MiB, t=3, p=1), scrypt (N=2¹², r=16, p=4), or
 /// PBKDF2-HMAC-SHA3-512 (200,000 iterations).
-pub fn derive_key(alg: KdfAlg, passphrase: &str, salt: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+pub fn derive_key(
+    alg: KdfAlg,
+    passphrase: &str,
+    salt: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, String> {
     match alg {
         KdfAlg::Argon2id => credstore::argon2_key(passphrase, salt)
             .map(|(k, _, _, _)| Zeroizing::new(k.to_vec()))
@@ -699,7 +883,9 @@ pub fn encode(bytes: &[u8], encoding: &str) -> Result<String, String> {
         "hex" => Ok(hex::encode(bytes)),
         "base64" => Ok(B64.encode(bytes)),
         "base64url" | "token" => Ok(B64URL.encode(bytes)),
-        other => Err(format!("unknown encoding '{other}' (use hex, base64, base64url or token)")),
+        other => Err(format!(
+            "unknown encoding '{other}' (use hex, base64, base64url or token)"
+        )),
     }
 }
 
@@ -710,17 +896,33 @@ mod tests {
     #[test]
     fn hmac_sha256_matches_rfc4231_case_2() {
         let tag = hmac(HashAlg::Sha256, b"Jefe", b"what do ya want for nothing?");
-        assert_eq!(hex::encode(&tag),
-                   "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
-        assert!(hmac_verify(HashAlg::Sha256, b"Jefe", b"what do ya want for nothing?", &tag));
-        assert!(!hmac_verify(HashAlg::Sha256, b"Jefe", b"what do ya want for nothing!", &tag));
+        assert_eq!(
+            hex::encode(&tag),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        assert!(hmac_verify(
+            HashAlg::Sha256,
+            b"Jefe",
+            b"what do ya want for nothing?",
+            &tag
+        ));
+        assert!(!hmac_verify(
+            HashAlg::Sha256,
+            b"Jefe",
+            b"what do ya want for nothing!",
+            &tag
+        ));
     }
 
     #[test]
     fn ed25519_matches_rfc8032_test_1() {
-        let seed = hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60").unwrap();
+        let seed = hex::decode("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
+            .unwrap();
         let pk = ed25519_public(&seed).unwrap();
-        assert_eq!(hex::encode(pk), "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        assert_eq!(
+            hex::encode(pk),
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+        );
         let sig = ed25519_sign(&seed, b"").unwrap();
         assert_eq!(hex::encode(sig),
             "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b");
@@ -730,10 +932,14 @@ mod tests {
 
     #[test]
     fn digests_match_known_vectors() {
-        assert_eq!(hex::encode(digest(HashAlg::Sha3_256, b"")),
-                   "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a");
-        assert_eq!(hex::encode(digest(HashAlg::Sha256, b"abc")),
-                   "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(
+            hex::encode(digest(HashAlg::Sha3_256, b"")),
+            "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"
+        );
+        assert_eq!(
+            hex::encode(digest(HashAlg::Sha256, b"abc")),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
@@ -772,7 +978,10 @@ mod tests {
         let env = passphrase_seal(b"top secret", "correct horse", b"").unwrap();
         assert!(env.starts_with(PASSPHRASE_PREFIX));
         assert!(!env.contains("top secret"));
-        assert_eq!(passphrase_open(&env, "correct horse", b"").unwrap(), b"top secret");
+        assert_eq!(
+            passphrase_open(&env, "correct horse", b"").unwrap(),
+            b"top secret"
+        );
         assert!(passphrase_open(&env, "wrong", b"").is_err());
         assert!(passphrase_open("bbkx1:not-base64!!", "x", b"").is_err());
         assert!(passphrase_open("no-prefix", "x", b"").is_err());
@@ -782,7 +991,13 @@ mod tests {
         let mut claims = Map::new();
         claims.insert("role".into(), json!("reader"));
         claims.insert("exp".into(), json!(i64::MAX)); // must be overridden
-        TokenRequest { claims, subject: Some("svc-a".into()), audience: Some("api".into()), ttl_secs: ttl, ..Default::default() }
+        TokenRequest {
+            claims,
+            subject: Some("svc-a".into()),
+            audience: Some("api".into()),
+            ttl_secs: ttl,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -799,17 +1014,32 @@ mod tests {
         let got = token_verify(&tok, &v, now + 10, Some("api")).unwrap();
         assert_eq!(got["sub"], json!("svc-a"));
         assert_eq!(got["role"], json!("reader"));
-        assert!(token_verify(&tok, &v, now + 10, Some("other")).unwrap_err().contains("audience"));
-        assert!(token_verify(&tok, &v, now + 600 + TOKEN_LEEWAY_SECS + 1, None).unwrap_err().contains("expired"));
+        assert!(token_verify(&tok, &v, now + 10, Some("other"))
+            .unwrap_err()
+            .contains("audience"));
+        assert!(
+            token_verify(&tok, &v, now + 600 + TOKEN_LEEWAY_SECS + 1, None)
+                .unwrap_err()
+                .contains("expired")
+        );
 
         // Tampered payload, wrong key, and an HMAC verifier are all rejected.
         let parts: Vec<&str> = tok.split('.').collect();
-        let forged = format!("{}.{}.{}", parts[0],
-            B64URL.encode(br#"{"sub":"admin","exp":9999999999}"#), parts[2]);
-        assert_eq!(token_verify(&forged, &v, now, None).unwrap_err(), "bad signature");
+        let forged = format!(
+            "{}.{}.{}",
+            parts[0],
+            B64URL.encode(br#"{"sub":"admin","exp":9999999999}"#),
+            parts[2]
+        );
+        assert_eq!(
+            token_verify(&forged, &v, now, None).unwrap_err(),
+            "bad signature"
+        );
         let other = TokenVerifier::Ed25519(ed25519_public(&[1u8; 32]).unwrap());
         assert!(token_verify(&tok, &other, now, None).is_err());
-        assert!(token_verify(&tok, &TokenVerifier::Hmac(&seed), now, None).unwrap_err().contains("algorithm"));
+        assert!(token_verify(&tok, &TokenVerifier::Hmac(&seed), now, None)
+            .unwrap_err()
+            .contains("algorithm"));
     }
 
     #[test]
@@ -818,11 +1048,22 @@ mod tests {
         let now = 1_700_000_000;
         let mut r = req(60);
         r.not_before_secs = Some(3600);
-        let tok = token_issue(&TokenSigner::Hmac(&key), None, &token_claims(r, now).unwrap()).unwrap();
+        let tok = token_issue(
+            &TokenSigner::Hmac(&key),
+            None,
+            &token_claims(r, now).unwrap(),
+        )
+        .unwrap();
         let v = TokenVerifier::Hmac(&key);
-        assert!(token_verify(&tok, &v, now, None).unwrap_err().contains("not valid before"));
+        assert!(token_verify(&tok, &v, now, None)
+            .unwrap_err()
+            .contains("not valid before"));
         // A token with alg=none is never accepted.
-        let none = format!("{}.{}.", B64URL.encode(br#"{"alg":"none"}"#), B64URL.encode(b"{}"));
+        let none = format!(
+            "{}.{}.",
+            B64URL.encode(br#"{"alg":"none"}"#),
+            B64URL.encode(b"{}")
+        );
         assert!(token_verify(&none, &v, now, None).is_err());
         assert!(token_claims(req(0), now).is_err());
     }
@@ -833,19 +1074,31 @@ mod tests {
         let pk = ed25519_public(&seed).unwrap();
         assert_eq!(parse_public_key(&ed25519_public_pem(&pk)).unwrap(), pk);
         assert_eq!(parse_public_key(&B64.encode(pk)).unwrap(), pk);
-        assert_eq!(parse_public_key(&ed25519_jwk(&pk, "k").to_string()).unwrap(), pk);
+        assert_eq!(
+            parse_public_key(&ed25519_jwk(&pk, "k").to_string()).unwrap(),
+            pk
+        );
         // A private key file yields its public half.
-        assert_eq!(parse_public_key(&local_key_json(KeyType::Ed25519, &seed)).unwrap(), pk);
+        assert_eq!(
+            parse_public_key(&local_key_json(KeyType::Ed25519, &seed)).unwrap(),
+            pk
+        );
         assert_eq!(parse_public_key(&ed25519_private_pem(&seed)).unwrap(), pk);
 
         let k = parse_local_key(ed25519_private_pem(&seed).as_bytes(), None).unwrap();
-        assert_eq!((k.key_type, k.secret.as_slice()), (KeyType::Ed25519, &seed[..]));
+        assert_eq!(
+            (k.key_type, k.secret.as_slice()),
+            (KeyType::Ed25519, &seed[..])
+        );
         let k = parse_local_key(local_key_json(KeyType::Hmac, &seed).as_bytes(), None).unwrap();
         assert_eq!(k.key_type, KeyType::Hmac);
         let k = parse_local_key(&seed, Some(KeyType::Hmac)).unwrap();
         assert_eq!(k.key_type, KeyType::Hmac);
         let k = parse_local_key(hex::encode(seed).as_bytes(), None).unwrap();
-        assert_eq!((k.key_type, k.secret.as_slice()), (KeyType::Aes256Gcm, &seed[..]));
+        assert_eq!(
+            (k.key_type, k.secret.as_slice()),
+            (KeyType::Aes256Gcm, &seed[..])
+        );
         assert!(parse_local_key(b"short", None).is_err());
     }
 

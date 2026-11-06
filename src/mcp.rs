@@ -33,7 +33,12 @@ const PROTO_LATEST: &str = "2025-06-18";
 const PROTO_SUPPORTED: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
 /// Online tools that change server state — hidden unless `--allow-write`.
-const WRITE_TOOLS: &[&str] = &["bbk_secret_put", "bbk_secret_delete", "bbk_key_create", "bbk_key_rotate"];
+const WRITE_TOOLS: &[&str] = &[
+    "bbk_secret_put",
+    "bbk_secret_delete",
+    "bbk_key_create",
+    "bbk_key_rotate",
+];
 
 /// How the server was launched — decides which tools exist and what they can do.
 pub struct McpConfig {
@@ -69,7 +74,11 @@ pub async fn run(cfg: McpConfig) -> std::io::Result<()> {
         } else {
             "disabled (offline)".to_string()
         },
-        if cfg.allow_write { "enabled" } else { "read-only" },
+        if cfg.allow_write {
+            "enabled"
+        } else {
+            "read-only"
+        },
     );
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -83,7 +92,11 @@ pub async fn run(cfg: McpConfig) -> std::io::Result<()> {
         let msg: Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
-                send(&mut stdout, error(Value::Null, -32700, &format!("parse error: {e}"))).await?;
+                send(
+                    &mut stdout,
+                    error(Value::Null, -32700, &format!("parse error: {e}")),
+                )
+                .await?;
                 continue;
             }
         };
@@ -96,7 +109,8 @@ pub async fn run(cfg: McpConfig) -> std::io::Result<()> {
 
         match method {
             "initialize" => {
-                let requested = msg.get("params")
+                let requested = msg
+                    .get("params")
                     .and_then(|p| p.get("protocolVersion"))
                     .and_then(Value::as_str);
                 send(&mut stdout, result(id, initialize_result(requested))).await?;
@@ -105,7 +119,11 @@ pub async fn run(cfg: McpConfig) -> std::io::Result<()> {
                 send(&mut stdout, result(id, json!({}))).await?;
             }
             "tools/list" => {
-                send(&mut stdout, result(id, json!({ "tools": tools_list(&cfg) }))).await?;
+                send(
+                    &mut stdout,
+                    result(id, json!({ "tools": tools_list(&cfg) })),
+                )
+                .await?;
             }
             "tools/call" => {
                 let r = call_tool(&cfg, msg.get("params")).await;
@@ -114,8 +132,15 @@ pub async fn run(cfg: McpConfig) -> std::io::Result<()> {
             m if m.starts_with("notifications/") => { /* initialized, cancelled, … — ignore */ }
             _ => {
                 if !is_notification {
-                    send(&mut stdout, error(id.unwrap_or(Value::Null), -32601,
-                        &format!("method not found: {method}"))).await?;
+                    send(
+                        &mut stdout,
+                        error(
+                            id.unwrap_or(Value::Null),
+                            -32601,
+                            &format!("method not found: {method}"),
+                        ),
+                    )
+                    .await?;
                 }
             }
         }
@@ -259,11 +284,13 @@ fn tools_list(cfg: &McpConfig) -> Vec<Value> {
                 "mfa":{"type":"string","description":"Current 6-digit TOTP code, if the secret requires MFA."},
                 "request_id":{"type":"string","description":"Approved K-of-N request id, if the secret is threshold-gated."}
             },"required":["name"]})));
-        t.push(tool("bbk_file_list",
+        t.push(tool(
+            "bbk_file_list",
             "List files stored on the Blackbook server (metadata only).",
             json!({"type":"object","properties":{
                 "domain":{"type":"string"}
-            }})));
+            }}),
+        ));
         for (name, desc, props, required) in key_tools() {
             let mut props = props;
             props["key"] = json!({"type":"string","description":"Managed key name."});
@@ -271,7 +298,11 @@ fn tools_list(cfg: &McpConfig) -> Vec<Value> {
             props["mfa"] = json!({"type":"string","description":"Current 6-digit TOTP code, if the key requires MFA."});
             let mut req = vec!["key"];
             req.extend(required);
-            t.push(tool(name, desc, json!({"type":"object","properties":props,"required":req})));
+            t.push(tool(
+                name,
+                desc,
+                json!({"type":"object","properties":props,"required":req}),
+            ));
         }
         t.push(tool("bbk_key_list",
             "List managed keys (name, type, latest version) in a domain. No key material is returned.",
@@ -292,7 +323,8 @@ fn tools_list(cfg: &McpConfig) -> Vec<Value> {
                     "key":{"type":"string"},
                     "domain":{"type":"string"}
                 },"required":["key"]})));
-            t.push(tool("bbk_secret_put",
+            t.push(tool(
+                "bbk_secret_put",
                 "Store (or overwrite) a secret on the Blackbook server. Requires --allow-write.",
                 json!({"type":"object","properties":{
                     "name":{"type":"string"},
@@ -302,13 +334,16 @@ fn tools_list(cfg: &McpConfig) -> Vec<Value> {
                     "mfa_required":{"type":"boolean","default":false},
                     "delete_on_read":{"type":"boolean","default":false},
                     "max_reads":{"type":"integer","minimum":1}
-                },"required":["name","value"]})));
-            t.push(tool("bbk_secret_delete",
+                },"required":["name","value"]}),
+            ));
+            t.push(tool(
+                "bbk_secret_delete",
                 "Delete a secret on the Blackbook server. Requires --allow-write.",
                 json!({"type":"object","properties":{
                     "name":{"type":"string"},
                     "domain":{"type":"string"}
-                },"required":["name"]})));
+                },"required":["name"]}),
+            ));
         }
     }
     t
@@ -361,7 +396,13 @@ fn key_tools() -> Vec<(&'static str, &'static str, Value, Vec<&'static str>)> {
 /// Compact human-readable uptime from a second count.
 fn fmt_uptime(secs: u64) -> String {
     let (d, h, m) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
-    if d > 0 { format!("{d}d {h}h {m}m") } else if h > 0 { format!("{h}h {m}m") } else { format!("{m}m") }
+    if d > 0 {
+        format!("{d}d {h}h {m}m")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,10 +433,22 @@ async fn call_tool(cfg: &McpConfig, params: Option<&Value>) -> Value {
         "bbk_verify_signature" => tool_verify_signature(args),
         "bbk_token_verify" => tool_token_verify(args),
         // --- online --------------------------------------------------------
-        "bbk_status" | "bbk_secret_list" | "bbk_secret_get" | "bbk_file_list"
-        | "bbk_secret_put" | "bbk_secret_delete" | "bbk_key_list" | "bbk_key_create" | "bbk_key_rotate"
-        | "bbk_key_encrypt" | "bbk_key_decrypt" | "bbk_key_sign" | "bbk_key_hmac" | "bbk_key_verify"
-        | "bbk_key_token_issue" | "bbk_key_token_verify" => {
+        "bbk_status"
+        | "bbk_secret_list"
+        | "bbk_secret_get"
+        | "bbk_file_list"
+        | "bbk_secret_put"
+        | "bbk_secret_delete"
+        | "bbk_key_list"
+        | "bbk_key_create"
+        | "bbk_key_rotate"
+        | "bbk_key_encrypt"
+        | "bbk_key_decrypt"
+        | "bbk_key_sign"
+        | "bbk_key_hmac"
+        | "bbk_key_verify"
+        | "bbk_key_token_issue"
+        | "bbk_key_token_verify" => {
             if !cfg.online() {
                 Err("online tools are disabled — this MCP server was started offline or with no profile".into())
             } else if WRITE_TOOLS.contains(&name) && !cfg.allow_write {
@@ -418,7 +471,9 @@ async fn call_tool(cfg: &McpConfig, params: Option<&Value>) -> Value {
 // ---------------------------------------------------------------------------
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
-    args.get(key).and_then(Value::as_str).ok_or_else(|| format!("missing required string argument '{key}'"))
+    args.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing required string argument '{key}'"))
 }
 fn arg_str_opt<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
@@ -431,7 +486,8 @@ fn arg_bool(args: &Value, key: &str, default: bool) -> bool {
 fn arg_data(args: &Value) -> Result<Vec<u8>, String> {
     let s = arg_str(args, "data")?;
     if arg_bool(args, "data_base64", false) {
-        base64::engine::general_purpose::STANDARD.decode(s.trim())
+        base64::engine::general_purpose::STANDARD
+            .decode(s.trim())
             .map_err(|e| format!("data_base64 is set but the data isn't valid base64: {e}"))
     } else {
         Ok(s.as_bytes().to_vec())
@@ -441,29 +497,50 @@ fn arg_data(args: &Value) -> Result<Vec<u8>, String> {
 fn tool_hash(args: &Value) -> Result<String, String> {
     let data = arg_data(args)?;
     let alg = HashAlg::parse(arg_str_opt(args, "algorithm").unwrap_or("sha3-256"))?;
-    Ok(format!("{}: {}", alg.as_str(), hex::encode(crypto_ops::digest(alg, &data))))
+    Ok(format!(
+        "{}: {}",
+        alg.as_str(),
+        hex::encode(crypto_ops::digest(alg, &data))
+    ))
 }
 
 fn tool_hmac(args: &Value) -> Result<String, String> {
     let data = arg_data(args)?;
-    let key = base64::engine::general_purpose::STANDARD.decode(arg_str(args, "key_base64")?.trim())
+    let key = base64::engine::general_purpose::STANDARD
+        .decode(arg_str(args, "key_base64")?.trim())
         .map_err(|e| format!("key_base64 is not valid base64: {e}"))?;
     let alg = HashAlg::parse(arg_str_opt(args, "algorithm").unwrap_or("sha3-256"))?;
-    Ok(format!("hmac-{}: {}", alg.as_str(), hex::encode(crypto_ops::hmac(alg, &key, &data))))
+    Ok(format!(
+        "hmac-{}: {}",
+        alg.as_str(),
+        hex::encode(crypto_ops::hmac(alg, &key, &data))
+    ))
 }
 
 fn tool_verify_signature(args: &Value) -> Result<String, String> {
     let data = arg_data(args)?;
     let pk = crypto_ops::parse_public_key(arg_str(args, "public_key")?)?;
     let sig = crypto_ops::parse_tag(arg_str(args, "signature")?)?;
-    Ok(if crypto_ops::ed25519_verify(&pk, &data, &sig) { "valid" } else { "INVALID" }.into())
+    Ok(if crypto_ops::ed25519_verify(&pk, &data, &sig) {
+        "valid"
+    } else {
+        "INVALID"
+    }
+    .into())
 }
 
 fn tool_token_verify(args: &Value) -> Result<String, String> {
     let pk = crypto_ops::parse_public_key(arg_str(args, "public_key")?)?;
-    match crypto_ops::token_verify(arg_str(args, "token")?, &TokenVerifier::Ed25519(pk),
-                                   crypto_ops::now_unix(), arg_str_opt(args, "audience")) {
-        Ok(claims) => Ok(format!("valid token\n{}", serde_json::to_string_pretty(&claims).unwrap_or_default())),
+    match crypto_ops::token_verify(
+        arg_str(args, "token")?,
+        &TokenVerifier::Ed25519(pk),
+        crypto_ops::now_unix(),
+        arg_str_opt(args, "audience"),
+    ) {
+        Ok(claims) => Ok(format!(
+            "valid token\n{}",
+            serde_json::to_string_pretty(&claims).unwrap_or_default()
+        )),
         Err(reason) => Ok(format!("INVALID token: {reason}")),
     }
 }
@@ -473,7 +550,10 @@ fn tool_random(args: &Value) -> Result<String, String> {
     if n == 0 || n > 4096 {
         return Err("bytes must be between 1 and 4096".into());
     }
-    crypto_ops::encode(&crypto_ops::random_bytes(n as usize), arg_str_opt(args, "encoding").unwrap_or("base64url"))
+    crypto_ops::encode(
+        &crypto_ops::random_bytes(n as usize),
+        arg_str_opt(args, "encoding").unwrap_or("base64url"),
+    )
 }
 
 fn tool_encrypt(args: &Value) -> Result<String, String> {
@@ -494,13 +574,18 @@ fn tool_derive_key(args: &Value) -> Result<String, String> {
     let passphrase = arg_str(args, "passphrase")?;
     let alg = KdfAlg::parse(arg_str_opt(args, "algorithm").unwrap_or("argon2id"))?;
     let salt = match arg_str_opt(args, "salt_base64") {
-        Some(s) => B64.decode(s.trim()).map_err(|e| format!("salt_base64 is not valid base64: {e}"))?,
+        Some(s) => B64
+            .decode(s.trim())
+            .map_err(|e| format!("salt_base64 is not valid base64: {e}"))?,
         None => crypto_ops::random_bytes(16).to_vec(),
     };
     let key = crypto_ops::derive_key(alg, passphrase, &salt)?;
     Ok(format!(
         "algorithm: {}\nkey_base64: {}\nkey_hex: {}\nsalt_base64: {}",
-        alg.as_str(), B64.encode(key.as_slice()), hex::encode(key.as_slice()), B64.encode(&salt)
+        alg.as_str(),
+        B64.encode(key.as_slice()),
+        hex::encode(key.as_slice()),
+        B64.encode(&salt)
     ))
 }
 
@@ -522,13 +607,21 @@ fn tool_fingerprint(args: &Value) -> Result<String, String> {
 /// Build an authenticated client for the configured profile in the effective
 /// domain (per-call `domain` overrides the launch default).
 fn online_client(cfg: &McpConfig, args: &Value) -> Result<client::BlackbookClient, String> {
-    let profile = cfg.profile.as_deref().ok_or("no Blackbook profile is configured")?;
-    let session = client::Session::load_named(profile).map_err(|e| format!(
-        "could not open profile '{profile}': {e}. Unlock it first: `bbk -P {profile} unlock`, \
+    let profile = cfg
+        .profile
+        .as_deref()
+        .ok_or("no Blackbook profile is configured")?;
+    let session = client::Session::load_named(profile).map_err(|e| {
+        format!(
+            "could not open profile '{profile}': {e}. Unlock it first: `bbk -P {profile} unlock`, \
          or set $BLACKBOOK_PASSPHRASE in the MCP server's environment."
-    ))?;
+        )
+    })?;
     let mut bb = client::BlackbookClient::from_session(&session).map_err(|e| e.to_string())?;
-    if let Some(d) = arg_str_opt(args, "domain").map(String::from).or_else(|| cfg.domain.clone()) {
+    if let Some(d) = arg_str_opt(args, "domain")
+        .map(String::from)
+        .or_else(|| cfg.domain.clone())
+    {
         bb = bb.with_domain(d);
     }
     Ok(bb)
@@ -542,14 +635,23 @@ async fn call_online(cfg: &McpConfig, name: &str, args: &Value) -> Result<String
             let health = bb.health().await.ok();
             let mut s = format!(
                 "identity: {} ({}) — id {}\nauth: {}\nserver: {}",
-                who.name, who.role, who.id, who.auth_method, bb.server_url()
+                who.name,
+                who.role,
+                who.id,
+                who.auth_method,
+                bb.server_url()
             );
             if let Some(ud) = who.user_domain.as_deref() {
                 s.push_str(&format!("\nuser domain: {ud}"));
             }
             if let Some(h) = health {
-                s.push_str(&format!("\nhealth: {} (db {}), version {}, uptime {}",
-                    h.status, h.database, h.version, fmt_uptime(h.uptime)));
+                s.push_str(&format!(
+                    "\nhealth: {} (db {}), version {}, uptime {}",
+                    h.status,
+                    h.database,
+                    h.version,
+                    fmt_uptime(h.uptime)
+                ));
             }
             Ok(s)
         }
@@ -561,12 +663,19 @@ async fn call_online(cfg: &McpConfig, name: &str, args: &Value) -> Result<String
             let mut lines = vec![format!("{} secret(s):", list.count)];
             for r in &list.resources {
                 let kind = if r.external { "external" } else { "server" };
-                let status = if r.exhausted_at.is_some() { " [exhausted]" } else { "" };
+                let status = if r.exhausted_at.is_some() {
+                    " [exhausted]"
+                } else {
+                    ""
+                };
                 let quorum = match (r.threshold_k, r.signatory_count) {
                     (Some(k), Some(n)) => format!(" quorum {k}-of-{n}"),
                     _ => String::new(),
                 };
-                lines.push(format!("  {} [{kind}]{status}{quorum} (reads: {})", r.resource_name, r.read_count));
+                lines.push(format!(
+                    "  {} [{kind}]{status}{quorum} (reads: {})",
+                    r.resource_name, r.read_count
+                ));
             }
             Ok(lines.join("\n"))
         }
@@ -576,7 +685,9 @@ async fn call_online(cfg: &McpConfig, name: &str, args: &Value) -> Result<String
                 bb = bb.with_mfa(code.to_string());
             }
             let n = arg_str(args, "name")?;
-            let r = bb.retrieve_with_request(n, arg_str_opt(args, "request_id")).await
+            let r = bb
+                .retrieve_with_request(n, arg_str_opt(args, "request_id"))
+                .await
                 .map_err(|e| e.to_string())?;
             if r.external {
                 Ok(format!(
@@ -595,8 +706,12 @@ async fn call_online(cfg: &McpConfig, name: &str, args: &Value) -> Result<String
             }
             let mut lines = vec![format!("{} file(s):", list.count)];
             for f in &list.files {
-                lines.push(format!("  {} ({} bytes, {})",
-                    f.name, f.size, f.mime_type.as_deref().unwrap_or("application/octet-stream")));
+                lines.push(format!(
+                    "  {} ({} bytes, {})",
+                    f.name,
+                    f.size,
+                    f.mime_type.as_deref().unwrap_or("application/octet-stream")
+                ));
             }
             Ok(lines.join("\n"))
         }
@@ -612,9 +727,21 @@ async fn call_online(cfg: &McpConfig, name: &str, args: &Value) -> Result<String
                 no_overwrite: false,
             };
             let any_flag = flags.mfa_required || flags.delete_on_read || flags.max_reads.is_some();
-            let r = bb.store(n, v, None, if any_flag { Some(&flags) } else { None }, None,
-                arg_bool(args, "overwrite", false)).await.map_err(|e| e.to_string())?;
-            Ok(format!("stored '{}' ({}) at {}", r.resource_name, r.encryption_method, r.created_at))
+            let r = bb
+                .store(
+                    n,
+                    v,
+                    None,
+                    if any_flag { Some(&flags) } else { None },
+                    None,
+                    arg_bool(args, "overwrite", false),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "stored '{}' ({}) at {}",
+                r.resource_name, r.encryption_method, r.created_at
+            ))
         }
         "bbk_secret_delete" => {
             let n = arg_str(args, "name")?;
@@ -628,21 +755,48 @@ async fn call_online(cfg: &McpConfig, name: &str, args: &Value) -> Result<String
             }
             let mut lines = vec![format!("{} key(s):", list.count)];
             for k in &list.keys {
-                lines.push(format!("  {} [{}] v{}{}", k.name, k.key_type, k.latest_version,
-                                   if k.mfa_required { " (MFA required)" } else { "" }));
+                lines.push(format!(
+                    "  {} [{}] v{}{}",
+                    k.name,
+                    k.key_type,
+                    k.latest_version,
+                    if k.mfa_required {
+                        " (MFA required)"
+                    } else {
+                        ""
+                    }
+                ));
             }
             Ok(lines.join("\n"))
         }
         "bbk_key_create" => {
-            let k = bb.key_create(arg_str(args, "name")?, arg_str_opt(args, "key_type").unwrap_or("aes256-gcm"),
-                                  arg_bool(args, "mfa_required", false), None).await.map_err(|e| e.to_string())?;
-            let mut s = format!("created {} key '{}' (v{})", k.key_type, k.name, k.latest_version);
-            if let Some(pk) = k.public_key { s.push_str(&format!("\npublic key: {pk}")); }
+            let k = bb
+                .key_create(
+                    arg_str(args, "name")?,
+                    arg_str_opt(args, "key_type").unwrap_or("aes256-gcm"),
+                    arg_bool(args, "mfa_required", false),
+                    None,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut s = format!(
+                "created {} key '{}' (v{})",
+                k.key_type, k.name, k.latest_version
+            );
+            if let Some(pk) = k.public_key {
+                s.push_str(&format!("\npublic key: {pk}"));
+            }
             Ok(s)
         }
         "bbk_key_rotate" => {
-            let k = bb.key_rotate(arg_str(args, "key")?).await.map_err(|e| e.to_string())?;
-            Ok(format!("rotated '{}' — new output uses v{}", k.name, k.latest_version))
+            let k = bb
+                .key_rotate(arg_str(args, "key")?)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "rotated '{}' — new output uses v{}",
+                k.name, k.latest_version
+            ))
         }
         _ => call_key_op(bb, name, args).await,
     }
@@ -650,7 +804,11 @@ async fn call_online(cfg: &McpConfig, name: &str, args: &Value) -> Result<String
 
 /// The managed-key operation tools: translate MCP arguments into one
 /// `/api/v1/keys/{key}/<op>` call and render the answer as text.
-async fn call_key_op(bb: client::BlackbookClient, name: &str, args: &Value) -> Result<String, String> {
+async fn call_key_op(
+    bb: client::BlackbookClient,
+    name: &str,
+    args: &Value,
+) -> Result<String, String> {
     use base64::engine::general_purpose::STANDARD as B64;
     let mut bb = bb;
     if let Some(code) = arg_str_opt(args, "mfa") {
@@ -658,42 +816,85 @@ async fn call_key_op(bb: client::BlackbookClient, name: &str, args: &Value) -> R
     }
     let key = arg_str(args, "key")?;
     let aad = arg_str_opt(args, "aad").map(|a| B64.encode(a.as_bytes()));
-    let field = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string)
-        .ok_or_else(|| format!("server response is missing '{k}'"));
+    let field = |v: &Value, k: &str| {
+        v.get(k)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| format!("server response is missing '{k}'"))
+    };
     let (op, body) = match name {
-        "bbk_key_encrypt" => ("encrypt", json!({ "plaintext": B64.encode(arg_data(args)?), "aad": aad })),
-        "bbk_key_decrypt" => ("decrypt", json!({ "ciphertext": arg_str(args, "ciphertext")?, "aad": aad })),
+        "bbk_key_encrypt" => (
+            "encrypt",
+            json!({ "plaintext": B64.encode(arg_data(args)?), "aad": aad }),
+        ),
+        "bbk_key_decrypt" => (
+            "decrypt",
+            json!({ "ciphertext": arg_str(args, "ciphertext")?, "aad": aad }),
+        ),
         "bbk_key_sign" => ("sign", json!({ "input": B64.encode(arg_data(args)?) })),
-        "bbk_key_hmac" => ("hmac", json!({ "input": B64.encode(arg_data(args)?),
-                                          "algorithm": arg_str_opt(args, "algorithm") })),
-        "bbk_key_verify" => ("verify", json!({ "input": B64.encode(arg_data(args)?),
+        "bbk_key_hmac" => (
+            "hmac",
+            json!({ "input": B64.encode(arg_data(args)?),
+                                          "algorithm": arg_str_opt(args, "algorithm") }),
+        ),
+        "bbk_key_verify" => (
+            "verify",
+            json!({ "input": B64.encode(arg_data(args)?),
                                               "signature": arg_str(args, "signature")?,
-                                              "algorithm": arg_str_opt(args, "algorithm") })),
-        "bbk_key_token_issue" => ("token", json!({
-            "claims": args.get("claims"), "subject": arg_str_opt(args, "subject"),
-            "audience": arg_str_opt(args, "audience"), "issuer": arg_str_opt(args, "issuer"),
-            "ttl_secs": args.get("ttl_secs").and_then(Value::as_i64),
-        })),
-        "bbk_key_token_verify" => ("token/verify", json!({ "token": arg_str(args, "token")?,
-                                                          "audience": arg_str_opt(args, "audience") })),
+                                              "algorithm": arg_str_opt(args, "algorithm") }),
+        ),
+        "bbk_key_token_issue" => (
+            "token",
+            json!({
+                "claims": args.get("claims"), "subject": arg_str_opt(args, "subject"),
+                "audience": arg_str_opt(args, "audience"), "issuer": arg_str_opt(args, "issuer"),
+                "ttl_secs": args.get("ttl_secs").and_then(Value::as_i64),
+            }),
+        ),
+        "bbk_key_token_verify" => (
+            "token/verify",
+            json!({ "token": arg_str(args, "token")?,
+                                                          "audience": arg_str_opt(args, "audience") }),
+        ),
         other => return Err(format!("unknown online tool: {other}")),
     };
     let r = bb.key_op(key, op, &body).await.map_err(|e| e.to_string())?;
     match op {
         "encrypt" => field(&r, "ciphertext"),
         "decrypt" => {
-            let pt = B64.decode(field(&r, "plaintext")?).map_err(|_| "server returned bad base64")?;
+            let pt = B64
+                .decode(field(&r, "plaintext")?)
+                .map_err(|_| "server returned bad base64")?;
             Ok(String::from_utf8(pt.clone())
                 .unwrap_or_else(|_| format!("(binary plaintext, base64) {}", B64.encode(&pt))))
         }
-        "sign" => Ok(format!("signature: {}\npublic key: {}", field(&r, "signature")?, field(&r, "public_key")?)),
+        "sign" => Ok(format!(
+            "signature: {}\npublic key: {}",
+            field(&r, "signature")?,
+            field(&r, "public_key")?
+        )),
         "hmac" => field(&r, "hmac"),
-        "verify" => Ok(if r.get("valid").and_then(Value::as_bool) == Some(true) { "valid" } else { "INVALID" }.into()),
-        "token" => Ok(format!("{}\n(expires {})", field(&r, "token")?, field(&r, "expires_at")?)),
-        _ => Ok(if r.get("valid").and_then(Value::as_bool) == Some(true) {
-            format!("valid token\n{}", serde_json::to_string_pretty(&r["claims"]).unwrap_or_default())
+        "verify" => Ok(if r.get("valid").and_then(Value::as_bool) == Some(true) {
+            "valid"
         } else {
-            format!("INVALID token: {}", r.get("reason").and_then(Value::as_str).unwrap_or("unknown"))
+            "INVALID"
+        }
+        .into()),
+        "token" => Ok(format!(
+            "{}\n(expires {})",
+            field(&r, "token")?,
+            field(&r, "expires_at")?
+        )),
+        _ => Ok(if r.get("valid").and_then(Value::as_bool) == Some(true) {
+            format!(
+                "valid token\n{}",
+                serde_json::to_string_pretty(&r["claims"]).unwrap_or_default()
+            )
+        } else {
+            format!(
+                "INVALID token: {}",
+                r.get("reason").and_then(Value::as_str).unwrap_or("unknown")
+            )
         }),
     }
 }
@@ -705,25 +906,41 @@ mod tests {
     #[test]
     fn encrypt_tool_output_opens_with_the_shared_envelope_code() {
         // bbk_encrypt output must stay decryptable by `bbk crypto decrypt -p`.
-        let env = tool_encrypt(&json!({"plaintext":"top secret","passphrase":"correct horse"})).unwrap();
+        let env =
+            tool_encrypt(&json!({"plaintext":"top secret","passphrase":"correct horse"})).unwrap();
         assert!(env.starts_with(crypto_ops::PASSPHRASE_PREFIX));
         assert!(!env.contains("top secret"));
-        assert_eq!(crypto_ops::passphrase_open(&env, "correct horse", b"").unwrap(), b"top secret");
-        assert_eq!(tool_decrypt(&json!({"envelope":env,"passphrase":"correct horse"})).unwrap(), "top secret");
+        assert_eq!(
+            crypto_ops::passphrase_open(&env, "correct horse", b"").unwrap(),
+            b"top secret"
+        );
+        assert_eq!(
+            tool_decrypt(&json!({"envelope":env,"passphrase":"correct horse"})).unwrap(),
+            "top secret"
+        );
         assert!(tool_decrypt(&json!({"envelope":env,"passphrase":"wrong"})).is_err());
     }
 
     #[test]
     fn hmac_and_signature_tools() {
         use base64::engine::general_purpose::STANDARD as B64;
-        let out = tool_hmac(&json!({"data":"what do ya want for nothing?","key_base64":B64.encode("Jefe"),
-                                    "algorithm":"sha256"})).unwrap();
+        let out = tool_hmac(
+            &json!({"data":"what do ya want for nothing?","key_base64":B64.encode("Jefe"),
+                                    "algorithm":"sha256"}),
+        )
+        .unwrap();
         assert!(out.ends_with("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
         let seed = [4u8; 32];
         let pk = B64.encode(crypto_ops::ed25519_public(&seed).unwrap());
         let sig = B64.encode(crypto_ops::ed25519_sign(&seed, b"msg").unwrap());
-        assert_eq!(tool_verify_signature(&json!({"data":"msg","signature":sig,"public_key":pk})).unwrap(), "valid");
-        assert_eq!(tool_verify_signature(&json!({"data":"msh","signature":sig,"public_key":pk})).unwrap(), "INVALID");
+        assert_eq!(
+            tool_verify_signature(&json!({"data":"msg","signature":sig,"public_key":pk})).unwrap(),
+            "valid"
+        );
+        assert_eq!(
+            tool_verify_signature(&json!({"data":"msh","signature":sig,"public_key":pk})).unwrap(),
+            "INVALID"
+        );
     }
 
     #[test]
@@ -735,25 +952,48 @@ mod tests {
 
     #[test]
     fn offline_tools_never_require_a_profile() {
-        assert!(tool_random(&json!({"bytes":16,"encoding":"hex"})).unwrap().len() == 32);
+        assert!(
+            tool_random(&json!({"bytes":16,"encoding":"hex"}))
+                .unwrap()
+                .len()
+                == 32
+        );
         assert!(tool_derive_key(&json!({"passphrase":"pw","algorithm":"scrypt"})).is_ok());
-        assert!(tool_fingerprint(&json!({"data":"hello"})).unwrap().contains("sha3-256"));
+        assert!(tool_fingerprint(&json!({"data":"hello"}))
+            .unwrap()
+            .contains("sha3-256"));
     }
 
     #[test]
     fn offline_config_hides_online_tools() {
-        let cfg = McpConfig { profile: Some("x".into()), offline: true, allow_write: true, domain: None };
-        let names: Vec<String> = tools_list(&cfg).iter()
-            .map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        assert!(names.iter().all(|n| !n.starts_with("bbk_secret") && n != "bbk_status"));
+        let cfg = McpConfig {
+            profile: Some("x".into()),
+            offline: true,
+            allow_write: true,
+            domain: None,
+        };
+        let names: Vec<String> = tools_list(&cfg)
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names
+            .iter()
+            .all(|n| !n.starts_with("bbk_secret") && n != "bbk_status"));
         assert!(names.contains(&"bbk_hash".to_string()));
     }
 
     #[test]
     fn write_tools_hidden_without_allow_write() {
-        let ro = McpConfig { profile: Some("x".into()), offline: false, allow_write: false, domain: None };
-        let names: Vec<String> = tools_list(&ro).iter()
-            .map(|t| t["name"].as_str().unwrap().to_string()).collect();
+        let ro = McpConfig {
+            profile: Some("x".into()),
+            offline: false,
+            allow_write: false,
+            domain: None,
+        };
+        let names: Vec<String> = tools_list(&ro)
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
         assert!(names.contains(&"bbk_secret_get".to_string()));
         assert!(!names.contains(&"bbk_secret_put".to_string()));
         assert!(!names.contains(&"bbk_secret_delete".to_string()));
@@ -763,8 +1003,16 @@ mod tests {
         // Every tool's schema requires only properties it declares.
         for t in tools_list(&ro) {
             let props = t["inputSchema"]["properties"].as_object().unwrap();
-            for r in t["inputSchema"]["required"].as_array().into_iter().flatten() {
-                assert!(props.contains_key(r.as_str().unwrap()), "{} requires undeclared {r}", t["name"]);
+            for r in t["inputSchema"]["required"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    props.contains_key(r.as_str().unwrap()),
+                    "{} requires undeclared {r}",
+                    t["name"]
+                );
             }
         }
     }

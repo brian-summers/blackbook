@@ -1,5 +1,5 @@
 //! Blackbook Core - Comprehensive cryptographic and database framework
-//! 
+//!
 //! This module provides:
 //! - Asymmetric key management (Ed25519, X25519)
 //! - Symmetric encryption (AES-GCM)
@@ -14,10 +14,10 @@ use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use aes_kw::KekAes256;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::{DateTime, Local};
-use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Signer, SignatureError, Verifier};
+use ed25519_dalek::{Signature, SignatureError, Signer, SigningKey, Verifier, VerifyingKey};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use sha3::{Sha3_256, Digest};
+use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
@@ -106,7 +106,7 @@ impl Id {
         let salt = domain.as_bytes();
         let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, dklen)
             .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
-        
+
         let mut output = vec![0u8; dklen];
         scrypt::scrypt(value.as_bytes(), salt, &params, &mut output)
             .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
@@ -152,7 +152,9 @@ fn base85_encode(data: &[u8]) -> String {
     for chunk in data.chunks(4) {
         let mut n: u32 = 0;
         for i in 0..4 {
-            n = n.wrapping_mul(256).wrapping_add(*chunk.get(i).unwrap_or(&0) as u32);
+            n = n
+                .wrapping_mul(256)
+                .wrapping_add(*chunk.get(i).unwrap_or(&0) as u32);
         }
         let mut buf = [0u8; 5];
         let mut v = n;
@@ -182,7 +184,7 @@ impl AsymmetricKey {
         for byte in &mut seed {
             *byte = rng.gen();
         }
-        
+
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
 
@@ -199,7 +201,7 @@ impl AsymmetricKey {
         if self.signing_key.len() != 32 {
             return Err(CryptoError::InvalidKeyFormat);
         }
-        
+
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&self.signing_key);
         let signing_key = SigningKey::from_bytes(&seed);
@@ -210,20 +212,20 @@ impl AsymmetricKey {
     /// Verify signature
     pub fn verify(&self, signature: &str, data: &[u8]) -> CryptoResult<bool> {
         let signature_bytes = BASE64.decode(signature)?;
-        
+
         if self.verifying_key.len() != 32 {
             return Err(CryptoError::InvalidKeyFormat);
         }
-        
+
         let mut key = [0u8; 32];
         key.copy_from_slice(&self.verifying_key);
-        let verifying_key = VerifyingKey::from_bytes(&key)
-            .map_err(|_| CryptoError::InvalidKeyFormat)?;
+        let verifying_key =
+            VerifyingKey::from_bytes(&key).map_err(|_| CryptoError::InvalidKeyFormat)?;
 
         let sig: [u8; 64] = signature_bytes
             .try_into()
             .map_err(|_| CryptoError::InvalidKeyFormat)?;
-        
+
         match verifying_key.verify(data, &Signature::from_bytes(&sig)) {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
@@ -258,7 +260,7 @@ impl BaseKey {
     pub fn new(length: usize) -> Self {
         let mut rng = rand::thread_rng();
         let key: Vec<u8> = (0..length).map(|_| rng.gen()).collect();
-        
+
         Self {
             id: Id::new(32),
             key,
@@ -299,7 +301,9 @@ pub struct PrimaryKey {
 
 impl PrimaryKey {
     pub fn new() -> Self {
-        Self { base: BaseKey::new(32) }
+        Self {
+            base: BaseKey::new(32),
+        }
     }
 
     /// Crate-internal accessor used by [`SecondaryKey`] to seed its KDF.
@@ -312,7 +316,9 @@ impl PrimaryKey {
 }
 
 impl Default for PrimaryKey {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Which KDF a [`SecondaryKey`] uses to stretch the primary into a usable
@@ -344,12 +350,22 @@ pub struct SecondaryKey {
 impl SecondaryKey {
     /// scrypt-backed secondary key.
     pub fn scrypt(primary: PrimaryKey, domain: impl Into<String>, length: usize) -> Self {
-        Self { primary, domain: domain.into(), kdf: Kdf::Scrypt, length }
+        Self {
+            primary,
+            domain: domain.into(),
+            kdf: Kdf::Scrypt,
+            length,
+        }
     }
 
     /// PBKDF2-HMAC-SHA3-512-backed secondary key.
     pub fn pbkdf2(primary: PrimaryKey, domain: impl Into<String>, length: usize) -> Self {
-        Self { primary, domain: domain.into(), kdf: Kdf::Pbkdf2Sha3_512, length }
+        Self {
+            primary,
+            domain: domain.into(),
+            kdf: Kdf::Pbkdf2Sha3_512,
+            length,
+        }
     }
 
     /// Derive bytes with `domain` as the salt.
@@ -384,8 +400,12 @@ impl SecondaryKey {
         Ok(output)
     }
 
-    pub fn domain(&self) -> &str { &self.domain }
-    pub fn length(&self) -> usize { self.length }
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+    pub fn length(&self) -> usize {
+        self.length
+    }
 }
 
 /// Default iteration count for [`WrappedKey`] — matches the Python prototype.
@@ -428,15 +448,21 @@ impl WrappedKey {
         let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(secret.to_vec());
         for i in 0..iterations {
             let kek_bytes = Zeroizing::new(wrapper.handle_with_info(&Self::round_info(i))?);
-            let kek = KekAes256::from(<[u8; 32]>::try_from(kek_bytes.as_slice())
-                .map_err(|_| CryptoError::KeyDerivation("KEK was not 32 bytes".to_string()))?);
+            let kek = KekAes256::from(
+                <[u8; 32]>::try_from(kek_bytes.as_slice())
+                    .map_err(|_| CryptoError::KeyDerivation("KEK was not 32 bytes".to_string()))?,
+            );
             let mut next = Zeroizing::new(vec![0u8; buf.len() + 8]);
             kek.wrap(buf.as_slice(), next.as_mut_slice())
                 .map_err(|e| CryptoError::Encryption(format!("aes-kw iter {i}: {e:?}")))?;
             buf = next;
         }
         // The final buffer is the fully-wrapped (encrypted) blob, safe to store.
-        Ok(Self { wrapped: buf.to_vec(), wrapper, iterations })
+        Ok(Self {
+            wrapped: buf.to_vec(),
+            wrapper,
+            iterations,
+        })
     }
 
     /// Recover the wrapped secret by reversing every iteration.
@@ -449,8 +475,10 @@ impl WrappedKey {
                 ));
             }
             let kek_bytes = Zeroizing::new(self.wrapper.handle_with_info(&Self::round_info(i))?);
-            let kek = KekAes256::from(<[u8; 32]>::try_from(kek_bytes.as_slice())
-                .map_err(|_| CryptoError::KeyDerivation("KEK was not 32 bytes".to_string()))?);
+            let kek = KekAes256::from(
+                <[u8; 32]>::try_from(kek_bytes.as_slice())
+                    .map_err(|_| CryptoError::KeyDerivation("KEK was not 32 bytes".to_string()))?,
+            );
             let mut next = Zeroizing::new(vec![0u8; buf.len() - 8]);
             kek.unwrap(buf.as_slice(), next.as_mut_slice())
                 .map_err(|e| CryptoError::Decryption(format!("aes-kw iter {i}: {e:?}")))?;
@@ -464,10 +492,15 @@ impl WrappedKey {
     /// Per-iteration `info`: `i` in minimal big-endian form. The wrapper's
     /// domain string is automatically prepended by `handle_with_info`.
     fn round_info(i: usize) -> Vec<u8> {
-        if i == 0 { return vec![0]; }
+        if i == 0 {
+            return vec![0];
+        }
         let bits = usize::BITS - i.leading_zeros();
         let nbytes = (bits / 8 + 1) as usize;
-        (0..nbytes).rev().map(|b| ((i >> (b * 8)) & 0xff) as u8).collect()
+        (0..nbytes)
+            .rev()
+            .map(|b| ((i >> (b * 8)) & 0xff) as u8)
+            .collect()
     }
 }
 
@@ -531,7 +564,13 @@ pub fn encrypt_aes_gcm(data: &[u8], key: &[u8]) -> CryptoResult<Vec<u8>> {
     let nonce = Nonce::from_slice(&salt[..12]);
 
     let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: data, aad: &timestamp })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: data,
+                aad: &timestamp,
+            },
+        )
         .map_err(|_| CryptoError::Encryption("AES-GCM encryption failed".to_string()))?;
 
     let mut out = Vec::with_capacity(ENVELOPE_PREFIX + ciphertext.len());
@@ -582,7 +621,9 @@ pub fn aead_open_nonce(frame: &[u8], dek: &[u8], expected: &[u8; 12]) -> CryptoR
         return Err(CryptoError::Decryption("frame too short".into()));
     }
     if &frame[..12] != expected.as_slice() {
-        return Err(CryptoError::Decryption("unexpected nonce (out-of-order or replayed frame)".into()));
+        return Err(CryptoError::Decryption(
+            "unexpected nonce (out-of-order or replayed frame)".into(),
+        ));
     }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
     cipher
@@ -604,7 +645,13 @@ pub fn aead_seal_aad(plaintext: &[u8], dek: &[u8], aad: &[u8]) -> CryptoResult<V
     rand::thread_rng().fill(&mut nonce);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
     let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::Encryption("AES-GCM seal failed".into()))?;
     let mut out = Vec::with_capacity(12 + ct.len());
     out.extend_from_slice(&nonce);
@@ -622,7 +669,13 @@ pub fn aead_open_aad(envelope: &[u8], dek: &[u8], aad: &[u8]) -> CryptoResult<Ve
     }
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(dek));
     cipher
-        .decrypt(Nonce::from_slice(&envelope[..12]), Payload { msg: &envelope[12..], aad })
+        .decrypt(
+            Nonce::from_slice(&envelope[..12]),
+            Payload {
+                msg: &envelope[12..],
+                aad,
+            },
+        )
         .map_err(|_| CryptoError::Decryption("AES-GCM open failed".into()))
 }
 
@@ -660,7 +713,13 @@ pub fn decrypt_aes_gcm(envelope: &[u8], key: &[u8]) -> CryptoResult<Vec<u8>> {
     let nonce = Nonce::from_slice(&salt[..12]);
 
     cipher
-        .decrypt(nonce, Payload { msg: body, aad: timestamp })
+        .decrypt(
+            nonce,
+            Payload {
+                msg: body,
+                aad: timestamp,
+            },
+        )
         .map_err(|_| CryptoError::Decryption("AES-GCM decryption failed".to_string()))
 }
 
@@ -725,8 +784,7 @@ impl Token {
     pub fn new(ttl_seconds: i64) -> Self {
         let key = AsymmetricKey::generate();
         let created_at = Local::now();
-        let expires_at = created_at
-            + chrono::Duration::seconds(ttl_seconds);
+        let expires_at = created_at + chrono::Duration::seconds(ttl_seconds);
 
         Self {
             id: Id::new(32),
@@ -745,7 +803,11 @@ impl Token {
             "expires_at": self.expires_at.to_rfc3339(),
         }))?;
 
-        self.signature = self.key.sign(&token_data).map(|s| BASE64.decode(s).unwrap_or_default()).unwrap_or_default();
+        self.signature = self
+            .key
+            .sign(&token_data)
+            .map(|s| BASE64.decode(s).unwrap_or_default())
+            .unwrap_or_default();
         Ok(BASE64.encode(&self.signature))
     }
 
@@ -932,16 +994,24 @@ impl BlackbookKey {
         let root = PrimaryKey::new();
         let secret_layer1 = SecondaryKey::scrypt(root.clone(), "secret/layer1/v1", 32);
         let secret_layer2 = SecondaryKey::scrypt(root.clone(), "secret/layer2/v1", 32);
-        let file_dek_kek  = SecondaryKey::scrypt(root.clone(), "file/dek-kek/v1", 32);
-        let index         = SecondaryKey::pbkdf2(root.clone(), "index/v1", 32);
-        let hmac          = SecondaryKey::pbkdf2(root.clone(), "hmac/v1", 32);
+        let file_dek_kek = SecondaryKey::scrypt(root.clone(), "file/dek-kek/v1", 32);
+        let index = SecondaryKey::pbkdf2(root.clone(), "index/v1", 32);
+        let hmac = SecondaryKey::pbkdf2(root.clone(), "hmac/v1", 32);
         let mfa_secret_kek = SecondaryKey::scrypt(root.clone(), "mfa/secret-kek/v1", 32);
-        let asymmetric    = AsymmetricKey::generate();
-        let exchange_key  = BaseKey::new(32);
+        let asymmetric = AsymmetricKey::generate();
+        let exchange_key = BaseKey::new(32);
         Ok(Self {
-            id, symmetric, root,
-            secret_layer1, secret_layer2, file_dek_kek, index, hmac, mfa_secret_kek,
-            asymmetric, exchange_key,
+            id,
+            symmetric,
+            root,
+            secret_layer1,
+            secret_layer2,
+            file_dek_kek,
+            index,
+            hmac,
+            mfa_secret_kek,
+            asymmetric,
+            exchange_key,
         })
     }
 
@@ -981,40 +1051,40 @@ pub mod crypto {
     pub fn hash_password(password: &str) -> CryptoResult<String> {
         let mut rng = rand::thread_rng();
         let salt: [u8; 32] = rng.gen();
-        
+
         let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, 32)
             .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
-        
+
         let mut output = vec![0u8; 32];
         scrypt::scrypt(password.as_bytes(), &salt, &params, &mut output)
             .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
-        
+
         // Combine salt and hash
         let mut result = Vec::new();
         result.extend_from_slice(&salt);
         result.extend_from_slice(&output);
-        
+
         Ok(BASE64.encode(&result))
     }
 
     /// Verify a password against a hash
     pub fn verify_password(password: &str, hash: &str) -> CryptoResult<bool> {
         let decoded = BASE64.decode(hash)?;
-        
+
         if decoded.len() != 64 {
             return Err(CryptoError::Encryption("Invalid hash format".to_string()));
         }
-        
+
         let salt = &decoded[..32];
         let stored_hash = &decoded[32..64];
-        
+
         let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, 32)
             .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
-        
+
         let mut output = vec![0u8; 32];
         scrypt::scrypt(password.as_bytes(), salt, &params, &mut output)
             .map_err(|e| CryptoError::KeyDerivation(e.to_string()))?;
-        
+
         Ok(output.as_slice() == stored_hash)
     }
 }

@@ -17,13 +17,13 @@
 //! everyday commands don't re-prompt or re-run Argon2id every call. The
 //! passphrase can also come from `$BLACKBOOK_PASSPHRASE` for automation.
 
-use argon2::{Argon2, Algorithm, Version, Params};
+use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
-use crate::blackbook_core::{aead_seal, aead_open};
+use crate::blackbook_core::{aead_open, aead_seal};
 
 /// Argon2id cost parameters. 64 MiB / t=3 / p=1 — the OWASP-recommended
 /// baseline, comfortably stronger than the server's per-message scrypt and
@@ -47,7 +47,9 @@ pub enum CredError {
     Kdf(String),
     #[error("decrypt failed — wrong passphrase or corrupt profile")]
     Decrypt,
-    #[error("this profile is encrypted; unlock it (`blackbook unlock`) or set $BLACKBOOK_PASSPHRASE")]
+    #[error(
+        "this profile is encrypted; unlock it (`blackbook unlock`) or set $BLACKBOOK_PASSPHRASE"
+    )]
     Locked,
     #[error("profile passphrase required (set $BLACKBOOK_PASSPHRASE, or run interactively to be prompted)")]
     NoPassphrase,
@@ -83,19 +85,31 @@ pub fn argon2_key(passphrase: &str, salt: &[u8]) -> Result<(Zeroizing<[u8; 32]>,
 
 /// Argon2id-derive with explicit cost parameters (for opening an envelope that
 /// recorded its own costs).
-pub fn argon2_key_with(passphrase: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<Zeroizing<[u8; 32]>> {
+pub fn argon2_key_with(
+    passphrase: &str,
+    salt: &[u8],
+    m: u32,
+    t: u32,
+    p: u32,
+) -> Result<Zeroizing<[u8; 32]>> {
     derive_kek(passphrase, salt, m, t, p)
 }
 
 /// Derive the 32-byte KEK from a passphrase + salt with Argon2id. The derived
 /// key is returned in a [`Zeroizing`] wrapper so it is wiped from memory once
 /// the caller is done sealing/opening with it.
-fn derive_kek(passphrase: &str, salt: &[u8], m: u32, t: u32, p: u32) -> Result<Zeroizing<[u8; 32]>> {
-    let params = Params::new(m, t, p, Some(32))
-        .map_err(|e| CredError::Kdf(e.to_string()))?;
+fn derive_kek(
+    passphrase: &str,
+    salt: &[u8],
+    m: u32,
+    t: u32,
+    p: u32,
+) -> Result<Zeroizing<[u8; 32]>> {
+    let params = Params::new(m, t, p, Some(32)).map_err(|e| CredError::Kdf(e.to_string()))?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = Zeroizing::new([0u8; 32]);
-    argon.hash_password_into(passphrase.as_bytes(), salt, out.as_mut_slice())
+    argon
+        .hash_password_into(passphrase.as_bytes(), salt, out.as_mut_slice())
         .map_err(|e| CredError::Kdf(e.to_string()))?;
     Ok(out)
 }
@@ -128,7 +142,8 @@ impl EncryptedProfile {
     pub fn derive_kek(&self, passphrase: &str) -> Result<Zeroizing<[u8; 32]>> {
         use base64::Engine as _;
         let salt = base64::engine::general_purpose::STANDARD
-            .decode(&self.salt).map_err(|e| CredError::B64(e.to_string()))?;
+            .decode(&self.salt)
+            .map_err(|e| CredError::B64(e.to_string()))?;
         derive_kek(passphrase, &salt, self.m_cost, self.t_cost, self.p_cost)
     }
 
@@ -138,8 +153,11 @@ impl EncryptedProfile {
     pub fn open_with_kek(&self, kek: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         use base64::Engine as _;
         let ct = base64::engine::general_purpose::STANDARD
-            .decode(&self.ct).map_err(|e| CredError::B64(e.to_string()))?;
-        aead_open(&ct, kek).map(Zeroizing::new).map_err(|_| CredError::Decrypt)
+            .decode(&self.ct)
+            .map_err(|e| CredError::B64(e.to_string()))?;
+        aead_open(&ct, kek)
+            .map(Zeroizing::new)
+            .map_err(|_| CredError::Decrypt)
     }
 
     /// Decrypt the inner JSON directly from a passphrase.
@@ -159,27 +177,44 @@ impl EncryptedProfile {
 /// `rpassword` on Windows reads the console device directly (not stdin), so
 /// closing the child's stdin is not enough; this flag is the reliable guard.
 pub fn prompts_suppressed() -> bool {
-    std::env::var("BLACKBOOK_NO_PROMPT").map(|v| !v.is_empty()).unwrap_or(false)
+    std::env::var("BLACKBOOK_NO_PROMPT")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 /// Resolve a passphrase for sealing/opening: explicit arg → $BLACKBOOK_PASSPHRASE
 /// → interactive no-echo prompt (only if attached to a TTY). `confirm` asks
 /// twice when prompting (used at login/seal time).
-pub fn resolve_passphrase(explicit: Option<&str>, prompt: &str, confirm: bool) -> Result<Zeroizing<String>> {
+pub fn resolve_passphrase(
+    explicit: Option<&str>,
+    prompt: &str,
+    confirm: bool,
+) -> Result<Zeroizing<String>> {
     if let Some(p) = explicit {
-        if !p.is_empty() { return Ok(Zeroizing::new(p.to_string())); }
+        if !p.is_empty() {
+            return Ok(Zeroizing::new(p.to_string()));
+        }
     }
     if let Ok(p) = std::env::var("BLACKBOOK_PASSPHRASE") {
-        if !p.is_empty() { return Ok(Zeroizing::new(p)); }
+        if !p.is_empty() {
+            return Ok(Zeroizing::new(p));
+        }
     }
-    if prompts_suppressed() { return Err(CredError::NoPassphrase); }
+    if prompts_suppressed() {
+        return Err(CredError::NoPassphrase);
+    }
     // Fall back to an interactive prompt. rpassword errors if there's no TTY,
     // which we surface as NoPassphrase so automation gets a clear message.
-    let p1 = Zeroizing::new(rpassword::prompt_password(prompt).map_err(|_| CredError::NoPassphrase)?);
-    if p1.is_empty() { return Err(CredError::NoPassphrase); }
+    let p1 =
+        Zeroizing::new(rpassword::prompt_password(prompt).map_err(|_| CredError::NoPassphrase)?);
+    if p1.is_empty() {
+        return Err(CredError::NoPassphrase);
+    }
     if confirm {
-        let p2 = Zeroizing::new(rpassword::prompt_password("Confirm passphrase: ")
-            .map_err(|_| CredError::NoPassphrase)?);
+        let p2 = Zeroizing::new(
+            rpassword::prompt_password("Confirm passphrase: ")
+                .map_err(|_| CredError::NoPassphrase)?,
+        );
         if *p1 != *p2 {
             return Err(CredError::Kdf("passphrases did not match".into()));
         }
@@ -201,8 +236,12 @@ struct AgentEntry {
 }
 
 fn agent_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| CredError::Io(
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no home directory")))?;
+    let home = dirs::home_dir().ok_or_else(|| {
+        CredError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory",
+        ))
+    })?;
     Ok(home.join(".bbk").join("agent"))
 }
 
@@ -211,7 +250,10 @@ fn agent_path(profile: &str) -> Result<PathBuf> {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Cache a derived KEK for `profile` for `ttl_secs`, `0600`.
@@ -241,8 +283,14 @@ pub fn agent_get(profile: &str) -> Option<Zeroizing<[u8; 32]>> {
         let _ = secure_delete(&path);
         return None;
     }
-    let raw = Zeroizing::new(base64::engine::general_purpose::STANDARD.decode(&entry.kek).ok()?);
-    if raw.len() != 32 { return None; }
+    let raw = Zeroizing::new(
+        base64::engine::general_purpose::STANDARD
+            .decode(&entry.kek)
+            .ok()?,
+    );
+    if raw.len() != 32 {
+        return None;
+    }
     let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(&raw);
     Some(out)
@@ -264,8 +312,8 @@ pub fn agent_clear(profile: &str) -> bool {
 /// structured, and wear-levelled (SSD) filesystems may still retain the old
 /// blocks, so it complements — does not replace — full-disk encryption.
 pub fn secure_delete(path: &Path) -> std::io::Result<()> {
-    use std::io::{Seek, SeekFrom, Write};
     use rand::RngCore;
+    use std::io::{Seek, SeekFrom, Write};
     if let Ok(meta) = std::fs::metadata(path) {
         let len = meta.len();
         if len > 0 {
@@ -276,7 +324,9 @@ pub fn secure_delete(path: &Path) -> std::io::Result<()> {
                 while remaining > 0 {
                     rand::thread_rng().fill_bytes(&mut buf);
                     let n = remaining.min(buf.len() as u64) as usize;
-                    if f.write_all(&buf[..n]).is_err() { break; }
+                    if f.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
                     remaining -= n as u64;
                 }
                 let _ = f.flush();
@@ -298,7 +348,9 @@ fn harden_perms(path: &std::path::Path) {
         }
     }
     #[cfg(not(unix))]
-    { let _ = path; }
+    {
+        let _ = path;
+    }
 }
 
 #[cfg(test)]
@@ -323,12 +375,19 @@ mod tests {
     #[test]
     fn wrong_passphrase_is_rejected() {
         let env = seal_profile("right", b"payload").unwrap();
-        assert!(matches!(env.open_with_passphrase("wrong"), Err(CredError::Decrypt)));
+        assert!(matches!(
+            env.open_with_passphrase("wrong"),
+            Err(CredError::Decrypt)
+        ));
     }
 
     #[test]
     fn secure_delete_removes_the_file() {
-        let path = std::env::temp_dir().join(format!("bbk-sd-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let path = std::env::temp_dir().join(format!(
+            "bbk-sd-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::write(&path, b"sensitive-bytes-that-should-be-scrubbed").unwrap();
         assert!(path.exists());
         secure_delete(&path).unwrap();

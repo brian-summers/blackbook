@@ -100,7 +100,9 @@ pub enum AuthMethod {
 }
 
 impl AuthenticatedClient {
-    pub fn is_admin(&self) -> bool { self.role == "admin" }
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
+    }
 }
 
 impl FromRequest for AuthenticatedClient {
@@ -119,34 +121,50 @@ impl FromRequest for AuthenticatedClient {
         let peer = req.conn_data::<PeerCertInfo>().cloned();
 
         Box::pin(async move {
-            let state = state.ok_or_else(|| {
-                actix_error::ErrorInternalServerError("app state missing")
-            })?;
+            let state =
+                state.ok_or_else(|| actix_error::ErrorInternalServerError("app state missing"))?;
             let by_cert = if let Some(p) = peer.as_ref() {
-                lookup_by_cn(&state.db, &state.metadata_enc_key, &state.name_index_key,
-                             &p.common_name, &p.fingerprint).await
-                    .map_err(|e| actix_error::ErrorInternalServerError(e.to_string()))?
-            } else { None };
+                lookup_by_cn(
+                    &state.db,
+                    &state.metadata_enc_key,
+                    &state.name_index_key,
+                    &p.common_name,
+                    &p.fingerprint,
+                )
+                .await
+                .map_err(|e| actix_error::ErrorInternalServerError(e.to_string()))?
+            } else {
+                None
+            };
             let by_token = if let Some(t) = token_value.as_ref() {
-                lookup_by_token(&state.db, &state.metadata_enc_key, t).await
+                lookup_by_token(&state.db, &state.metadata_enc_key, t)
+                    .await
                     .map_err(|e| actix_error::ErrorInternalServerError(e.to_string()))?
-            } else { None };
+            } else {
+                None
+            };
 
             // Both factors are mandatory and must agree. No cert-only or
             // token-only path exists — a full bundle (cert + key + token,
             // all bound to one identity) is the only accepted credential.
             match (by_cert, by_token) {
                 (Some(c), Some(t)) if c.id == t.id => {
-                    let mut x = c; x.auth_method = AuthMethod::MutualTlsAndToken; Ok(x)
+                    let mut x = c;
+                    x.auth_method = AuthMethod::MutualTlsAndToken;
+                    Ok(x)
                 }
                 (Some(_), Some(_)) => Err(actix_error::ErrorUnauthorized(
-                    "client certificate and bearer token identify different clients")),
+                    "client certificate and bearer token identify different clients",
+                )),
                 (Some(_), None) => Err(actix_error::ErrorUnauthorized(
-                    "a bearer token is required in addition to the client certificate")),
+                    "a bearer token is required in addition to the client certificate",
+                )),
                 (None, Some(_)) => Err(actix_error::ErrorUnauthorized(
-                    "a client certificate is required in addition to the bearer token")),
+                    "a client certificate is required in addition to the bearer token",
+                )),
                 (None, None) => Err(actix_error::ErrorUnauthorized(
-                    "both a client certificate and a bearer token are required")),
+                    "both a client certificate and a bearer token are required",
+                )),
             }
         })
     }
@@ -160,8 +178,11 @@ impl FromRequest for AuthenticatedClient {
 // client cannot replay the previous cert because its fingerprint no longer
 // matches the row.
 async fn lookup_by_cn(
-    db: &PgPool, metadata_enc_key: &[u8], name_index_key: &[u8],
-    cn: &str, fingerprint: &str,
+    db: &PgPool,
+    metadata_enc_key: &[u8],
+    name_index_key: &[u8],
+    cn: &str,
+    fingerprint: &str,
 ) -> sqlx::Result<Option<AuthenticatedClient>> {
     let name_id = crate::server::client_name_id_hex(name_index_key, cn);
     let row: Option<(String, Vec<u8>, String, Option<NaiveDateTime>)> = sqlx::query_as(
@@ -173,14 +194,23 @@ async fn lookup_by_cn(
     .fetch_optional(db)
     .await?;
     Ok(row.and_then(|(id, name_enc, role, exp)| {
-        if exp.map(|e| e <= Utc::now().naive_utc()).unwrap_or(false) { return None; }
+        if exp.map(|e| e <= Utc::now().naive_utc()).unwrap_or(false) {
+            return None;
+        }
         let name = crate::server::dec_str(metadata_enc_key, &name_enc).ok()?;
-        Some(AuthenticatedClient { id, name, role, auth_method: AuthMethod::MutualTlsAndToken })
+        Some(AuthenticatedClient {
+            id,
+            name,
+            role,
+            auth_method: AuthMethod::MutualTlsAndToken,
+        })
     }))
 }
 
 async fn lookup_by_token(
-    db: &PgPool, metadata_enc_key: &[u8], token: &str,
+    db: &PgPool,
+    metadata_enc_key: &[u8],
+    token: &str,
 ) -> sqlx::Result<Option<AuthenticatedClient>> {
     let hash = hash_token(token);
     let row: Option<(String, Vec<u8>, String, Option<NaiveDateTime>)> = sqlx::query_as(
@@ -191,9 +221,16 @@ async fn lookup_by_token(
     .fetch_optional(db)
     .await?;
     Ok(row.and_then(|(id, name_enc, role, exp)| {
-        if exp.map(|e| e <= Utc::now().naive_utc()).unwrap_or(false) { return None; }
+        if exp.map(|e| e <= Utc::now().naive_utc()).unwrap_or(false) {
+            return None;
+        }
         let name = crate::server::dec_str(metadata_enc_key, &name_enc).ok()?;
-        Some(AuthenticatedClient { id, name, role, auth_method: AuthMethod::MutualTlsAndToken })
+        Some(AuthenticatedClient {
+            id,
+            name,
+            role,
+            auth_method: AuthMethod::MutualTlsAndToken,
+        })
     }))
 }
 
@@ -208,7 +245,9 @@ pub enum AclDecision {
 }
 
 impl AclDecision {
-    pub fn is_allowed(&self) -> bool { !matches!(self, AclDecision::Denied) }
+    pub fn is_allowed(&self) -> bool {
+        !matches!(self, AclDecision::Denied)
+    }
 }
 
 /// Decide whether `client` may perform `action` on `resource_name` in
@@ -224,16 +263,22 @@ pub async fn acl_check(
     resource_name: &str,
     action: AclAction,
 ) -> sqlx::Result<AclDecision> {
-    if client.is_admin() { return Ok(AclDecision::AllowedAdmin); }
+    if client.is_admin() {
+        return Ok(AclDecision::AllowedAdmin);
+    }
 
     let domain_admin: Option<i32> = sqlx::query_scalar(
         "SELECT 1 FROM blackbook_domain_members
          WHERE client_id = $1 AND domain_id = $2 AND role = 'admin'
          LIMIT 1",
     )
-    .bind(&client.id).bind(domain_id)
-    .fetch_optional(db).await?;
-    if domain_admin.is_some() { return Ok(AclDecision::AllowedDomainAdmin); }
+    .bind(&client.id)
+    .bind(domain_id)
+    .fetch_optional(db)
+    .await?;
+    if domain_admin.is_some() {
+        return Ok(AclDecision::AllowedDomainAdmin);
+    }
 
     // Patterns are AEAD-encrypted at rest, so SQL can't do the LIKE match
     // anymore. Pull every candidate grant that matches everything *but* the
@@ -259,17 +304,26 @@ pub async fn acl_check(
     .fetch_all(db).await?;
     for (id, pattern_enc, schedule, rate_max, rate_period, rate_count, rate_window) in candidates {
         let pattern = match crate::blackbook_core::aead_open(&pattern_enc, metadata_enc_key) {
-            Ok(b) => match String::from_utf8(b) { Ok(s) => s, Err(_) => continue },
+            Ok(b) => match String::from_utf8(b) {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
             Err(_) => continue,
         };
-        if !sql_like_match(&pattern, resource_name) { continue; }
+        if !sql_like_match(&pattern, resource_name) {
+            continue;
+        }
         let now = Utc::now().naive_utc();
         // Cron-style allowed-access window. A malformed schedule fails closed.
         if let Some(sched) = &schedule {
-            if !cron_window_matches(sched, &now).unwrap_or(false) { continue; }
+            if !cron_window_matches(sched, &now).unwrap_or(false) {
+                continue;
+            }
         }
         // Per-rule fixed-window rate limit.
-        if !rate_ok(rate_max, rate_period, rate_count, rate_window, now) { continue; }
+        if !rate_ok(rate_max, rate_period, rate_count, rate_window, now) {
+            continue;
+        }
         return Ok(AclDecision::Allowed(id));
     }
     Ok(AclDecision::Denied)
@@ -290,22 +344,29 @@ pub async fn acl_check(
 pub fn sql_like_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    let (mut i, mut j) = (0usize, 0usize);          // i over text, j over pattern
-    let mut star: Option<usize> = None;             // index in p of the last '*'
-    let mut mark = 0usize;                           // text index when '*' was seen
+    let (mut i, mut j) = (0usize, 0usize); // i over text, j over pattern
+    let mut star: Option<usize> = None; // index in p of the last '*'
+    let mut mark = 0usize; // text index when '*' was seen
     while i < t.len() {
         if j < p.len() && (p[j] == '_' || p[j] == t[i]) {
-            i += 1; j += 1;
+            i += 1;
+            j += 1;
         } else if j < p.len() && p[j] == '*' {
-            star = Some(j); mark = i; j += 1;
+            star = Some(j);
+            mark = i;
+            j += 1;
         } else if let Some(s) = star {
             // Backtrack: let the last '*' absorb one more text char.
-            j = s + 1; mark += 1; i = mark;
+            j = s + 1;
+            mark += 1;
+            i = mark;
         } else {
             return false;
         }
     }
-    while j < p.len() && p[j] == '*' { j += 1; }
+    while j < p.len() && p[j] == '*' {
+        j += 1;
+    }
     j == p.len()
 }
 
@@ -336,12 +397,16 @@ fn cron_field(field: &str, val: u32, min: u32, max: u32) -> Result<bool, String>
             Some((r, s)) => (r, s.parse::<u32>().map_err(|_| format!("bad step '{s}'"))?),
             None => (term, 1),
         };
-        if step == 0 { return Err("step may not be 0".into()); }
+        if step == 0 {
+            return Err("step may not be 0".into());
+        }
         let (lo, hi) = if range == "*" {
             (min, max)
         } else if let Some((a, b)) = range.split_once('-') {
-            (a.parse().map_err(|_| format!("bad range '{range}'"))?,
-             b.parse().map_err(|_| format!("bad range '{range}'"))?)
+            (
+                a.parse().map_err(|_| format!("bad range '{range}'"))?,
+                b.parse().map_err(|_| format!("bad range '{range}'"))?,
+            )
         } else {
             let v: u32 = range.parse().map_err(|_| format!("bad value '{range}'"))?;
             (v, v)
@@ -356,11 +421,18 @@ fn cron_field(field: &str, val: u32, min: u32, max: u32) -> Result<bool, String>
 /// Fixed-window rate check: given a rule's limit and current window state, is
 /// another access allowed *now*? `None` for `max`/`period` means "no limit".
 pub fn rate_ok(
-    rate_max: Option<i32>, rate_period_secs: Option<i32>,
-    rate_count: i32, window_start: Option<NaiveDateTime>, now: NaiveDateTime,
+    rate_max: Option<i32>,
+    rate_period_secs: Option<i32>,
+    rate_count: i32,
+    window_start: Option<NaiveDateTime>,
+    now: NaiveDateTime,
 ) -> bool {
-    let (Some(max), Some(period)) = (rate_max, rate_period_secs) else { return true };
-    if max <= 0 || period <= 0 { return true; }
+    let (Some(max), Some(period)) = (rate_max, rate_period_secs) else {
+        return true;
+    };
+    if max <= 0 || period <= 0 {
+        return true;
+    }
     match window_start {
         // No window yet, or the current window has fully elapsed → fresh budget.
         None => true,
@@ -401,27 +473,36 @@ pub async fn acl_record_use(db: &PgPool, decision: &AclDecision) {
 /// Resolve a friendly domain name to its row id. `Ok(None)` if the domain
 /// doesn't exist or is archived.
 pub async fn resolve_domain(
-    db: &PgPool, name_index_key: &[u8], name: &str,
+    db: &PgPool,
+    name_index_key: &[u8],
+    name: &str,
 ) -> sqlx::Result<Option<String>> {
     let name_id = crate::server::domain_name_id_hex(name_index_key, name);
     sqlx::query_scalar::<_, String>(
         "SELECT id FROM blackbook_domains WHERE name_id = $1 AND archived_at IS NULL",
     )
     .bind(&name_id)
-    .fetch_optional(db).await
+    .fetch_optional(db)
+    .await
 }
 
 /// Is the client allowed to touch the given domain at all? Global admins
 /// pass unconditionally; otherwise they must have a membership row.
 pub async fn domain_member(
-    db: &PgPool, client: &AuthenticatedClient, domain_id: &str,
+    db: &PgPool,
+    client: &AuthenticatedClient,
+    domain_id: &str,
 ) -> sqlx::Result<bool> {
-    if client.is_admin() { return Ok(true); }
+    if client.is_admin() {
+        return Ok(true);
+    }
     let row: Option<i32> = sqlx::query_scalar(
         "SELECT 1 FROM blackbook_domain_members WHERE client_id = $1 AND domain_id = $2 LIMIT 1",
     )
-    .bind(&client.id).bind(domain_id)
-    .fetch_optional(db).await?;
+    .bind(&client.id)
+    .bind(domain_id)
+    .fetch_optional(db)
+    .await?;
     Ok(row.is_some())
 }
 
@@ -431,15 +512,21 @@ pub async fn domain_member(
 /// no global privilege (client provisioning, audit, cross-domain ops stay
 /// reserved for global admins).
 pub async fn domain_admin(
-    db: &PgPool, client: &AuthenticatedClient, domain_id: &str,
+    db: &PgPool,
+    client: &AuthenticatedClient,
+    domain_id: &str,
 ) -> sqlx::Result<bool> {
-    if client.is_admin() { return Ok(true); }
+    if client.is_admin() {
+        return Ok(true);
+    }
     let row: Option<i32> = sqlx::query_scalar(
         "SELECT 1 FROM blackbook_domain_members
          WHERE client_id = $1 AND domain_id = $2 AND role = 'admin' LIMIT 1",
     )
-    .bind(&client.id).bind(domain_id)
-    .fetch_optional(db).await?;
+    .bind(&client.id)
+    .bind(domain_id)
+    .fetch_optional(db)
+    .await?;
     Ok(row.is_some())
 }
 
@@ -447,14 +534,16 @@ pub async fn domain_admin(
 /// Empty for non-admins with no domain-admin role; global admins should be
 /// handled separately (they see everything).
 pub async fn admin_domain_ids(
-    db: &PgPool, client: &AuthenticatedClient,
+    db: &PgPool,
+    client: &AuthenticatedClient,
 ) -> sqlx::Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT domain_id FROM blackbook_domain_members
          WHERE client_id = $1 AND role = 'admin'",
     )
     .bind(&client.id)
-    .fetch_all(db).await?;
+    .fetch_all(db)
+    .await?;
     Ok(rows.into_iter().map(|(d,)| d).collect())
 }
 
@@ -510,25 +599,35 @@ pub async fn audit(
         // Constant key for the audit chain's advisory lock — arbitrary, just
         // needs to be unique within Blackbook. Released on COMMIT/ROLLBACK.
         sqlx::query("SELECT pg_advisory_xact_lock(7919001)")
-            .execute(&mut *tx).await?;
-        let prev: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT row_hash FROM blackbook_audit ORDER BY id DESC LIMIT 1",
-        ).fetch_optional(&mut *tx).await?;
+            .execute(&mut *tx)
+            .await?;
+        let prev: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT row_hash FROM blackbook_audit ORDER BY id DESC LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?;
         let prev_hash_bytes: [u8; 32] = match prev.and_then(|(opt,)| opt) {
             Some(hex_str) => {
                 let mut buf = [0u8; 32];
-                if hex::decode_to_slice(&hex_str, &mut buf).is_ok() { buf }
-                else { [0u8; 32] }
+                if hex::decode_to_slice(&hex_str, &mut buf).is_ok() {
+                    buf
+                } else {
+                    [0u8; 32]
+                }
             }
             None => [0u8; 32],
         };
         let row_hash = compute_audit_hash(
-            hmac_key, &prev_hash_bytes,
+            hmac_key,
+            &prev_hash_bytes,
             ts.timestamp_micros(),
-            client_id, action, resource, status.as_str(), message,
+            client_id,
+            action,
+            resource,
+            status.as_str(),
+            message,
         );
         let prev_hash_hex = hex::encode(prev_hash_bytes);
-        let row_hash_hex  = hex::encode(row_hash);
+        let row_hash_hex = hex::encode(row_hash);
         sqlx::query(
             "INSERT INTO blackbook_audit
              (ts, client_id, action, status, resource_enc, message_enc, prev_hash, row_hash)
@@ -542,10 +641,12 @@ pub async fn audit(
         .bind(enc_message.as_deref())
         .bind(&prev_hash_hex)
         .bind(&row_hash_hex)
-        .execute(&mut *tx).await?;
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
-    }.await;
+    }
+    .await;
     if let Err(e) = result {
         log::warn!("audit insert failed (action={action}, status={status:?}): {e}");
     }
@@ -597,7 +698,12 @@ fn write_audit_opt<D: sha3::Digest>(h: &mut D, s: Option<&str>) {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum AuditStatus { Ok, Denied, NotFound, Error }
+pub enum AuditStatus {
+    Ok,
+    Denied,
+    NotFound,
+    Error,
+}
 impl AuditStatus {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -625,7 +731,9 @@ pub async fn bootstrap_admin_if_needed(
     )
     .fetch_one(db)
     .await?;
-    if exists.0 { return Ok(None); }
+    if exists.0 {
+        return Ok(None);
+    }
 
     let token = generate_token();
     let token_hash = hash_token(&token);
@@ -684,15 +792,21 @@ pub fn user_domain_name(client_name: &str) -> String {
 /// Returns the user-domain name. Shared by `create_client` and the admin
 /// bootstrap so every identity gets one consistently.
 pub async fn ensure_user_domain(
-    db: &PgPool, metadata_enc_key: &[u8], name_index_key: &[u8],
-    client_id: &str, client_name: &str,
+    db: &PgPool,
+    metadata_enc_key: &[u8],
+    name_index_key: &[u8],
+    client_id: &str,
+    client_name: &str,
 ) -> Result<String, AuthOpError> {
     let dname = user_domain_name(client_name);
     let name_id = crate::server::domain_name_id_hex(name_index_key, &dname);
     // Find or create the domain.
     let existing: Option<(String,)> = sqlx::query_as(
         "SELECT id FROM blackbook_domains WHERE name_id = $1 AND archived_at IS NULL",
-    ).bind(&name_id).fetch_optional(db).await?;
+    )
+    .bind(&name_id)
+    .fetch_optional(db)
+    .await?;
     let domain_id = match existing {
         Some((id,)) => id,
         None => {
@@ -700,17 +814,26 @@ pub async fn ensure_user_domain(
             let name_enc = crate::blackbook_core::aead_seal(dname.as_bytes(), metadata_enc_key)
                 .map_err(AuthOpError::Crypto)?;
             let desc_enc = crate::blackbook_core::aead_seal(
-                format!("Private user domain for {client_name}").as_bytes(), metadata_enc_key)
-                .map_err(AuthOpError::Crypto)?;
+                format!("Private user domain for {client_name}").as_bytes(),
+                metadata_enc_key,
+            )
+            .map_err(AuthOpError::Crypto)?;
             sqlx::query(
                 "INSERT INTO blackbook_domains (id, name_enc, name_id, description_enc)
                  VALUES ($1, $2, $3, $4) ON CONFLICT (name_id) DO NOTHING",
-            ).bind(&id).bind(&name_enc).bind(&name_id).bind(&desc_enc)
-            .execute(db).await?;
+            )
+            .bind(&id)
+            .bind(&name_enc)
+            .bind(&name_id)
+            .bind(&desc_enc)
+            .execute(db)
+            .await?;
             // Re-read in case a concurrent create won the ON CONFLICT race.
-            let (id,): (String,) = sqlx::query_as(
-                "SELECT id FROM blackbook_domains WHERE name_id = $1",
-            ).bind(&name_id).fetch_one(db).await?;
+            let (id,): (String,) =
+                sqlx::query_as("SELECT id FROM blackbook_domains WHERE name_id = $1")
+                    .bind(&name_id)
+                    .fetch_one(db)
+                    .await?;
             id
         }
     };
@@ -718,7 +841,11 @@ pub async fn ensure_user_domain(
     sqlx::query(
         "INSERT INTO blackbook_domain_members (domain_id, client_id, role)
          VALUES ($1, $2, 'admin') ON CONFLICT (domain_id, client_id) DO UPDATE SET role = 'admin'",
-    ).bind(&domain_id).bind(client_id).execute(db).await?;
+    )
+    .bind(&domain_id)
+    .bind(client_id)
+    .execute(db)
+    .await?;
     Ok(dname)
 }
 
@@ -766,19 +893,28 @@ pub async fn create_client(
     let default_name_id = crate::server::domain_name_id_hex(name_index_key, "default");
     let default_id: Option<(String,)> = sqlx::query_as(
         "SELECT id FROM blackbook_domains WHERE name_id = $1 AND archived_at IS NULL",
-    ).bind(&default_name_id).fetch_optional(db).await?;
+    )
+    .bind(&default_name_id)
+    .fetch_optional(db)
+    .await?;
     if let Some((domain_id,)) = default_id {
         let _ = sqlx::query(
             "INSERT INTO blackbook_domain_members (domain_id, client_id, role)
              VALUES ($1, $2, 'user') ON CONFLICT DO NOTHING",
-        ).bind(&domain_id).bind(&id).execute(db).await;
+        )
+        .bind(&domain_id)
+        .bind(&id)
+        .execute(db)
+        .await;
     }
 
     // Give the client its own private, fully-administered user domain (`~name`).
     let user_domain = ensure_user_domain(db, metadata_enc_key, name_index_key, &id, name).await?;
 
     Ok(NewClient {
-        id, name: name.to_string(), role: role.to_string(),
+        id,
+        name: name.to_string(),
+        role: role.to_string(),
         token,
         cert_pem: cert.cert_pem,
         key_pem: cert.key_pem,
@@ -803,7 +939,9 @@ pub async fn rotate_client(
     .bind(&name_id)
     .fetch_optional(db)
     .await?;
-    let Some((id, role)) = existing else { return Ok(None); };
+    let Some((id, role)) = existing else {
+        return Ok(None);
+    };
 
     let token = generate_token();
     let token_hash = hash_token(&token);
@@ -825,7 +963,9 @@ pub async fn rotate_client(
 
     Ok(Some(NewClient {
         user_domain: user_domain_name(&name),
-        id, name: name.to_string(), role,
+        id,
+        name: name.to_string(),
+        role,
         token,
         cert_pem: cert.cert_pem,
         key_pem: cert.key_pem,
@@ -898,14 +1038,21 @@ pub async fn enroll_totp(
          SET totp_secret_enc = $1, totp_enrolled = FALSE
          WHERE id = $2",
     )
-    .bind(&enc).bind(client_id)
-    .execute(db).await?;
+    .bind(&enc)
+    .bind(client_id)
+    .execute(db)
+    .await?;
 
     let totp = totp_rs::TOTP::new(
-        totp_rs::Algorithm::SHA1, 6, 1, 30, secret.clone(),
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret.clone(),
         Some("Blackbook".to_string()),
         client_name.to_string(),
-    ).map_err(|e| AuthOpError::Totp(format!("{e:?}")))?;
+    )
+    .map_err(|e| AuthOpError::Totp(format!("{e:?}")))?;
     let uri = totp.get_url();
     let b32 = base32::encode(base32::Alphabet::RFC4648 { padding: false }, &secret);
     Ok((uri, b32))
@@ -923,19 +1070,31 @@ pub async fn verify_totp(
         "SELECT totp_secret_enc FROM blackbook_clients
          WHERE id = $1 AND totp_secret_enc IS NOT NULL",
     )
-    .bind(client_id).fetch_optional(db).await?;
-    let Some((enc,)) = row else { return Ok(false); };
+    .bind(client_id)
+    .fetch_optional(db)
+    .await?;
+    let Some((enc,)) = row else {
+        return Ok(false);
+    };
     let secret = crate::blackbook_core::decrypt_aes_gcm(&enc, kek_bytes)?;
     let totp = totp_rs::TOTP::new(
-        totp_rs::Algorithm::SHA1, 6, 1, 30, secret,
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        secret,
         Some("Blackbook".to_string()),
         client_id.to_string(),
-    ).map_err(|e| AuthOpError::Totp(format!("{e:?}")))?;
-    let ok = totp.check_current(code)
+    )
+    .map_err(|e| AuthOpError::Totp(format!("{e:?}")))?;
+    let ok = totp
+        .check_current(code)
         .map_err(|e| AuthOpError::Totp(format!("{e:?}")))?;
     if ok {
         let _ = sqlx::query("UPDATE blackbook_clients SET totp_enrolled = TRUE WHERE id = $1")
-            .bind(client_id).execute(db).await;
+            .bind(client_id)
+            .execute(db)
+            .await;
     }
     Ok(ok)
 }
@@ -956,7 +1115,7 @@ pub struct NewClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResourceFlags, compute_audit_hash, sql_like_match, cron_window_matches, rate_ok};
+    use super::{compute_audit_hash, cron_window_matches, rate_ok, sql_like_match, ResourceFlags};
     use chrono::NaiveDateTime;
 
     fn dt(s: &str) -> NaiveDateTime {
@@ -967,11 +1126,12 @@ mod tests {
     fn cron_business_hours_window() {
         // "* 9-17 * * 1-5" = weekdays 09:00–17:59.
         let sched = "* 9-17 * * 1-5";
-        assert!(cron_window_matches(sched, &dt("2026-06-19 10:30:00")).unwrap());  // Fri 10:30
-        assert!(cron_window_matches(sched, &dt("2026-06-19 17:59:00")).unwrap());  // Fri 17:59
+        assert!(cron_window_matches(sched, &dt("2026-06-19 10:30:00")).unwrap()); // Fri 10:30
+        assert!(cron_window_matches(sched, &dt("2026-06-19 17:59:00")).unwrap()); // Fri 17:59
         assert!(!cron_window_matches(sched, &dt("2026-06-19 18:00:00")).unwrap()); // Fri 18:00 (out)
         assert!(!cron_window_matches(sched, &dt("2026-06-19 08:59:00")).unwrap()); // Fri 08:59 (out)
-        assert!(!cron_window_matches(sched, &dt("2026-06-20 10:30:00")).unwrap()); // Sat (out)
+        assert!(!cron_window_matches(sched, &dt("2026-06-20 10:30:00")).unwrap());
+        // Sat (out)
     }
 
     #[test]
@@ -979,7 +1139,7 @@ mod tests {
         assert!(cron_window_matches("*/15 * * * *", &dt("2026-06-19 10:30:00")).unwrap()); // 30 % 15 == 0
         assert!(!cron_window_matches("*/15 * * * *", &dt("2026-06-19 10:31:00")).unwrap());
         assert!(cron_window_matches("0 0 1,15 * *", &dt("2026-06-15 00:00:00")).unwrap()); // 15th midnight
-        // Sunday accepted as both 0 and 7.
+                                                                                           // Sunday accepted as both 0 and 7.
         assert!(cron_window_matches("* * * * 0", &dt("2026-06-21 12:00:00")).unwrap()); // Sun
         assert!(cron_window_matches("* * * * 7", &dt("2026-06-21 12:00:00")).unwrap());
     }
@@ -987,7 +1147,8 @@ mod tests {
     #[test]
     fn cron_malformed_is_error() {
         assert!(cron_window_matches("only four fields here", &dt("2026-06-19 10:00:00")).is_err());
-        assert!(cron_window_matches("* * * * *", &dt("2026-06-19 10:00:00")).unwrap()); // always
+        assert!(cron_window_matches("* * * * *", &dt("2026-06-19 10:00:00")).unwrap());
+        // always
     }
 
     #[test]
@@ -1012,13 +1173,13 @@ mod tests {
         assert!(sql_like_match("*", "anything"));
         assert!(sql_like_match("*", ""));
         assert!(sql_like_match("prod-_", "prod-x"));
-        assert!(!sql_like_match("prod-_", "prod-xy"));        // _ is exactly one
+        assert!(!sql_like_match("prod-_", "prod-xy")); // _ is exactly one
         assert!(!sql_like_match("monthly-report-*", "weekly-report-1"));
         assert!(sql_like_match("a*b*c", "axxbyyc"));
-        assert!(!sql_like_match("a*b*c", "axxbyy"));          // missing trailing c
+        assert!(!sql_like_match("a*b*c", "axxbyy")); // missing trailing c
         assert!(sql_like_match("exact", "exact"));
         assert!(!sql_like_match("exact", "exactly"));
-        assert!(sql_like_match("**a", "a"));                  // redundant stars
+        assert!(sql_like_match("**a", "a")); // redundant stars
     }
 
     #[test]
@@ -1030,17 +1191,36 @@ mod tests {
         let text = "a".repeat(64);
         let start = std::time::Instant::now();
         assert!(!sql_like_match(pattern, &text));
-        assert!(start.elapsed().as_millis() < 100, "glob match took too long — exponential backtracking?");
+        assert!(
+            start.elapsed().as_millis() < 100,
+            "glob match took too long — exponential backtracking?"
+        );
     }
 
     #[test]
     fn audit_hash_is_deterministic() {
         let key = b"test-key-32-bytes-xxxxxxxxxxxxxxx";
         let prev = [7u8; 32];
-        let a = compute_audit_hash(key, &prev, 1_700_000_000_000_000,
-            Some("client-1"), "read", Some("res-a"), "ok", None);
-        let b = compute_audit_hash(key, &prev, 1_700_000_000_000_000,
-            Some("client-1"), "read", Some("res-a"), "ok", None);
+        let a = compute_audit_hash(
+            key,
+            &prev,
+            1_700_000_000_000_000,
+            Some("client-1"),
+            "read",
+            Some("res-a"),
+            "ok",
+            None,
+        );
+        let b = compute_audit_hash(
+            key,
+            &prev,
+            1_700_000_000_000_000,
+            Some("client-1"),
+            "read",
+            Some("res-a"),
+            "ok",
+            None,
+        );
         assert_eq!(a, b, "same inputs must produce the same hash");
     }
 
@@ -1048,28 +1228,146 @@ mod tests {
     fn audit_hash_changes_when_any_field_changes() {
         let key = b"test-key-32-bytes-xxxxxxxxxxxxxxx";
         let prev = [0u8; 32];
-        let base = compute_audit_hash(key, &prev, 100,
-            Some("c"), "read", Some("r"), "ok", Some("m"));
+        let base = compute_audit_hash(
+            key,
+            &prev,
+            100,
+            Some("c"),
+            "read",
+            Some("r"),
+            "ok",
+            Some("m"),
+        );
         // Each variant flips exactly one field; all must differ from base.
-        assert_ne!(base, compute_audit_hash(key, &[1u8;32], 100, Some("c"), "read", Some("r"), "ok", Some("m")), "prev_hash");
-        assert_ne!(base, compute_audit_hash(key, &prev, 101, Some("c"), "read", Some("r"), "ok", Some("m")), "ts");
-        assert_ne!(base, compute_audit_hash(key, &prev, 100, Some("d"), "read", Some("r"), "ok", Some("m")), "client");
-        assert_ne!(base, compute_audit_hash(key, &prev, 100, Some("c"), "delete", Some("r"), "ok", Some("m")), "action");
-        assert_ne!(base, compute_audit_hash(key, &prev, 100, Some("c"), "read", Some("x"), "ok", Some("m")), "resource");
-        assert_ne!(base, compute_audit_hash(key, &prev, 100, Some("c"), "read", Some("r"), "denied", Some("m")), "status");
-        assert_ne!(base, compute_audit_hash(key, &prev, 100, Some("c"), "read", Some("r"), "ok", Some("n")), "message");
+        assert_ne!(
+            base,
+            compute_audit_hash(
+                key,
+                &[1u8; 32],
+                100,
+                Some("c"),
+                "read",
+                Some("r"),
+                "ok",
+                Some("m")
+            ),
+            "prev_hash"
+        );
+        assert_ne!(
+            base,
+            compute_audit_hash(
+                key,
+                &prev,
+                101,
+                Some("c"),
+                "read",
+                Some("r"),
+                "ok",
+                Some("m")
+            ),
+            "ts"
+        );
+        assert_ne!(
+            base,
+            compute_audit_hash(
+                key,
+                &prev,
+                100,
+                Some("d"),
+                "read",
+                Some("r"),
+                "ok",
+                Some("m")
+            ),
+            "client"
+        );
+        assert_ne!(
+            base,
+            compute_audit_hash(
+                key,
+                &prev,
+                100,
+                Some("c"),
+                "delete",
+                Some("r"),
+                "ok",
+                Some("m")
+            ),
+            "action"
+        );
+        assert_ne!(
+            base,
+            compute_audit_hash(
+                key,
+                &prev,
+                100,
+                Some("c"),
+                "read",
+                Some("x"),
+                "ok",
+                Some("m")
+            ),
+            "resource"
+        );
+        assert_ne!(
+            base,
+            compute_audit_hash(
+                key,
+                &prev,
+                100,
+                Some("c"),
+                "read",
+                Some("r"),
+                "denied",
+                Some("m")
+            ),
+            "status"
+        );
+        assert_ne!(
+            base,
+            compute_audit_hash(
+                key,
+                &prev,
+                100,
+                Some("c"),
+                "read",
+                Some("r"),
+                "ok",
+                Some("n")
+            ),
+            "message"
+        );
         // None vs empty-string must not collide (length-prefix sentinel).
         assert_ne!(
             compute_audit_hash(key, &prev, 100, None, "read", None, "ok", None),
             compute_audit_hash(key, &prev, 100, Some(""), "read", Some(""), "ok", Some("")),
-            "None must be distinguishable from empty string");
+            "None must be distinguishable from empty string"
+        );
     }
 
     #[test]
     fn audit_hash_depends_on_key() {
         let prev = [0u8; 32];
-        let a = compute_audit_hash(b"key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &prev, 100, None, "read", None, "ok", None);
-        let b = compute_audit_hash(b"key-bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &prev, 100, None, "read", None, "ok", None);
+        let a = compute_audit_hash(
+            b"key-aaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &prev,
+            100,
+            None,
+            "read",
+            None,
+            "ok",
+            None,
+        );
+        let b = compute_audit_hash(
+            b"key-bbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &prev,
+            100,
+            None,
+            "read",
+            None,
+            "ok",
+            None,
+        );
         assert_ne!(a, b, "a different MAC key must produce a different hash");
     }
 
@@ -1109,9 +1407,12 @@ mod tests {
     #[test]
     fn resource_flags_unknown_field_is_rejected() {
         // A misspelled flag name must produce an error, not silently do nothing.
-        let result: Result<ResourceFlags, _> =
-            serde_json::from_str(r#"{"delete_on_reaad": true}"#);
-        assert!(result.is_err(), "expected error for unknown field, got {:?}", result);
+        let result: Result<ResourceFlags, _> = serde_json::from_str(r#"{"delete_on_reaad": true}"#);
+        assert!(
+            result.is_err(),
+            "expected error for unknown field, got {:?}",
+            result
+        );
     }
 
     #[test]

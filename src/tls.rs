@@ -13,8 +13,8 @@
 //! than RSA, smaller than RSA, mature in every TLS 1.3 stack.
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
 };
 use sha3::{Digest, Sha3_256};
 use std::sync::Arc;
@@ -78,7 +78,11 @@ impl Ca {
         let cert_pem = cert.pem();
         let key_pem = key_pair.serialize_pem();
         let issuer = Issuer::new(params, key_pair);
-        Ok(Self { issuer, cert_pem, key_pem })
+        Ok(Self {
+            issuer,
+            cert_pem,
+            key_pem,
+        })
     }
 
     /// Reconstruct an in-memory CA from saved PEMs so we can keep issuing child
@@ -113,11 +117,19 @@ pub fn issue_server_cert(ca: &Ca, sans: &[String]) -> Result<CertBundle> {
     // rcgen 0.14's `new` parses each SAN string into IpAddress / DnsName for us.
     let mut params = CertificateParams::new(sans.to_vec())?;
     let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, sans.first().cloned().unwrap_or_else(|| "blackbook-server".into()));
+    dn.push(
+        DnType::CommonName,
+        sans.first()
+            .cloned()
+            .unwrap_or_else(|| "blackbook-server".into()),
+    );
     dn.push(DnType::OrganizationName, "Blackbook");
     params.distinguished_name = dn;
     params.is_ca = IsCa::NoCa;
-    params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let (nb, na) = lifetime(SERVER_LIFETIME_DAYS);
     params.not_before = nb;
@@ -127,7 +139,11 @@ pub fn issue_server_cert(ca: &Ca, sans: &[String]) -> Result<CertBundle> {
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
     let fingerprint = fingerprint_pem(&cert_pem)?;
-    Ok(CertBundle { cert_pem, key_pem, fingerprint })
+    Ok(CertBundle {
+        cert_pem,
+        key_pem,
+        fingerprint,
+    })
 }
 
 /// Issue a client certificate. CN encodes the client name; later the server's
@@ -150,7 +166,11 @@ pub fn issue_client_cert(ca: &Ca, client_name: &str, ttl_days: i64) -> Result<Ce
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
     let fingerprint = fingerprint_pem(&cert_pem)?;
-    Ok(CertBundle { cert_pem, key_pem, fingerprint })
+    Ok(CertBundle {
+        cert_pem,
+        key_pem,
+        fingerprint,
+    })
 }
 
 /// Wraps the CA so it can be stored in `AppState` (Arc-shared, immutable
@@ -171,11 +191,20 @@ fn pem_to_der(pem: &str) -> Result<Vec<u8>> {
     let mut b64 = String::new();
     for line in pem.lines() {
         let line = line.trim();
-        if line.starts_with("-----BEGIN") { in_block = true; continue; }
-        if line.starts_with("-----END") { break; }
-        if in_block { b64.push_str(line); }
+        if line.starts_with("-----BEGIN") {
+            in_block = true;
+            continue;
+        }
+        if line.starts_with("-----END") {
+            break;
+        }
+        if in_block {
+            b64.push_str(line);
+        }
     }
-    if b64.is_empty() { return Err(TlsError::Pem("no PEM block found".into())); }
+    if b64.is_empty() {
+        return Err(TlsError::Pem("no PEM block found".into()));
+    }
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
@@ -234,7 +263,8 @@ mod tests {
     fn ca_round_trip_can_sign() {
         let ca = Ca::generate().unwrap();
         let reloaded = Ca::from_pem(&ca.cert_pem, &ca.key_pem).unwrap();
-        let server = issue_server_cert(&reloaded, &["localhost".into(), "127.0.0.1".into()]).unwrap();
+        let server =
+            issue_server_cert(&reloaded, &["localhost".into(), "127.0.0.1".into()]).unwrap();
         assert!(server.cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(server.key_pem.contains("PRIVATE KEY"));
     }

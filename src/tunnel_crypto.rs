@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use crate::blackbook_core::{aead_seal_nonce, aead_open_nonce, CryptoError, CryptoResult};
+use crate::blackbook_core::{aead_open_nonce, aead_seal_nonce, CryptoError, CryptoResult};
 
 /// Protocol/version label mixed into every transcript. Bump on any wire change.
 pub const TUNNEL_PROTO: &[u8] = b"blackbook/tunnel/v1";
@@ -57,7 +57,10 @@ pub struct Handshake {
 /// Role determines which directional key encrypts vs decrypts, so the two sides
 /// never share a key+nonce space (which would be catastrophic for GCM).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role { Initiator, Responder }
+pub enum Role {
+    Initiator,
+    Responder,
+}
 
 /// An established session: directional AES-256-GCM keys + monotonic per-direction
 /// nonce counters. `send`/`recv` are relative to *this* side.
@@ -119,11 +122,20 @@ fn pem_to_der(pem: &str) -> CryptoResult<Vec<u8>> {
     let mut b64 = String::new();
     for line in pem.lines() {
         let line = line.trim();
-        if line.starts_with("-----BEGIN") { in_block = true; continue; }
-        if line.starts_with("-----END") { break; }
-        if in_block { b64.push_str(line); }
+        if line.starts_with("-----BEGIN") {
+            in_block = true;
+            continue;
+        }
+        if line.starts_with("-----END") {
+            break;
+        }
+        if in_block {
+            b64.push_str(line);
+        }
     }
-    if b64.is_empty() { return Err(CryptoError::InvalidKeyFormat); }
+    if b64.is_empty() {
+        return Err(CryptoError::InvalidKeyFormat);
+    }
     base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
         .map_err(|_| CryptoError::InvalidKeyFormat)
@@ -133,29 +145,36 @@ fn pem_to_der(pem: &str) -> CryptoResult<Vec<u8>> {
 
 /// Sign `msg` with the client's certificate private key (PEM, ECDSA P-256).
 fn ecdsa_sign(key_pem: &str, msg: &[u8]) -> CryptoResult<Vec<u8>> {
+    use openssl::hash::MessageDigest;
     use openssl::pkey::PKey;
     use openssl::sign::Signer;
-    use openssl::hash::MessageDigest;
     let pkey = PKey::private_key_from_pem(key_pem.as_bytes())
         .map_err(|e| CryptoError::Encryption(format!("load client key: {e}")))?;
     let mut signer = Signer::new(MessageDigest::sha256(), &pkey)
         .map_err(|e| CryptoError::Encryption(format!("signer: {e}")))?;
-    signer.update(msg).map_err(|e| CryptoError::Encryption(e.to_string()))?;
-    signer.sign_to_vec().map_err(|e| CryptoError::Encryption(e.to_string()))
+    signer
+        .update(msg)
+        .map_err(|e| CryptoError::Encryption(e.to_string()))?;
+    signer
+        .sign_to_vec()
+        .map_err(|e| CryptoError::Encryption(e.to_string()))
 }
 
 /// Verify an ECDSA P-256 signature against the public key inside `cert_pem`.
 fn ecdsa_verify(cert_pem: &str, msg: &[u8], sig: &[u8]) -> CryptoResult<bool> {
-    use openssl::x509::X509;
-    use openssl::sign::Verifier;
     use openssl::hash::MessageDigest;
+    use openssl::sign::Verifier;
+    use openssl::x509::X509;
     let cert = X509::from_pem(cert_pem.as_bytes())
         .map_err(|e| CryptoError::Decryption(format!("parse peer cert: {e}")))?;
-    let pkey = cert.public_key()
+    let pkey = cert
+        .public_key()
         .map_err(|e| CryptoError::Decryption(format!("peer cert pubkey: {e}")))?;
     let mut verifier = Verifier::new(MessageDigest::sha256(), &pkey)
         .map_err(|e| CryptoError::Decryption(e.to_string()))?;
-    verifier.update(msg).map_err(|e| CryptoError::Decryption(e.to_string()))?;
+    verifier
+        .update(msg)
+        .map_err(|e| CryptoError::Decryption(e.to_string()))?;
     Ok(verifier.verify(sig).unwrap_or(false))
 }
 
@@ -178,7 +197,13 @@ pub struct Pending {
 /// Start a handshake: generate the ephemeral key and return the bundle plus the
 /// ephemeral public key to advertise. (The full signed `Handshake` is produced
 /// by [`complete`] once the peer's ephemeral public key is known.)
-pub fn begin(role: Role, tunnel_id: &str, my_name: &str, my_cert_pem: &str, my_key_pem: &str) -> Pending {
+pub fn begin(
+    role: Role,
+    tunnel_id: &str,
+    my_name: &str,
+    my_cert_pem: &str,
+    my_key_pem: &str,
+) -> Pending {
     use rand::rngs::OsRng;
     let eph_secret = EphemeralSecret::random_from_rng(OsRng);
     let eph_pub = PublicKey::from(&eph_secret).to_bytes();
@@ -195,7 +220,9 @@ pub fn begin(role: Role, tunnel_id: &str, my_name: &str, my_cert_pem: &str, my_k
 
 impl Pending {
     /// Our ephemeral public key (32 bytes) — send this to the peer first.
-    pub fn eph_pub(&self) -> [u8; 32] { self.eph_pub }
+    pub fn eph_pub(&self) -> [u8; 32] {
+        self.eph_pub
+    }
 
     /// Produce our signed handshake message, given the peer's ephemeral pubkey.
     /// We sign the session base (both ephemeral keys, role-ordered) bound to our
@@ -236,14 +263,17 @@ impl Pending {
         let peer_fp = cert_fingerprint(&peer.cert_pem)?;
         if peer_fp != expected_peer_fp {
             return Err(CryptoError::Decryption(
-                "peer certificate fingerprint does not match the server-vouched value".into()));
+                "peer certificate fingerprint does not match the server-vouched value".into(),
+            ));
         }
         if peer.from != expected_peer_name {
             return Err(CryptoError::Decryption(
-                "peer name does not match the server-vouched value".into()));
+                "peer name does not match the server-vouched value".into(),
+            ));
         }
 
-        let peer_eph_vec = b64.decode(peer.eph_pub.as_bytes())
+        let peer_eph_vec = b64
+            .decode(peer.eph_pub.as_bytes())
             .map_err(|_| CryptoError::Decryption("peer eph_pub not base64".into()))?;
         if peer_eph_vec.len() != 32 {
             return Err(CryptoError::Decryption("peer eph_pub wrong length".into()));
@@ -255,16 +285,18 @@ impl Pending {
         //    base (initiator eph first); the peer signed `base ‖ peer_name ‖
         //    peer_fp`, which we reconstruct from the now-verified peer identity.
         let (init_eph, resp_eph) = match self.role {
-            Role::Initiator => (self.eph_pub, peer_eph),   // peer is responder
-            Role::Responder => (peer_eph, self.eph_pub),   // peer is initiator
+            Role::Initiator => (self.eph_pub, peer_eph), // peer is responder
+            Role::Responder => (peer_eph, self.eph_pub), // peer is initiator
         };
         let base = session_base(&self.tunnel_id, &init_eph, &resp_eph);
         let peer_payload = signing_payload(&base, &peer.from, &peer_fp);
-        let sig = b64.decode(peer.signature.as_bytes())
+        let sig = b64
+            .decode(peer.signature.as_bytes())
             .map_err(|_| CryptoError::Decryption("peer signature not base64".into()))?;
         if !ecdsa_verify(&peer.cert_pem, &peer_payload, &sig)? {
             return Err(CryptoError::Decryption(
-                "peer handshake signature failed — identity not authenticated".into()));
+                "peer handshake signature failed — identity not authenticated".into(),
+            ));
         }
 
         // 3. X25519 ECDH → HKDF-SHA256 → two directional keys, salted by the
@@ -278,7 +310,10 @@ impl Pending {
             Role::Responder => (k_r2i, k_i2r),
         };
         Ok(Session {
-            send_key, recv_key, send_ctr: 0, recv_ctr: 0,
+            send_key,
+            recv_key,
+            send_ctr: 0,
+            recv_ctr: 0,
             peer_name: expected_peer_name.to_string(),
             peer_fingerprint: expected_peer_fp.to_string(),
         })
@@ -305,7 +340,9 @@ impl Session {
     /// it never repeats under a given directional key. Returns ciphertext+tag.
     pub fn seal(&mut self, plaintext: &[u8]) -> CryptoResult<Vec<u8>> {
         let nonce = ctr_nonce(self.send_ctr);
-        self.send_ctr = self.send_ctr.checked_add(1)
+        self.send_ctr = self
+            .send_ctr
+            .checked_add(1)
             .ok_or_else(|| CryptoError::Encryption("tunnel nonce space exhausted".into()))?;
         aead_seal_nonce(plaintext, &self.send_key, &nonce)
     }
@@ -315,7 +352,9 @@ impl Session {
     pub fn open(&mut self, frame: &[u8]) -> CryptoResult<Vec<u8>> {
         let nonce = ctr_nonce(self.recv_ctr);
         let pt = aead_open_nonce(frame, &self.recv_key, &nonce)?;
-        self.recv_ctr = self.recv_ctr.checked_add(1)
+        self.recv_ctr = self
+            .recv_ctr
+            .checked_add(1)
             .ok_or_else(|| CryptoError::Decryption("tunnel nonce space exhausted".into()))?;
         Ok(pt)
     }
@@ -344,10 +383,18 @@ mod tests {
         (alice, bob, ca)
     }
 
-    fn run_handshake(alice: &tls::CertBundle, bob: &tls::CertBundle)
-        -> CryptoResult<(Session, Session)> {
+    fn run_handshake(
+        alice: &tls::CertBundle,
+        bob: &tls::CertBundle,
+    ) -> CryptoResult<(Session, Session)> {
         let tid = "tunnel-123";
-        let a = begin(Role::Initiator, tid, "alice", &alice.cert_pem, &alice.key_pem);
+        let a = begin(
+            Role::Initiator,
+            tid,
+            "alice",
+            &alice.cert_pem,
+            &alice.key_pem,
+        );
         let b = begin(Role::Responder, tid, "bob", &bob.cert_pem, &bob.key_pem);
         let a_pub = a.eph_pub();
         let b_pub = b.eph_pub();
@@ -401,9 +448,16 @@ mod tests {
         // A server (or MITM) lies about bob's fingerprint → alice must reject.
         let (alice, bob, _ca) = two_clients();
         let tid = "t";
-        let a = begin(Role::Initiator, tid, "alice", &alice.cert_pem, &alice.key_pem);
+        let a = begin(
+            Role::Initiator,
+            tid,
+            "alice",
+            &alice.cert_pem,
+            &alice.key_pem,
+        );
         let b = begin(Role::Responder, tid, "bob", &bob.cert_pem, &bob.key_pem);
-        let a_pub = a.eph_pub(); let b_pub = b.eph_pub();
+        let a_pub = a.eph_pub();
+        let b_pub = b.eph_pub();
         let b_hs = b.sign(&a_pub).unwrap();
         let _a_hs = a.sign(&b_pub).unwrap();
         let bad_fp = "0".repeat(64);
@@ -419,9 +473,22 @@ mod tests {
         let (alice, bob, ca) = two_clients();
         let mallory = tls::issue_client_cert(&ca, "bob", 7).unwrap(); // same CN, different key
         let tid = "t";
-        let a = begin(Role::Initiator, tid, "alice", &alice.cert_pem, &alice.key_pem);
-        let m = begin(Role::Responder, tid, "bob", &mallory.cert_pem, &mallory.key_pem);
-        let a_pub = a.eph_pub(); let m_pub = m.eph_pub();
+        let a = begin(
+            Role::Initiator,
+            tid,
+            "alice",
+            &alice.cert_pem,
+            &alice.key_pem,
+        );
+        let m = begin(
+            Role::Responder,
+            tid,
+            "bob",
+            &mallory.cert_pem,
+            &mallory.key_pem,
+        );
+        let a_pub = a.eph_pub();
+        let m_pub = m.eph_pub();
         let m_hs = m.sign(&a_pub).unwrap();
         let _ = a.sign(&m_pub).unwrap();
         // alice expects the REAL bob's fingerprint → mallory's cert won't match.

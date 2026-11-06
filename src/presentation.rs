@@ -10,7 +10,9 @@
 
 /// One braille pattern glyph per byte (`U+2800`–`U+28FF`). 32 bytes → 32 chars.
 pub fn braille(data: &[u8]) -> String {
-    data.iter().map(|&b| char::from_u32(0x2800 + b as u32).unwrap()).collect()
+    data.iter()
+        .map(|&b| char::from_u32(0x2800 + b as u32).unwrap())
+        .collect()
 }
 
 /// OpenSSH-style "randomart": a 17×9 grid produced by a "drunken bishop" walk
@@ -30,10 +32,20 @@ pub fn randomart(data: &[u8], title: &str) -> String {
         let mut b = byte;
         for _ in 0..4 {
             let d = b & 0b11;
-            if d & 0b01 == 0 { x = x.saturating_sub(1); } else if x < W - 1 { x += 1; }
-            if d & 0b10 == 0 { y = y.saturating_sub(1); } else if y < H - 1 { y += 1; }
+            if d & 0b01 == 0 {
+                x = x.saturating_sub(1);
+            } else if x < W - 1 {
+                x += 1;
+            }
+            if d & 0b10 == 0 {
+                y = y.saturating_sub(1);
+            } else if y < H - 1 {
+                y += 1;
+            }
             let c = &mut field[y][x];
-            if (*c as usize) < COINS.len() - 1 { *c += 1; }
+            if (*c as usize) < COINS.len() - 1 {
+                *c += 1;
+            }
             b >>= 2;
         }
     }
@@ -45,9 +57,13 @@ pub fn randomart(data: &[u8], title: &str) -> String {
     for (j, row) in field.iter().enumerate() {
         out.push('|');
         for (i, &v) in row.iter().enumerate() {
-            let ch = if i == sx && j == sy { 'S' }
-                     else if i == x && j == y { 'E' }
-                     else { COINS[v as usize] as char };
+            let ch = if i == sx && j == sy {
+                'S'
+            } else if i == x && j == y {
+                'E'
+            } else {
+                COINS[v as usize] as char
+            };
             out.push(ch);
         }
         out.push_str("|\n");
@@ -60,7 +76,9 @@ pub fn randomart(data: &[u8], title: &str) -> String {
 
 /// Center `title` (wrapped in `[ ]` if non-empty) within `width` dashes.
 fn center_in(title: &str, width: usize) -> String {
-    let label = if title.is_empty() { String::new() } else {
+    let label = if title.is_empty() {
+        String::new()
+    } else {
         let t: String = title.chars().take(width.saturating_sub(2)).collect();
         format!("[{t}]")
     };

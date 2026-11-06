@@ -37,10 +37,14 @@ impl NetRateLimiter {
 
     /// Build from env with generous high-availability defaults.
     pub fn from_env() -> Self {
-        let refill = std::env::var("BLACKBOOK_NET_RATE_PER_SEC").ok()
-            .and_then(|v| v.parse().ok()).unwrap_or(100.0);
-        let burst = std::env::var("BLACKBOOK_NET_BURST").ok()
-            .and_then(|v| v.parse().ok()).unwrap_or(200.0);
+        let refill = std::env::var("BLACKBOOK_NET_RATE_PER_SEC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100.0);
+        let burst = std::env::var("BLACKBOOK_NET_BURST")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200.0);
         let me = Self::new(burst, refill);
         if me.enabled {
             log::info!("network rate limit: {refill}/s sustained, {burst} burst, per client");
@@ -53,15 +57,19 @@ impl NetRateLimiter {
     /// Consume one token for `key`. `true` = allowed. Disabled limiter always
     /// allows. Refills lazily based on elapsed time since the last request.
     pub fn allow(&self, key: &str) -> bool {
-        if !self.enabled { return true; }
+        if !self.enabled {
+            return true;
+        }
         let now = Instant::now();
         let mut buckets = self.buckets.lock();
         // Bound memory: sweep idle buckets if the map gets large.
         if buckets.len() > 8192 {
             buckets.retain(|_, b| now.duration_since(b.last).as_secs() < 300);
         }
-        let b = buckets.entry(key.to_string())
-            .or_insert(Bucket { tokens: self.capacity, last: now });
+        let b = buckets.entry(key.to_string()).or_insert(Bucket {
+            tokens: self.capacity,
+            last: now,
+        });
         let elapsed = now.duration_since(b.last).as_secs_f64();
         b.tokens = (b.tokens + elapsed * self.refill_per_sec).min(self.capacity);
         b.last = now;
@@ -98,6 +106,8 @@ mod tests {
     #[test]
     fn disabled_limiter_always_allows() {
         let rl = NetRateLimiter::new(0.0, 0.0);
-        for _ in 0..1000 { assert!(rl.allow("x")); }
+        for _ in 0..1000 {
+            assert!(rl.allow("x"));
+        }
     }
 }

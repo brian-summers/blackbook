@@ -18,12 +18,12 @@
 //! The session-start `Vouch` is the one WebSocket *text* message; the ephemeral
 //! pubkey exchange and handshakes are binary; everything after is binary AEAD.
 
-use std::collections::HashMap;
-use serde::Deserialize;
-use tokio::sync::mpsc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use futures_util::{SinkExt, StreamExt};
 use reqwest_websocket::Message;
+use serde::Deserialize;
+use std::collections::HashMap;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::client::TunnelWs;
 use crate::tunnel_crypto::{self, Role, Session};
@@ -51,7 +51,10 @@ pub enum TunnelError {
 type Result<T> = std::result::Result<T, TunnelError>;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Proto { Tcp, Udp }
+pub enum Proto {
+    Tcp,
+    Udp,
+}
 
 // --- inner mux frame kinds ---------------------------------------------------
 const KIND_OPEN_TCP: u8 = 1;
@@ -67,8 +70,14 @@ fn inner_encode(kind: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     v
 }
 fn inner_decode(buf: &[u8]) -> Option<(u8, u32, &[u8])> {
-    if buf.len() < 5 { return None; }
-    Some((buf[0], u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]), &buf[5..]))
+    if buf.len() < 5 {
+        return None;
+    }
+    Some((
+        buf[0],
+        u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]),
+        &buf[5..],
+    ))
 }
 
 // --- handshake ---------------------------------------------------------------
@@ -78,30 +87,50 @@ fn inner_decode(buf: &[u8]) -> Option<(u8, u32, &[u8])> {
 /// `ws` ready for the data plane.
 pub async fn handshake(
     ws: &mut TunnelWs,
-    my_name: &str, my_cert_pem: &str, my_key_pem: &str,
+    my_name: &str,
+    my_cert_pem: &str,
+    my_key_pem: &str,
 ) -> Result<(Session, Vouch)> {
     // 1. First relay message is the text Vouch describing our peer.
     let vouch: Vouch = match next_msg(ws).await? {
-        Some(Message::Text(t)) => serde_json::from_str(&t)
-            .map_err(|e| TunnelError::Ws(format!("bad vouch: {e}")))?,
+        Some(Message::Text(t)) => {
+            serde_json::from_str(&t).map_err(|e| TunnelError::Ws(format!("bad vouch: {e}")))?
+        }
         Some(_) => return Err(TunnelError::Ws("expected vouch text first".into())),
         None => return Err(TunnelError::PeerNeverJoined),
     };
-    let role = if vouch.you_are_initiator { Role::Initiator } else { Role::Responder };
+    let role = if vouch.you_are_initiator {
+        Role::Initiator
+    } else {
+        Role::Responder
+    };
     let pending = tunnel_crypto::begin(role, &vouch.tunnel_id, my_name, my_cert_pem, my_key_pem);
 
     // 2a. Exchange ephemeral pubkeys (raw 32 bytes).
-    ws.send(Message::Binary(pending.eph_pub().to_vec())).await
+    ws.send(Message::Binary(pending.eph_pub().to_vec()))
+        .await
         .map_err(|e| TunnelError::Ws(e.to_string()))?;
     let peer_eph = match next_msg(ws).await? {
-        Some(Message::Binary(b)) if b.len() == 32 => { let mut a = [0u8; 32]; a.copy_from_slice(&b); a }
-        _ => return Err(TunnelError::Ws("expected peer ephemeral pubkey (32 bytes)".into())),
+        Some(Message::Binary(b)) if b.len() == 32 => {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&b);
+            a
+        }
+        _ => {
+            return Err(TunnelError::Ws(
+                "expected peer ephemeral pubkey (32 bytes)".into(),
+            ))
+        }
     };
 
     // 2b. Sign over the session and exchange full handshakes.
-    let my_hs = pending.sign(&peer_eph).map_err(|e| TunnelError::Crypto(e.to_string()))?;
+    let my_hs = pending
+        .sign(&peer_eph)
+        .map_err(|e| TunnelError::Crypto(e.to_string()))?;
     let my_hs_json = serde_json::to_vec(&my_hs).map_err(|e| TunnelError::Ws(e.to_string()))?;
-    ws.send(Message::Binary(my_hs_json)).await.map_err(|e| TunnelError::Ws(e.to_string()))?;
+    ws.send(Message::Binary(my_hs_json))
+        .await
+        .map_err(|e| TunnelError::Ws(e.to_string()))?;
     let peer_hs: tunnel_crypto::Handshake = match next_msg(ws).await? {
         Some(Message::Binary(b)) => serde_json::from_slice(&b)
             .map_err(|e| TunnelError::Ws(format!("bad peer handshake: {e}")))?,
@@ -109,7 +138,8 @@ pub async fn handshake(
     };
 
     // 3. Verify peer signature against the server-vouched fingerprint.
-    let session = pending.complete(&peer_hs, &vouch.peer_name, &vouch.peer_fingerprint)
+    let session = pending
+        .complete(&peer_hs, &vouch.peer_name, &vouch.peer_fingerprint)
         .map_err(|e| TunnelError::Crypto(e.to_string()))?;
     Ok((session, vouch))
 }
@@ -119,7 +149,9 @@ async fn next_msg(ws: &mut TunnelWs) -> Result<Option<Message>> {
     loop {
         match ws.next().await {
             Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
-            Some(Ok(m @ Message::Text(_))) | Some(Ok(m @ Message::Binary(_))) => return Ok(Some(m)),
+            Some(Ok(m @ Message::Text(_))) | Some(Ok(m @ Message::Binary(_))) => {
+                return Ok(Some(m))
+            }
             Some(Ok(Message::Close { .. })) | None => return Ok(None),
             Some(Err(e)) => return Err(TunnelError::Ws(e.to_string())),
         }
@@ -136,7 +168,10 @@ async fn next_msg(ws: &mut TunnelWs) -> Result<Option<Message>> {
 
 /// Per-stream inbound sink (engine → that stream's socket pump).
 type StreamInbound = mpsc::UnboundedSender<StreamMsg>;
-enum StreamMsg { Data(Vec<u8>), Close }
+enum StreamMsg {
+    Data(Vec<u8>),
+    Close,
+}
 
 /// Command from a forwarder/listener to the engine.
 enum EngineCmd {
@@ -148,12 +183,27 @@ enum EngineCmd {
 
 /// Run as the **listener** side: bind locally and, per connection, ask the peer
 /// to dial `remote`. Blocks until the tunnel closes.
-pub async fn run_listener(ws: TunnelWs, session: Session, proto: Proto, listen: String, remote: String) -> Result<()> {
+pub async fn run_listener(
+    ws: TunnelWs,
+    session: Session,
+    proto: Proto,
+    listen: String,
+    remote: String,
+) -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<EngineCmd>();
     let streams: SharedStreams = Default::default();
     // Spawn the local acceptor that creates streams on demand.
-    let acceptor = tokio::spawn(listen_loop(proto, listen, remote, cmd_tx.clone(), streams.clone()));
-    let res = engine_loop(ws, session, cmd_rx, cmd_tx, streams, /*is_target=*/false).await;
+    let acceptor = tokio::spawn(listen_loop(
+        proto,
+        listen,
+        remote,
+        cmd_tx.clone(),
+        streams.clone(),
+    ));
+    let res = engine_loop(
+        ws, session, cmd_rx, cmd_tx, streams, /*is_target=*/ false,
+    )
+    .await;
     acceptor.abort();
     res
 }
@@ -162,7 +212,10 @@ pub async fn run_listener(ws: TunnelWs, session: Session, proto: Proto, listen: 
 pub async fn run_target(ws: TunnelWs, session: Session) -> Result<()> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<EngineCmd>();
     let streams: SharedStreams = Default::default();
-    engine_loop(ws, session, cmd_rx, cmd_tx, streams, /*is_target=*/true).await
+    engine_loop(
+        ws, session, cmd_rx, cmd_tx, streams, /*is_target=*/ true,
+    )
+    .await
 }
 
 type SharedStreams = std::sync::Arc<std::sync::Mutex<HashMap<u32, StreamInbound>>>;
@@ -227,11 +280,16 @@ async fn engine_loop(
 // --- listener (initiator side) ----------------------------------------------
 
 static NEXT_STREAM_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-fn next_sid() -> u32 { NEXT_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }
+fn next_sid() -> u32 {
+    NEXT_STREAM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 async fn listen_loop(
-    proto: Proto, listen: String, remote: String,
-    cmd_tx: mpsc::UnboundedSender<EngineCmd>, streams: SharedStreams,
+    proto: Proto,
+    listen: String,
+    remote: String,
+    cmd_tx: mpsc::UnboundedSender<EngineCmd>,
+    streams: SharedStreams,
 ) -> Result<()> {
     match proto {
         Proto::Tcp => {
@@ -241,7 +299,9 @@ async fn listen_loop(
                 let (sock, _peer) = l.accept().await?;
                 let sid = next_sid();
                 let open = inner_encode(KIND_OPEN_TCP, sid, remote.as_bytes());
-                if cmd_tx.send(EngineCmd::Send(open)).is_err() { break; }
+                if cmd_tx.send(EngineCmd::Send(open)).is_err() {
+                    break;
+                }
                 let (in_tx, in_rx) = mpsc::unbounded_channel::<StreamMsg>();
                 let _ = cmd_tx.send(EngineCmd::Register(sid, in_tx));
                 tokio::spawn(pump_tcp(sock, sid, cmd_tx.clone(), in_rx, streams.clone()));
@@ -266,7 +326,9 @@ async fn listen_loop(
                     sid
                 });
                 let data = inner_encode(KIND_DATA, sid, &buf[..n]);
-                if cmd_tx.send(EngineCmd::Send(data)).is_err() { break; }
+                if cmd_tx.send(EngineCmd::Send(data)).is_err() {
+                    break;
+                }
             }
             Ok(())
         }
@@ -274,10 +336,16 @@ async fn listen_loop(
 }
 
 /// Listener-side UDP: deliver peer replies for one source back to it.
-async fn udp_reply_pump(sock: std::sync::Arc<tokio::net::UdpSocket>, src: std::net::SocketAddr, mut in_rx: mpsc::UnboundedReceiver<StreamMsg>) {
+async fn udp_reply_pump(
+    sock: std::sync::Arc<tokio::net::UdpSocket>,
+    src: std::net::SocketAddr,
+    mut in_rx: mpsc::UnboundedReceiver<StreamMsg>,
+) {
     while let Some(msg) = in_rx.recv().await {
         match msg {
-            StreamMsg::Data(d) => { let _ = sock.send_to(&d, src).await; }
+            StreamMsg::Data(d) => {
+                let _ = sock.send_to(&d, src).await;
+            }
             StreamMsg::Close => break,
         }
     }
@@ -285,30 +353,55 @@ async fn udp_reply_pump(sock: std::sync::Arc<tokio::net::UdpSocket>, src: std::n
 
 // --- target side -------------------------------------------------------------
 
-fn spawn_target_stream(proto: Proto, sid: u32, addr: String, cmd_tx: mpsc::UnboundedSender<EngineCmd>, streams: SharedStreams) {
+fn spawn_target_stream(
+    proto: Proto,
+    sid: u32,
+    addr: String,
+    cmd_tx: mpsc::UnboundedSender<EngineCmd>,
+    streams: SharedStreams,
+) {
     let (in_tx, in_rx) = mpsc::unbounded_channel::<StreamMsg>();
     streams.lock().unwrap().insert(sid, in_tx);
     match proto {
-        Proto::Tcp => { tokio::spawn(async move {
-            match tokio::net::TcpStream::connect(&addr).await {
-                Ok(sock) => { let _ = pump_tcp(sock, sid, cmd_tx, in_rx, streams).await; }
-                Err(e) => {
-                    log::warn!("tunnel target: dial {addr} failed: {e}");
-                    let _ = cmd_tx.send(EngineCmd::Send(inner_encode(KIND_CLOSE, sid, &[])));
-                    streams.lock().unwrap().remove(&sid);
+        Proto::Tcp => {
+            tokio::spawn(async move {
+                match tokio::net::TcpStream::connect(&addr).await {
+                    Ok(sock) => {
+                        let _ = pump_tcp(sock, sid, cmd_tx, in_rx, streams).await;
+                    }
+                    Err(e) => {
+                        log::warn!("tunnel target: dial {addr} failed: {e}");
+                        let _ = cmd_tx.send(EngineCmd::Send(inner_encode(KIND_CLOSE, sid, &[])));
+                        streams.lock().unwrap().remove(&sid);
+                    }
                 }
-            }
-        }); }
-        Proto::Udp => { tokio::spawn(target_udp(sid, addr, cmd_tx, in_rx, streams)); }
+            });
+        }
+        Proto::Udp => {
+            tokio::spawn(target_udp(sid, addr, cmd_tx, in_rx, streams));
+        }
     }
 }
 
 /// Target-side UDP: one local socket per stream; send peer datagrams out, return replies.
-async fn target_udp(sid: u32, addr: String, cmd_tx: mpsc::UnboundedSender<EngineCmd>, mut in_rx: mpsc::UnboundedReceiver<StreamMsg>, streams: SharedStreams) {
+async fn target_udp(
+    sid: u32,
+    addr: String,
+    cmd_tx: mpsc::UnboundedSender<EngineCmd>,
+    mut in_rx: mpsc::UnboundedReceiver<StreamMsg>,
+    streams: SharedStreams,
+) {
     let sock = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => s, Err(e) => { log::warn!("tunnel target udp bind: {e}"); return; }
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("tunnel target udp bind: {e}");
+            return;
+        }
     };
-    if let Err(e) = sock.connect(&addr).await { log::warn!("tunnel target udp connect {addr}: {e}"); return; }
+    if let Err(e) = sock.connect(&addr).await {
+        log::warn!("tunnel target udp connect {addr}: {e}");
+        return;
+    }
     let sock = std::sync::Arc::new(sock);
     let recv_sock = sock.clone();
     let recv_tx = cmd_tx.clone();
@@ -316,14 +409,23 @@ async fn target_udp(sid: u32, addr: String, cmd_tx: mpsc::UnboundedSender<Engine
         let mut buf = vec![0u8; 65535];
         loop {
             match recv_sock.recv(&mut buf).await {
-                Ok(n) => { if recv_tx.send(EngineCmd::Send(inner_encode(KIND_DATA, sid, &buf[..n]))).is_err() { break; } }
+                Ok(n) => {
+                    if recv_tx
+                        .send(EngineCmd::Send(inner_encode(KIND_DATA, sid, &buf[..n])))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Err(_) => break,
             }
         }
     });
     while let Some(msg) = in_rx.recv().await {
         match msg {
-            StreamMsg::Data(d) => { let _ = sock.send(&d).await; }
+            StreamMsg::Data(d) => {
+                let _ = sock.send(&d).await;
+            }
             StreamMsg::Close => break,
         }
     }
@@ -336,8 +438,10 @@ async fn target_udp(sid: u32, addr: String, cmd_tx: mpsc::UnboundedSender<Engine
 /// Pipe a TCP socket ↔ the tunnel for one stream: socket reads → DATA frames to
 /// the engine; inbound StreamMsg → socket writes. Sends CLOSE when the socket ends.
 async fn pump_tcp(
-    sock: tokio::net::TcpStream, sid: u32,
-    cmd_tx: mpsc::UnboundedSender<EngineCmd>, mut in_rx: mpsc::UnboundedReceiver<StreamMsg>,
+    sock: tokio::net::TcpStream,
+    sid: u32,
+    cmd_tx: mpsc::UnboundedSender<EngineCmd>,
+    mut in_rx: mpsc::UnboundedReceiver<StreamMsg>,
     streams: SharedStreams,
 ) -> Result<()> {
     let (mut rd, mut wr) = sock.into_split();
@@ -347,15 +451,29 @@ async fn pump_tcp(
         let mut buf = vec![0u8; 32 * 1024];
         loop {
             match rd.read(&mut buf).await {
-                Ok(0) | Err(_) => { let _ = up_tx.send(EngineCmd::Send(inner_encode(KIND_CLOSE, sid, &[]))); break; }
-                Ok(n) => { if up_tx.send(EngineCmd::Send(inner_encode(KIND_DATA, sid, &buf[..n]))).is_err() { break; } }
+                Ok(0) | Err(_) => {
+                    let _ = up_tx.send(EngineCmd::Send(inner_encode(KIND_CLOSE, sid, &[])));
+                    break;
+                }
+                Ok(n) => {
+                    if up_tx
+                        .send(EngineCmd::Send(inner_encode(KIND_DATA, sid, &buf[..n])))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
         }
     });
     // tunnel → socket
     while let Some(msg) = in_rx.recv().await {
         match msg {
-            StreamMsg::Data(d) => { if wr.write_all(&d).await.is_err() { break; } }
+            StreamMsg::Data(d) => {
+                if wr.write_all(&d).await.is_err() {
+                    break;
+                }
+            }
             StreamMsg::Close => break,
         }
     }

@@ -1,5 +1,4 @@
-use clap::{Parser, Subcommand, CommandFactory};
-use zeroize::Zeroizing;
+use clap::{CommandFactory, Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Pool;
 use sqlx::Postgres;
@@ -7,25 +6,26 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
-pub mod blackbook_core;
-mod crypto_ops;
-mod crypto_cli;
-mod keys_api;
 mod audit_archive;
-mod net_ratelimit;
-mod presentation;
-mod server;
+pub mod auth;
+pub mod blackbook_core;
 mod client;
 mod credstore;
-mod webui;
+mod crypto_cli;
+mod crypto_ops;
+mod keys_api;
 mod mcp;
+mod net_ratelimit;
+pub mod persistence;
+mod presentation;
+mod server;
+pub mod tls;
+mod tunnel_client;
 mod tunnel_crypto;
 mod tunnel_relay;
-mod tunnel_client;
-pub mod auth;
-pub mod persistence;
-pub mod tls;
+mod webui;
 
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -46,11 +46,15 @@ pub enum AppError {
 pub type Result<T> = std::result::Result<T, AppError>;
 
 impl From<client::ClientError> for AppError {
-    fn from(e: client::ClientError) -> Self { AppError::Client(e.to_string()) }
+    fn from(e: client::ClientError) -> Self {
+        AppError::Client(e.to_string())
+    }
 }
 
 impl From<credstore::CredError> for AppError {
-    fn from(e: credstore::CredError) -> Self { AppError::Config(e.to_string()) }
+    fn from(e: credstore::CredError) -> Self {
+        AppError::Config(e.to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,9 +165,11 @@ enum Commands {
     /// $BLACKBOOK_OLD_PASSPHRASE / $BLACKBOOK_NEW_PASSPHRASE, or prompts.
     Passphrase {
         /// Current passphrase (else env/prompt).
-        #[arg(long)] old: Option<String>,
+        #[arg(long)]
+        old: Option<String>,
         /// New passphrase (else env/prompt, confirmed when prompted).
-        #[arg(long)] new: Option<String>,
+        #[arg(long)]
+        new: Option<String>,
     },
     /// Manage credential profiles (multiple identities).
     #[command(subcommand)]
@@ -195,45 +201,59 @@ enum Commands {
         name: String,
         value: Option<String>,
         /// Require MFA (TOTP) on every future read of this secret.
-        #[arg(short = 'M', long)] mfa_required: bool,
+        #[arg(short = 'M', long)]
+        mfa_required: bool,
         /// Delete this secret immediately after the first successful read.
-        #[arg(short = 'd', long)] delete_on_read: bool,
+        #[arg(short = 'd', long)]
+        delete_on_read: bool,
         /// Maximum number of reads before the secret refuses to authorize.
-        #[arg(short = 'n', long)] max_reads: Option<i64>,
+        #[arg(short = 'n', long)]
+        max_reads: Option<i64>,
         /// Re-key the encryption envelope after every successful read.
-        #[arg(short = 'r', long)] rotate_on_read: bool,
+        #[arg(short = 'r', long)]
+        rotate_on_read: bool,
         /// Threshold K for K-of-N approvals. Requires --signatories.
-        #[arg(short = 'q', long)] quorum: Option<i32>,
+        #[arg(short = 'q', long)]
+        quorum: Option<i32>,
         /// Comma-separated list of client names allowed to approve.
-        #[arg(short = 's', long, value_delimiter = ',')] signatories: Vec<String>,
+        #[arg(short = 's', long, value_delimiter = ',')]
+        signatories: Vec<String>,
         /// Replace an existing secret with the same name. Requires update permission.
-        #[arg(short = 'o', long)] overwrite: bool,
+        #[arg(short = 'o', long)]
+        overwrite: bool,
         /// Mark this secret as exempt from `cleanup`. Even after the secret
         /// is tombstoned (e.g. by max_reads exhaustion), the forensic record
         /// — name + created_at + exhausted_at — is preserved.
-        #[arg(short = 'p', long)] preserve_on_cleanup: bool,
+        #[arg(short = 'p', long)]
+        preserve_on_cleanup: bool,
         /// Make this secret immutable: once created it can never be overwritten,
         /// even with --overwrite. Delete it first to replace it.
-        #[arg(short = 'i', long)] no_overwrite: bool,
+        #[arg(short = 'i', long)]
+        no_overwrite: bool,
         /// Client-side encryption under the profile's managed key (CMK): the
         /// server stores only an opaque envelope it can never decrypt.
-        #[arg(short = 'e', long = "external-key")] external_key: bool,
+        #[arg(short = 'e', long = "external-key")]
+        external_key: bool,
         /// Client-side encryption under a user-supplied passphrase (Argon2id),
         /// never sent to the server. Prefer $BLACKBOOK_EXTERNAL_PASSPHRASE to
         /// keep it off the command line. Implies client-side encryption.
-        #[arg(long)] external_passphrase: Option<String>,
+        #[arg(long)]
+        external_passphrase: Option<String>,
         /// Alias: managed-key client-side encryption (same as --external-key
         /// for secrets, since a secret's data always lives in blackbook).
-        #[arg(long)] external: bool,
+        #[arg(long)]
+        external: bool,
         /// Not available for secrets (data residency is files-only); rejected
         /// with a clear message. Present so the error is explicit, not "unknown
         /// flag".
-        #[arg(long, hide = true)] external_data: bool,
+        #[arg(long, hide = true)]
+        external_data: bool,
         /// Opt into passphrase-mode client-side encryption, sourcing the
         /// passphrase from $BLACKBOOK_EXTERNAL_PASSPHRASE instead of an argv
         /// value (so it never appears on the command line). Equivalent to
         /// `--external-passphrase <value>`. Used by the web console.
-        #[arg(long, hide = true)] external_passphrase_env: bool,
+        #[arg(long, hide = true)]
+        external_passphrase_env: bool,
     },
     /// Print a secret's value to stdout. If the secret has a K-of-N policy
     /// and you don't already have an approved request, the server returns
@@ -241,21 +261,26 @@ enum Commands {
     /// approvals are in, or `--wait` to block until it's approved.
     Get {
         name: String,
-        #[arg(short = 'r', long)] request_id: Option<String>,
+        #[arg(short = 'r', long)]
+        request_id: Option<String>,
         /// Block and poll until the K-of-N request is approved (or timeout),
         /// so an automated reader makes a single call. No effect on
         /// non-threshold secrets.
-        #[arg(short = 'w', long)] wait: bool,
+        #[arg(short = 'w', long)]
+        wait: bool,
         /// Max seconds to wait with --wait (default 300).
-        #[arg(long, default_value_t = 300)] wait_timeout: u64,
+        #[arg(long, default_value_t = 300)]
+        wait_timeout: u64,
         /// Passphrase to decrypt a client-side ("external") secret. Falls back
         /// to $BLACKBOOK_EXTERNAL_PASSPHRASE. Ignored for normal secrets.
-        #[arg(long)] external_passphrase: Option<String>,
+        #[arg(long)]
+        external_passphrase: Option<String>,
     },
     /// List secrets visible to the current client.
     Ls {
         /// Output as JSON (used by the web console's structured API).
-        #[arg(long)] json: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Delete a secret.
     Rm {
@@ -272,11 +297,14 @@ enum Commands {
     Rekey {
         name: String,
         /// Current passphrase, if the secret is passphrase-sealed (else env/prompt).
-        #[arg(long)] old_external_passphrase: Option<String>,
+        #[arg(long)]
+        old_external_passphrase: Option<String>,
         /// Re-wrap under the profile's managed key (CMK).
-        #[arg(short = 'e', long = "external-key")] external_key: bool,
+        #[arg(short = 'e', long = "external-key")]
+        external_key: bool,
         /// Re-wrap under this new user passphrase (Argon2id).
-        #[arg(long)] external_passphrase: Option<String>,
+        #[arg(long)]
+        external_passphrase: Option<String>,
     },
 
     /// Manage encrypted files.
@@ -324,7 +352,8 @@ enum Commands {
         /// Show full detail for a single request id.
         id: Option<String>,
         /// In the list, expand the signatory and approver names per row.
-        #[arg(short = 'v', long)] verbose: bool,
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Manage advance-approval grants — pre-authorize a reader for a pattern
     /// (scoped to domain + grantee + pattern, with a TTL and optional use cap)
@@ -377,11 +406,14 @@ enum TunnelCmd {
         /// Peer client name to tunnel to (must be online to `accept`).
         peer: String,
         /// Local address to bind (host:port).
-        #[arg(short = 'l', long)] listen: String,
+        #[arg(short = 'l', long)]
+        listen: String,
         /// Address the peer should dial for each connection (host:port).
-        #[arg(short = 't', long = "to")] target: String,
+        #[arg(short = 't', long = "to")]
+        target: String,
         /// Forward UDP instead of TCP.
-        #[arg(short = 'u', long)] udp: bool,
+        #[arg(short = 'u', long)]
+        udp: bool,
     },
     /// Target side: wait for a tunnel offer addressed to you and serve the
     /// peer's dial requests (connecting to whatever host:port they ask for).
@@ -389,9 +421,11 @@ enum TunnelCmd {
     Accept {
         /// Only accept an offer from this client name (else accept any offerer
         /// who targeted you).
-        #[arg(short = 'f', long)] from: Option<String>,
+        #[arg(short = 'f', long)]
+        from: Option<String>,
         /// Seconds to wait for an offer before giving up (default 300).
-        #[arg(long, default_value_t = 300)] wait_timeout: u64,
+        #[arg(long, default_value_t = 300)]
+        wait_timeout: u64,
     },
     /// List tunnels you offered or are the target of.
     Ls,
@@ -409,69 +443,94 @@ enum FileCmd {
         #[arg(short = 't', long)]
         mime: Option<String>,
         /// Require MFA (TOTP) on every future download of this file.
-        #[arg(short = 'M', long)] mfa_required: bool,
+        #[arg(short = 'M', long)]
+        mfa_required: bool,
         /// Delete this file immediately after the first successful download.
-        #[arg(short = 'd', long)] delete_on_read: bool,
+        #[arg(short = 'd', long)]
+        delete_on_read: bool,
         /// Maximum number of downloads before the file refuses to authorize.
-        #[arg(short = 'R', long)] max_reads: Option<i64>,
+        #[arg(short = 'R', long)]
+        max_reads: Option<i64>,
         /// Re-key the per-file DEK after every successful download.
-        #[arg(short = 'r', long)] rotate_on_read: bool,
+        #[arg(short = 'r', long)]
+        rotate_on_read: bool,
         /// Threshold K for K-of-N approvals. Requires --signatories.
-        #[arg(short = 'q', long)] quorum: Option<i32>,
+        #[arg(short = 'q', long)]
+        quorum: Option<i32>,
         /// Comma-separated list of client names allowed to approve.
-        #[arg(short = 's', long, value_delimiter = ',')] signatories: Vec<String>,
+        #[arg(short = 's', long, value_delimiter = ',')]
+        signatories: Vec<String>,
         /// Replace an existing file of the same name. Requires update permission.
-        #[arg(short = 'o', long)] overwrite: bool,
+        #[arg(short = 'o', long)]
+        overwrite: bool,
         /// Keep the forensic record even after tombstoning by `cleanup`.
-        #[arg(short = 'p', long)] preserve_on_cleanup: bool,
+        #[arg(short = 'p', long)]
+        preserve_on_cleanup: bool,
         /// Make this file immutable: never overwritable, even with --overwrite.
-        #[arg(short = 'i', long)] no_overwrite: bool,
+        #[arg(short = 'i', long)]
+        no_overwrite: bool,
         /// Managed-key client-side encryption (CMK), data stored in blackbook:
         /// the server keeps only an opaque envelope it can never decrypt.
-        #[arg(short = 'e', long = "external-key")] external_key: bool,
+        #[arg(short = 'e', long = "external-key")]
+        external_key: bool,
         /// User-supplied passphrase (Argon2id) instead of the managed key.
         /// Never sent to the server; prefer $BLACKBOOK_EXTERNAL_PASSPHRASE.
-        #[arg(long)] external_passphrase: Option<String>,
+        #[arg(long)]
+        external_passphrase: Option<String>,
         /// Data residency: keep the encrypted file on *this machine* (under
         /// ~/.bbk), uploading only a manifest + the server's half of the split
         /// file key. Reading needs both this client AND the server. Combine
         /// with --external-passphrase for a user key; default key is managed.
-        #[arg(short = 'E', long = "external-data", visible_alias = "resident")] external_data: bool,
+        #[arg(short = 'E', long = "external-data", visible_alias = "resident")]
+        external_data: bool,
         /// Shorthand for managed key + data residency
         /// (= --external-key --external-data).
-        #[arg(long)] external: bool,
+        #[arg(long)]
+        external: bool,
         /// With --external-data, also keep an encrypted backup copy server-side
         /// (still unreadable by the server).
-        #[arg(short = 'c', long)] server_copy: bool,
+        #[arg(short = 'c', long)]
+        server_copy: bool,
         /// With --external-data, delete the original plaintext file after stashing.
-        #[arg(long)] shred: bool,
+        #[arg(long)]
+        shred: bool,
         /// Opt into passphrase-mode client-side encryption, sourcing the
         /// passphrase from $BLACKBOOK_EXTERNAL_PASSPHRASE instead of an argv
         /// value. Equivalent to `--external-passphrase <value>`. Used by the
         /// web console.
-        #[arg(long, hide = true)] external_passphrase_env: bool,
+        #[arg(long, hide = true)]
+        external_passphrase_env: bool,
     },
     /// Download a file. Output defaults to ./<name> (or `-` for stdout).
     Get {
         name: String,
         path: Option<PathBuf>,
         /// Approved K-of-N request id (for threshold-gated files).
-        #[arg(short = 'r', long)] request_id: Option<String>,
+        #[arg(short = 'r', long)]
+        request_id: Option<String>,
         /// Block and poll until the K-of-N request is approved (or timeout).
-        #[arg(short = 'w', long)] wait: bool,
+        #[arg(short = 'w', long)]
+        wait: bool,
         /// Max seconds to wait with --wait (default 300).
-        #[arg(long, default_value_t = 300)] wait_timeout: u64,
+        #[arg(long, default_value_t = 300)]
+        wait_timeout: u64,
         /// Passphrase to decrypt a client-side ("external")/resident file.
         /// Falls back to $BLACKBOOK_EXTERNAL_PASSPHRASE.
-        #[arg(long)] external_passphrase: Option<String>,
+        #[arg(long)]
+        external_passphrase: Option<String>,
     },
     /// List files visible to the current client.
     Ls {
         /// Output as JSON (used by the web console's structured API).
-        #[arg(long)] json: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Delete a file.
-    Rm { name: String, #[arg(short = 'y', long)] yes: bool },
+    Rm {
+        name: String,
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// Re-encrypt a file under a new per-file DEK.
     Rotate { name: String },
     /// Change the client-side key on an external/resident file. Decrypts with
@@ -482,11 +541,14 @@ enum FileCmd {
     Rekey {
         name: String,
         /// Current passphrase, if the file is passphrase-sealed (else env/prompt).
-        #[arg(long)] old_external_passphrase: Option<String>,
+        #[arg(long)]
+        old_external_passphrase: Option<String>,
         /// Re-wrap under the profile's managed key (CMK).
-        #[arg(short = 'e', long = "external-key")] external_key: bool,
+        #[arg(short = 'e', long = "external-key")]
+        external_key: bool,
         /// Re-wrap under this new user passphrase (Argon2id).
-        #[arg(long)] external_passphrase: Option<String>,
+        #[arg(long)]
+        external_passphrase: Option<String>,
     },
 }
 
@@ -517,7 +579,8 @@ enum ClientCmd {
     Revoke {
         name: String,
         /// Skip the confirmation prompt.
-        #[arg(short = 'y', long)] yes: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -528,25 +591,36 @@ enum AclCmd {
     Grant {
         subject: String,
         pattern: String,
-        #[arg(short = 'c', long)] create: bool,
-        #[arg(short = 'r', long)] read: bool,
-        #[arg(short = 'u', long)] update: bool,
-        #[arg(short = 'd', long)] delete: bool,
+        #[arg(short = 'c', long)]
+        create: bool,
+        #[arg(short = 'r', long)]
+        read: bool,
+        #[arg(short = 'u', long)]
+        update: bool,
+        #[arg(short = 'd', long)]
+        delete: bool,
         /// RFC3339 timestamp after which the grant stops authorizing.
-        #[arg(short = 'e', long)] expires_at: Option<String>,
+        #[arg(short = 'e', long)]
+        expires_at: Option<String>,
         /// RFC3339 timestamp before which the grant doesn't yet authorize.
-        #[arg(short = 'b', long)] not_before: Option<String>,
+        #[arg(short = 'b', long)]
+        not_before: Option<String>,
         /// Cap on use count (use `--max-uses 1` for one-shot grants).
-        #[arg(short = 'x', long)] max_uses: Option<i32>,
+        #[arg(short = 'x', long)]
+        max_uses: Option<i32>,
         /// Rate limit as `N/PERIOD`, e.g. `10/1h`, `5/30m`, `100/1d`, `2/90s`.
         /// At most N authorizations per window (fixed window).
-        #[arg(long)] rate: Option<String>,
+        #[arg(long)]
+        rate: Option<String>,
         /// Cron-style allowed-access window (5 fields, mask semantics), e.g.
         /// "* 9-17 * * 1-5" = weekdays 9am–6pm. Access outside it is denied.
-        #[arg(long)] schedule: Option<String>,
+        #[arg(long)]
+        schedule: Option<String>,
     },
     Ls,
-    Revoke { id: String },
+    Revoke {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -563,7 +637,8 @@ enum DomainCmd {
     /// Create a new domain.
     Create {
         name: String,
-        #[arg(short = 'd', long)] description: Option<String>,
+        #[arg(short = 'd', long)]
+        description: Option<String>,
     },
     /// List domains visible to you.
     Ls,
@@ -574,7 +649,8 @@ enum DomainCmd {
         /// Domain to make the default for the active profile.
         name: Option<String>,
         /// Clear the saved preference (revert to `default`).
-        #[arg(long)] clear: bool,
+        #[arg(long)]
+        clear: bool,
     },
     /// Show the members of a domain.
     Members { domain: String },
@@ -582,7 +658,8 @@ enum DomainCmd {
     AddMember {
         domain: String,
         client: String,
-        #[arg(short = 'r', long, default_value = "user")] role: String,
+        #[arg(short = 'r', long, default_value = "user")]
+        role: String,
     },
     /// Remove a client's membership.
     RmMember { domain: String, client: String },
@@ -599,7 +676,8 @@ enum ProfileCmd {
     /// Delete a saved profile.
     Rm {
         name: String,
-        #[arg(short = 'y', long)] yes: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -615,23 +693,29 @@ enum GrantsCmd {
         /// Resource pattern (`*` any, `_` one char), e.g. `monthly-report-*`.
         pattern: String,
         /// Whether the grant covers secrets or files.
-        #[arg(short = 'k', long, default_value = "secret")] kind: String,
+        #[arg(short = 'k', long, default_value = "secret")]
+        kind: String,
         /// Cap the number of reads this grant authorizes (default: unlimited
         /// within the TTL).
-        #[arg(short = 'x', long)] max_uses: Option<i32>,
+        #[arg(short = 'x', long)]
+        max_uses: Option<i32>,
         /// Time limit in hours from now (required unless --expires-at given).
-        #[arg(short = 'H', long)] ttl_hours: Option<i64>,
+        #[arg(short = 'H', long)]
+        ttl_hours: Option<i64>,
         /// Explicit RFC3339 expiry (overrides --ttl-hours).
-        #[arg(short = 'e', long)] expires_at: Option<String>,
+        #[arg(short = 'e', long)]
+        expires_at: Option<String>,
         /// RFC3339 time before which the grant doesn't yet authorize.
-        #[arg(short = 'b', long)] not_before: Option<String>,
+        #[arg(short = 'b', long)]
+        not_before: Option<String>,
     },
     /// List advance grants you created or benefit from.
     Ls,
     /// Revoke an advance grant by id.
     Rm {
         id: String,
-        #[arg(short = 'y', long)] yes: bool,
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
 }
 
@@ -639,7 +723,9 @@ enum GrantsCmd {
 // Database wrapper
 // ---------------------------------------------------------------------------
 
-struct Database { pool: Pool<Postgres> }
+struct Database {
+    pool: Pool<Postgres>,
+}
 
 impl Database {
     async fn new(database_url: &str) -> Result<Self> {
@@ -670,7 +756,9 @@ impl Database {
                 applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 notes      TEXT
             )"#,
-        ).execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Domains: both a namespace partition and an ACL group. The friendly
         // name is `name_enc` (AEAD), looked up via `name_id` (HMAC).
@@ -683,7 +771,9 @@ impl Database {
                 created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 archived_at     TIMESTAMP
             )"#,
-        ).execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Clients: encrypted name + HMAC lookup id. Token hash, cert
         // fingerprint, and TOTP-secret ciphertext stay as they were.
@@ -701,7 +791,9 @@ impl Database {
                 totp_secret_enc  BYTEA,
                 totp_enrolled    BOOLEAN NOT NULL DEFAULT FALSE
             )"#,
-        ).execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_clients_token_hash ON blackbook_clients(token_hash) WHERE revoked_at IS NULL")
             .execute(&self.pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_clients_cert_fp ON blackbook_clients(cert_fingerprint) WHERE revoked_at IS NULL")
@@ -743,7 +835,9 @@ impl Database {
                 encryption_method VARCHAR(100),
                 UNIQUE (domain_id, name_id)
             )"#,
-        ).execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_secrets_name_id ON blackbook_secrets(domain_id, name_id)")
             .execute(&self.pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_secrets_exhausted ON blackbook_secrets(exhausted_at) WHERE exhausted_at IS NOT NULL")
@@ -774,9 +868,14 @@ impl Database {
                 -- Cron-style allowed-access window (5 fields). NULL = always.
                 schedule         TEXT
             )"#,
-        ).execute(&self.pool).await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_acl_client_id ON blackbook_acl(client_id)")
-            .execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_blackbook_acl_client_id ON blackbook_acl(client_id)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Audit log: encrypted resource + message; hash chain (prev_hash,
         // row_hash) binds every row to the previous one over PLAINTEXT
@@ -794,11 +893,17 @@ impl Database {
                 prev_hash    CHAR(64),
                 row_hash     CHAR(64) NOT NULL
             )"#,
-        ).execute(&self.pool).await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_audit_ts ON blackbook_audit(ts DESC)")
-            .execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_blackbook_audit_ts ON blackbook_audit(ts DESC)",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_audit_id ON blackbook_audit(id)")
-            .execute(&self.pool).await?;
+            .execute(&self.pool)
+            .await?;
         // Chain anchors: when old audit rows are archived-and-pruned, the
         // `row_hash` of the last pruned row is recorded here so live-chain
         // verification resumes from it instead of genesis (otherwise the first
@@ -812,7 +917,9 @@ impl Database {
                 archive_file        TEXT NOT NULL,
                 created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )"#,
-        ).execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
 
         // File blobs: encrypted on disk under per-file DEK. The row's
         // friendly name/MIME/size are AEAD ciphertext; the integrity hash is
@@ -825,7 +932,9 @@ impl Database {
                 ciphertext_size BIGINT NOT NULL,
                 created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )"#,
-        ).execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS blackbook_pages (
                 id                 TEXT PRIMARY KEY,
@@ -861,8 +970,11 @@ impl Database {
                 UNIQUE (domain_id, name_id)
             )"#,
         ).execute(&self.pool).await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_pages_owner ON blackbook_pages(owner_id)")
-            .execute(&self.pool).await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_blackbook_pages_owner ON blackbook_pages(owner_id)",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_pages_name_id ON blackbook_pages(domain_id, name_id)")
             .execute(&self.pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_blackbook_pages_exhausted ON blackbook_pages(exhausted_at) WHERE exhausted_at IS NOT NULL")
@@ -888,7 +1000,9 @@ impl Database {
                 expires_at        TIMESTAMP NOT NULL,
                 consumed_at       TIMESTAMP
             )"#,
-        ).execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_access_requests_requester ON blackbook_access_requests(requester_id)")
             .execute(&self.pool).await?;
         // Fast lookup for the "is there already an open request for this
@@ -917,7 +1031,9 @@ impl Database {
                 created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 revoked_at      TIMESTAMP
             )"#,
-        ).execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_access_grants_lookup ON blackbook_access_grants(grantee_id, domain_id, resource_kind) WHERE revoked_at IS NULL")
             .execute(&self.pool).await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_access_grants_signatory ON blackbook_access_grants(signatory_id) WHERE revoked_at IS NULL")
@@ -952,7 +1068,9 @@ impl Database {
                 created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (key_id, version)
             )"#,
-        ).execute(&self.pool).await?;
+        )
+        .execute(&self.pool)
+        .await?;
 
         log::info!("Database schema initialized successfully");
         Ok(())
@@ -966,22 +1084,24 @@ impl Database {
     /// but kept for future numbered migrations.
     #[allow(dead_code)]
     async fn migrate_once(&self, version: i32, name: &str, sql: &str) -> Result<()> {
-        let already: Option<(i32,)> = sqlx::query_as(
-            "SELECT version FROM blackbook_schema_migrations WHERE version = $1",
-        )
-        .bind(version)
-        .fetch_optional(&self.pool).await?;
-        if already.is_some() { return Ok(()); }
+        let already: Option<(i32,)> =
+            sqlx::query_as("SELECT version FROM blackbook_schema_migrations WHERE version = $1")
+                .bind(version)
+                .fetch_optional(&self.pool)
+                .await?;
+        if already.is_some() {
+            return Ok(());
+        }
         // Allow multi-statement SQL by splitting on the trailing `;` per stmt.
         // We don't have to be clever — these are server-authored strings.
         for stmt in sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
             sqlx::query(stmt).execute(&self.pool).await?;
         }
-        sqlx::query(
-            "INSERT INTO blackbook_schema_migrations (version, name) VALUES ($1, $2)",
-        )
-        .bind(version).bind(name)
-        .execute(&self.pool).await?;
+        sqlx::query("INSERT INTO blackbook_schema_migrations (version, name) VALUES ($1, $2)")
+            .bind(version)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
         log::info!("applied schema migration {version}: {name}");
         Ok(())
     }
@@ -1049,9 +1169,15 @@ enum ExtKey {
 /// explicit flag → $BLACKBOOK_EXTERNAL_PASSPHRASE → None. Unlike Phase 2, a
 /// passphrase is no longer required — absent one we fall back to the CMK.
 fn resolve_external_passphrase_opt(explicit: Option<String>) -> Option<String> {
-    if let Some(p) = explicit { if !p.is_empty() { return Some(p); } }
+    if let Some(p) = explicit {
+        if !p.is_empty() {
+            return Some(p);
+        }
+    }
     if let Ok(p) = std::env::var("BLACKBOOK_EXTERNAL_PASSPHRASE") {
-        if !p.is_empty() { return Some(p); }
+        if !p.is_empty() {
+            return Some(p);
+        }
     }
     None
 }
@@ -1074,13 +1200,18 @@ fn resolve_external_passphrase_for_read(explicit: Option<String>) -> Result<Stri
     if credstore::prompts_suppressed() {
         return Err(AppError::Config(
             "external passphrase required — pass --external-passphrase or set \
-             $BLACKBOOK_EXTERNAL_PASSPHRASE".into()));
+             $BLACKBOOK_EXTERNAL_PASSPHRASE"
+                .into(),
+        ));
     }
-    let p = rpassword::prompt_password("Passphrase for this external item: ")
-        .map_err(|_| AppError::Config(
+    let p = rpassword::prompt_password("Passphrase for this external item: ").map_err(|_| {
+        AppError::Config(
             "this item is passphrase-sealed and no passphrase was provided — \
              pass --external-passphrase, set $BLACKBOOK_EXTERNAL_PASSPHRASE, \
-             or run interactively so it can be requested".into()))?;
+             or run interactively so it can be requested"
+                .into(),
+        )
+    })?;
     if p.is_empty() {
         return Err(AppError::Config("empty passphrase".into()));
     }
@@ -1110,14 +1241,23 @@ fn resolve_external_passphrase_for_read(explicit: Option<String>) -> Result<Stri
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
-enum KeySource { Managed, Passphrase }
+enum KeySource {
+    Managed,
+    Passphrase,
+}
 
 #[derive(Clone, Copy, PartialEq)]
-enum DataLoc { InServer, Resident }
+enum DataLoc {
+    InServer,
+    Resident,
+}
 
 /// A fully-resolved client-side storage decision. `None` from the resolver
 /// means "no client-side encryption — store normally".
-struct ExtSpec { key: KeySource, data: DataLoc }
+struct ExtSpec {
+    key: KeySource,
+    data: DataLoc,
+}
 
 /// Raw client-side flags as they arrive from clap, before validation. The
 /// resolver turns these into an `Option<ExtSpec>` (None = normal storage).
@@ -1164,18 +1304,24 @@ fn resolve_ext_spec(f: &ExtFlags, data_allowed: bool) -> Result<Option<ExtSpec>>
         return Err(AppError::Config(
             "--external-key/--external select the managed key (CMK), but --external-passphrase \
              selects a user-supplied key — choose one. For resident data with a passphrase, \
-             use --external-data --external-passphrase.".into()));
+             use --external-data --external-passphrase."
+                .into(),
+        ));
     }
 
     let wants_external = managed_signal || f.external_data || pass_signal;
-    if !wants_external { return Ok(None); }
+    if !wants_external {
+        return Ok(None);
+    }
 
     // Explicit data-residency on a secret is rejected (no on-disk home).
     if f.external_data && !data_allowed {
         return Err(AppError::Config(
             "--external-data is not available for secrets — a secret has no on-disk home, so \
              its data always lives in blackbook. Use --external-key (managed key) or \
-             --external-passphrase (user key) to encrypt it client-side.".into()));
+             --external-passphrase (user key) to encrypt it client-side."
+                .into(),
+        ));
     }
 
     // Key source: an explicit managed signal forces managed (ignoring any
@@ -1203,15 +1349,23 @@ fn resolve_ext_spec(f: &ExtFlags, data_allowed: bool) -> Result<Option<ExtSpec>>
 }
 
 /// Build the seal key for an `ExtSpec`, sourcing the passphrase if needed.
-fn ext_key_for_spec(spec: &ExtSpec, session: &client::Session, explicit: Option<String>) -> Result<ExtKey> {
+fn ext_key_for_spec(
+    spec: &ExtSpec,
+    session: &client::Session,
+    explicit: Option<String>,
+) -> Result<ExtKey> {
     match spec.key {
         KeySource::Passphrase => {
             let p = resolve_external_passphrase_for_read(explicit)?;
             Ok(ExtKey::Passphrase(p))
         }
-        KeySource::Managed => session.cmk_bytes().map(ExtKey::Cmk).ok_or_else(|| AppError::Config(
-            "no managed key (CMK) for --external-key: this profile predates client master \
-             keys. Re-run `blackbook login` to mint one, or use --external-passphrase.".into())),
+        KeySource::Managed => session.cmk_bytes().map(ExtKey::Cmk).ok_or_else(|| {
+            AppError::Config(
+                "no managed key (CMK) for --external-key: this profile predates client master \
+             keys. Re-run `blackbook login` to mint one, or use --external-passphrase."
+                    .into(),
+            )
+        }),
     }
 }
 
@@ -1252,8 +1406,17 @@ fn external_seal(key: &ExtKey, plaintext: &[u8]) -> Result<Vec<u8>> {
 /// `0x02 | mode | m(4) t(4) p(4) | salt_len(1) | salt | wdek_len(4) | wdek | ct`.
 /// The Argon2 cost triple is present for all modes (zero for CMK) to keep the
 /// layout fixed-position and easy to parse.
-fn ext_encode_v2(mode: u8, salt: &[u8], m: u32, t: u32, p: u32, wrapped_dek: &[u8], ciphertext: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + 12 + 1 + salt.len() + 4 + wrapped_dek.len() + ciphertext.len());
+fn ext_encode_v2(
+    mode: u8,
+    salt: &[u8],
+    m: u32,
+    t: u32,
+    p: u32,
+    wrapped_dek: &[u8],
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(2 + 12 + 1 + salt.len() + 4 + wrapped_dek.len() + ciphertext.len());
     out.push(EXT_ENVELOPE_V2);
     out.push(mode);
     out.extend_from_slice(&m.to_be_bytes());
@@ -1280,35 +1443,71 @@ struct ExtEnvelope {
 /// Decode a v1 or v2 external envelope.
 fn ext_decode(buf: &[u8]) -> Result<ExtEnvelope> {
     let bad = || AppError::Crypto("malformed external envelope".into());
-    if buf.is_empty() { return Err(bad()); }
+    if buf.is_empty() {
+        return Err(bad());
+    }
     match buf[0] {
         EXT_ENVELOPE_V1 => {
-            if buf.len() < 2 { return Err(bad()); }
+            if buf.len() < 2 {
+                return Err(bad());
+            }
             let slen = buf[1] as usize;
             let mut p = 2;
-            if buf.len() < p + slen + 4 { return Err(bad()); }
-            let salt = buf[p..p + slen].to_vec(); p += slen;
-            let wlen = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap()) as usize; p += 4;
-            if buf.len() < p + wlen { return Err(bad()); }
-            let wrapped_dek = buf[p..p + wlen].to_vec(); p += wlen;
-            Ok(ExtEnvelope { version: 1, mode: EXT_MODE_ARGON2, salt, argon: (0, 0, 0),
-                             wrapped_dek, ciphertext: buf[p..].to_vec() })
+            if buf.len() < p + slen + 4 {
+                return Err(bad());
+            }
+            let salt = buf[p..p + slen].to_vec();
+            p += slen;
+            let wlen = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            if buf.len() < p + wlen {
+                return Err(bad());
+            }
+            let wrapped_dek = buf[p..p + wlen].to_vec();
+            p += wlen;
+            Ok(ExtEnvelope {
+                version: 1,
+                mode: EXT_MODE_ARGON2,
+                salt,
+                argon: (0, 0, 0),
+                wrapped_dek,
+                ciphertext: buf[p..].to_vec(),
+            })
         }
         EXT_ENVELOPE_V2 => {
-            if buf.len() < 2 + 12 + 1 { return Err(bad()); }
+            if buf.len() < 2 + 12 + 1 {
+                return Err(bad());
+            }
             let mode = buf[1];
             let mut p = 2;
-            let m = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap()); p += 4;
-            let t = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap()); p += 4;
-            let pc = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap()); p += 4;
-            let slen = buf[p] as usize; p += 1;
-            if buf.len() < p + slen + 4 { return Err(bad()); }
-            let salt = buf[p..p + slen].to_vec(); p += slen;
-            let wlen = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap()) as usize; p += 4;
-            if buf.len() < p + wlen { return Err(bad()); }
-            let wrapped_dek = buf[p..p + wlen].to_vec(); p += wlen;
-            Ok(ExtEnvelope { version: 2, mode, salt, argon: (m, t, pc),
-                             wrapped_dek, ciphertext: buf[p..].to_vec() })
+            let m = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap());
+            p += 4;
+            let t = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap());
+            p += 4;
+            let pc = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap());
+            p += 4;
+            let slen = buf[p] as usize;
+            p += 1;
+            if buf.len() < p + slen + 4 {
+                return Err(bad());
+            }
+            let salt = buf[p..p + slen].to_vec();
+            p += slen;
+            let wlen = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            if buf.len() < p + wlen {
+                return Err(bad());
+            }
+            let wrapped_dek = buf[p..p + wlen].to_vec();
+            p += wlen;
+            Ok(ExtEnvelope {
+                version: 2,
+                mode,
+                salt,
+                argon: (m, t, pc),
+                wrapped_dek,
+                ciphertext: buf[p..].to_vec(),
+            })
         }
         _ => Err(bad()),
     }
@@ -1316,13 +1515,19 @@ fn ext_decode(buf: &[u8]) -> Result<ExtEnvelope> {
 
 /// Recover the wrapping KEK for an envelope, given the session (for the CMK)
 /// and an optional passphrase (for passphrase/legacy modes).
-fn external_kek(env: &ExtEnvelope, session: &client::Session, explicit_pass: Option<String>) -> Result<Zeroizing<[u8; 32]>> {
+fn external_kek(
+    env: &ExtEnvelope,
+    session: &client::Session,
+    explicit_pass: Option<String>,
+) -> Result<Zeroizing<[u8; 32]>> {
     match (env.version, env.mode) {
-        (2, m) if m == EXT_MODE_CMK => {
-            session.cmk_bytes().map(Zeroizing::new).ok_or_else(|| AppError::Crypto(
+        (2, m) if m == EXT_MODE_CMK => session.cmk_bytes().map(Zeroizing::new).ok_or_else(|| {
+            AppError::Crypto(
                 "this external item is sealed under the profile's client master key, \
-                 but the active profile has none (different identity?)".into()))
-        }
+                 but the active profile has none (different identity?)"
+                    .into(),
+            )
+        }),
         (2, _) => {
             // Passphrase-sealed: request the passphrase on this access (flag →
             // env → prompt). Never cached, so it's asked for each read.
@@ -1341,12 +1546,20 @@ fn external_kek(env: &ExtEnvelope, session: &client::Session, explicit_pass: Opt
 }
 
 /// Open an external envelope to plaintext, using the session + optional passphrase.
-fn external_open(env: &ExtEnvelope, session: &client::Session, explicit_pass: Option<String>) -> Result<Vec<u8>> {
+fn external_open(
+    env: &ExtEnvelope,
+    session: &client::Session,
+    explicit_pass: Option<String>,
+) -> Result<Vec<u8>> {
     let kek = external_kek(env, session, explicit_pass)?;
-    let dek = Zeroizing::new(blackbook_core::aead_open(&env.wrapped_dek, kek.as_slice())
-        .map_err(|_| AppError::Crypto("wrong key/passphrase or corrupt envelope (DEK unwrap failed)".into()))?);
-    blackbook_core::aead_open(&env.ciphertext, &dek)
-        .map_err(|_| AppError::Crypto("decryption failed (wrong key/passphrase or corrupt data)".into()))
+    let dek = Zeroizing::new(
+        blackbook_core::aead_open(&env.wrapped_dek, kek.as_slice()).map_err(|_| {
+            AppError::Crypto("wrong key/passphrase or corrupt envelope (DEK unwrap failed)".into())
+        })?,
+    );
+    blackbook_core::aead_open(&env.ciphertext, &dek).map_err(|_| {
+        AppError::Crypto("decryption failed (wrong key/passphrase or corrupt data)".into())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1372,7 +1585,9 @@ struct ResidentHeader {
     mode: u8,
     /// Argon2 salt (base64) when mode = 1.
     salt: String,
-    m_cost: u32, t_cost: u32, p_cost: u32,
+    m_cost: u32,
+    t_cost: u32,
+    p_cost: u32,
     /// `AES-256-GCM(client_kek, Kf_c)` (base64).
     wrapped_c: String,
     /// Original file name, for restore convenience.
@@ -1391,7 +1606,8 @@ fn resident_index_path() -> Result<PathBuf> {
 }
 
 fn resident_index_load() -> std::collections::BTreeMap<String, String> {
-    resident_index_path().ok()
+    resident_index_path()
+        .ok()
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
@@ -1404,25 +1620,42 @@ fn resident_index_save(map: &std::collections::BTreeMap<String, String>) -> Resu
     Ok(())
 }
 
-fn resident_key(domain: &str, name: &str) -> String { format!("{domain}/{name}") }
+fn resident_key(domain: &str, name: &str) -> String {
+    format!("{domain}/{name}")
+}
 
 /// Seal a file for resident storage. Returns `(stash_bytes, key_component_b64,
 /// mode_label)` where `key_component_b64` is the server half (`Kf_s`).
-fn resident_seal(key: &ExtKey, plaintext: &[u8], orig_name: &str) -> Result<(Vec<u8>, String, &'static str)> {
-    use rand::RngCore;
+fn resident_seal(
+    key: &ExtKey,
+    plaintext: &[u8],
+    orig_name: &str,
+) -> Result<(Vec<u8>, String, &'static str)> {
     use base64::Engine as _;
+    use rand::RngCore;
     let b64 = base64::engine::general_purpose::STANDARD;
-    let mut kf = [0u8; 32]; rand::thread_rng().fill_bytes(&mut kf);
-    let mut kf_c = [0u8; 32]; rand::thread_rng().fill_bytes(&mut kf_c);
+    let mut kf = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut kf);
+    let mut kf_c = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut kf_c);
     let kf_s: Vec<u8> = kf.iter().zip(kf_c.iter()).map(|(a, b)| a ^ b).collect();
 
     let ct = blackbook_core::aead_seal(plaintext, &kf)
         .map_err(|e| AppError::Crypto(format!("seal: {e}")))?;
 
-    let (mode, salt_b64, m, t, p, client_kek, label): (u8, String, u32, u32, u32, Zeroizing<[u8; 32]>, &'static str) = match key {
+    let (mode, salt_b64, m, t, p, client_kek, label): (
+        u8,
+        String,
+        u32,
+        u32,
+        u32,
+        Zeroizing<[u8; 32]>,
+        &'static str,
+    ) = match key {
         ExtKey::Cmk(cmk) => (0, String::new(), 0, 0, 0, Zeroizing::new(*cmk), "CMK"),
         ExtKey::Passphrase(pass) => {
-            let mut salt = [0u8; 16]; rand::thread_rng().fill_bytes(&mut salt);
+            let mut salt = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut salt);
             let (k, m, t, p) = credstore::argon2_key(pass, &salt)?;
             (1, b64.encode(salt), m, t, p, k, "passphrase")
         }
@@ -1431,8 +1664,13 @@ fn resident_seal(key: &ExtKey, plaintext: &[u8], orig_name: &str) -> Result<(Vec
         .map_err(|e| AppError::Crypto(format!("wrap client half: {e}")))?;
 
     let header = ResidentHeader {
-        mode, salt: salt_b64, m_cost: m, t_cost: t, p_cost: p,
-        wrapped_c: b64.encode(&wrapped_c), orig_name: orig_name.to_string(),
+        mode,
+        salt: salt_b64,
+        m_cost: m,
+        t_cost: t,
+        p_cost: p,
+        wrapped_c: b64.encode(&wrapped_c),
+        orig_name: orig_name.to_string(),
     };
     let hjson = serde_json::to_vec(&header)?;
     let mut stash = Vec::with_capacity(4 + 4 + hjson.len() + ct.len());
@@ -1444,7 +1682,9 @@ fn resident_seal(key: &ExtKey, plaintext: &[u8], orig_name: &str) -> Result<(Vec
 }
 
 /// The domain a client is scoped to, for keying the resident index.
-fn domain_label(bb: &client::BlackbookClient) -> String { bb.domain().to_string() }
+fn domain_label(bb: &client::BlackbookClient) -> String {
+    bb.domain().to_string()
+}
 
 /// Extract just the ciphertext part of a stash (for the optional server copy).
 fn resident_parts_from_stash(stash: &[u8]) -> Result<(ResidentHeader, Vec<u8>)> {
@@ -1454,9 +1694,13 @@ fn resident_parts_from_stash(stash: &[u8]) -> Result<(ResidentHeader, Vec<u8>)> 
 /// Parse a resident stash file into (header, ciphertext).
 fn resident_parse(stash: &[u8]) -> Result<(ResidentHeader, Vec<u8>)> {
     let bad = || AppError::Crypto("malformed resident stash file".into());
-    if stash.len() < 8 || &stash[..4] != RESIDENT_MAGIC { return Err(bad()); }
+    if stash.len() < 8 || &stash[..4] != RESIDENT_MAGIC {
+        return Err(bad());
+    }
     let hlen = u32::from_be_bytes(stash[4..8].try_into().unwrap()) as usize;
-    if stash.len() < 8 + hlen { return Err(bad()); }
+    if stash.len() < 8 + hlen {
+        return Err(bad());
+    }
     let header: ResidentHeader = serde_json::from_slice(&stash[8..8 + hlen]).map_err(|_| bad())?;
     Ok((header, stash[8 + hlen..].to_vec()))
 }
@@ -1464,42 +1708,63 @@ fn resident_parse(stash: &[u8]) -> Result<(ResidentHeader, Vec<u8>)> {
 /// Open a resident stash given the server key-component half and the session
 /// (for the CMK) / optional passphrase. Returns the file plaintext.
 fn resident_open(
-    header: &ResidentHeader, ciphertext: &[u8], kf_s_b64: &str,
-    session: &client::Session, explicit_pass: Option<String>,
+    header: &ResidentHeader,
+    ciphertext: &[u8],
+    kf_s_b64: &str,
+    session: &client::Session,
+    explicit_pass: Option<String>,
 ) -> Result<Vec<u8>> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
     // Recover the client half: unwrap Kf_c with CMK or Argon2id(passphrase).
     let client_kek: Zeroizing<[u8; 32]> = match header.mode {
-        0 => session.cmk_bytes().map(Zeroizing::new).ok_or_else(|| AppError::Crypto(
-            "resident file is sealed under the profile's client master key, but \
-             the active profile has none".into()))?,
+        0 => session.cmk_bytes().map(Zeroizing::new).ok_or_else(|| {
+            AppError::Crypto(
+                "resident file is sealed under the profile's client master key, but \
+             the active profile has none"
+                    .into(),
+            )
+        })?,
         _ => {
             // Passphrase-sealed resident file: request the passphrase on this
             // access (flag → env → prompt); never cached.
             let pass = resolve_external_passphrase_for_read(explicit_pass)?;
-            let salt = b64.decode(&header.salt).map_err(|_| AppError::Crypto("bad salt".into()))?;
+            let salt = b64
+                .decode(&header.salt)
+                .map_err(|_| AppError::Crypto("bad salt".into()))?;
             credstore::argon2_key_with(&pass, &salt, header.m_cost, header.t_cost, header.p_cost)
                 .map_err(|e| AppError::Crypto(format!("kdf: {e}")))?
         }
     };
-    let wrapped_c = b64.decode(&header.wrapped_c).map_err(|_| AppError::Crypto("bad wrapped_c".into()))?;
-    let kf_c = Zeroizing::new(blackbook_core::aead_open(&wrapped_c, client_kek.as_slice())
-        .map_err(|_| AppError::Crypto("wrong key/passphrase (client half unwrap failed)".into()))?);
-    let kf_s = Zeroizing::new(b64.decode(kf_s_b64).map_err(|_| AppError::Crypto("server key component not base64".into()))?);
+    let wrapped_c = b64
+        .decode(&header.wrapped_c)
+        .map_err(|_| AppError::Crypto("bad wrapped_c".into()))?;
+    let kf_c = Zeroizing::new(
+        blackbook_core::aead_open(&wrapped_c, client_kek.as_slice()).map_err(|_| {
+            AppError::Crypto("wrong key/passphrase (client half unwrap failed)".into())
+        })?,
+    );
+    let kf_s = Zeroizing::new(
+        b64.decode(kf_s_b64)
+            .map_err(|_| AppError::Crypto("server key component not base64".into()))?,
+    );
     if kf_c.len() != 32 || kf_s.len() != 32 {
         return Err(AppError::Crypto("key halves must be 32 bytes".into()));
     }
-    let kf: Zeroizing<Vec<u8>> = Zeroizing::new(kf_c.iter().zip(kf_s.iter()).map(|(a, b)| a ^ b).collect());
-    blackbook_core::aead_open(ciphertext, &kf)
-        .map_err(|_| AppError::Crypto("decryption failed (wrong key halves or corrupt data)".into()))
+    let kf: Zeroizing<Vec<u8>> =
+        Zeroizing::new(kf_c.iter().zip(kf_s.iter()).map(|(a, b)| a ^ b).collect());
+    blackbook_core::aead_open(ciphertext, &kf).map_err(|_| {
+        AppError::Crypto("decryption failed (wrong key halves or corrupt data)".into())
+    })
 }
 
 /// Unwrap just the client key-half (`Kf_c`) from a resident stash header using
 /// its *current* key (CMK or passphrase). Used by `file rekey` — re-keying a
 /// resident file only needs to rewrap this 32-byte half, not the ciphertext.
 fn resident_unwrap_client_half(
-    header: &ResidentHeader, session: &client::Session, explicit_pass: Option<String>,
+    header: &ResidentHeader,
+    session: &client::Session,
+    explicit_pass: Option<String>,
 ) -> Result<[u8; 32]> {
     use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -1513,33 +1778,54 @@ fn resident_unwrap_client_half(
                 .map_err(|e| AppError::Crypto(format!("kdf: {e}")))?
         }
     };
-    let wrapped_c = b64.decode(&header.wrapped_c).map_err(|_| AppError::Crypto("bad wrapped_c".into()))?;
-    let kf_c = Zeroizing::new(blackbook_core::aead_open(&wrapped_c, client_kek.as_slice())
-        .map_err(|_| AppError::Crypto("wrong key/passphrase (client half unwrap failed)".into()))?);
-    if kf_c.len() != 32 { return Err(AppError::Crypto("client half must be 32 bytes".into())); }
-    let mut out = [0u8; 32]; out.copy_from_slice(&kf_c); Ok(out)
+    let wrapped_c = b64
+        .decode(&header.wrapped_c)
+        .map_err(|_| AppError::Crypto("bad wrapped_c".into()))?;
+    let kf_c = Zeroizing::new(
+        blackbook_core::aead_open(&wrapped_c, client_kek.as_slice()).map_err(|_| {
+            AppError::Crypto("wrong key/passphrase (client half unwrap failed)".into())
+        })?,
+    );
+    if kf_c.len() != 32 {
+        return Err(AppError::Crypto("client half must be 32 bytes".into()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&kf_c);
+    Ok(out)
 }
 
 /// Rebuild a resident stash, re-wrapping the (unchanged) client key-half under
 /// `new_key` and keeping the (unchanged) ciphertext. The file key `Kf` and the
 /// server's half `Kf_s` are untouched, so no server interaction is needed.
-fn resident_rewrap(new_key: &ExtKey, kf_c: &[u8; 32], ciphertext: &[u8], orig_name: &str) -> Result<Vec<u8>> {
+fn resident_rewrap(
+    new_key: &ExtKey,
+    kf_c: &[u8; 32],
+    ciphertext: &[u8],
+    orig_name: &str,
+) -> Result<Vec<u8>> {
     use base64::Engine as _;
     use rand::RngCore;
     let b64 = base64::engine::general_purpose::STANDARD;
-    let (mode, salt_b64, m, t, p, client_kek): (u8, String, u32, u32, u32, Zeroizing<[u8; 32]>) = match new_key {
-        ExtKey::Cmk(cmk) => (0, String::new(), 0, 0, 0, Zeroizing::new(*cmk)),
-        ExtKey::Passphrase(pass) => {
-            let mut salt = [0u8; 16]; rand::thread_rng().fill_bytes(&mut salt);
-            let (k, m, t, p) = credstore::argon2_key(pass, &salt)?;
-            (1, b64.encode(salt), m, t, p, k)
-        }
-    };
+    let (mode, salt_b64, m, t, p, client_kek): (u8, String, u32, u32, u32, Zeroizing<[u8; 32]>) =
+        match new_key {
+            ExtKey::Cmk(cmk) => (0, String::new(), 0, 0, 0, Zeroizing::new(*cmk)),
+            ExtKey::Passphrase(pass) => {
+                let mut salt = [0u8; 16];
+                rand::thread_rng().fill_bytes(&mut salt);
+                let (k, m, t, p) = credstore::argon2_key(pass, &salt)?;
+                (1, b64.encode(salt), m, t, p, k)
+            }
+        };
     let wrapped_c = blackbook_core::aead_seal(kf_c, client_kek.as_slice())
         .map_err(|e| AppError::Crypto(format!("wrap client half: {e}")))?;
     let header = ResidentHeader {
-        mode, salt: salt_b64, m_cost: m, t_cost: t, p_cost: p,
-        wrapped_c: b64.encode(&wrapped_c), orig_name: orig_name.to_string(),
+        mode,
+        salt: salt_b64,
+        m_cost: m,
+        t_cost: t,
+        p_cost: p,
+        wrapped_c: b64.encode(&wrapped_c),
+        orig_name: orig_name.to_string(),
     };
     let hjson = serde_json::to_vec(&header)?;
     let mut stash = Vec::with_capacity(8 + hjson.len() + ciphertext.len());
@@ -1571,9 +1857,11 @@ async fn cmd_login(
         let mut s = String::new();
         std::io::stdin().read_to_string(&mut s)?;
         s
-    } else { std::fs::read_to_string(&bundle)? };
-    let b: LoginBundle = serde_json::from_str(&raw)
-        .map_err(|e| AppError::Config(format!("bundle: {e}")))?;
+    } else {
+        std::fs::read_to_string(&bundle)?
+    };
+    let b: LoginBundle =
+        serde_json::from_str(&raw).map_err(|e| AppError::Config(format!("bundle: {e}")))?;
 
     let mut session = client::Session {
         server: b.server.unwrap_or_default(),
@@ -1583,22 +1871,35 @@ async fn cmd_login(
         ca_pem: b.ca_pem,
         cmk: None,
     };
-    if let Some(s) = server_override { session.server = s; }
+    if let Some(s) = server_override {
+        session.server = s;
+    }
 
     // A full bundle is mandatory: the server rejects any request that doesn't
     // present both a client certificate and a matching bearer token. Catch an
     // incomplete bundle here with a precise message instead of a generic 401.
     let mut missing = Vec::new();
-    if session.server.is_empty() { missing.push("server"); }
-    if session.token.is_none()    { missing.push("token"); }
-    if session.cert_pem.is_none() { missing.push("cert"); }
-    if session.key_pem.is_none()  { missing.push("key"); }
-    if session.ca_pem.is_none()   { missing.push("ca"); }
+    if session.server.is_empty() {
+        missing.push("server");
+    }
+    if session.token.is_none() {
+        missing.push("token");
+    }
+    if session.cert_pem.is_none() {
+        missing.push("cert");
+    }
+    if session.key_pem.is_none() {
+        missing.push("key");
+    }
+    if session.ca_pem.is_none() {
+        missing.push("ca");
+    }
     if !missing.is_empty() {
         return Err(AppError::Config(format!(
             "incomplete credential bundle — missing: {}. Use a bundle from \
              `client create` or the first-run admin-bundle.json.",
-            missing.join(", "))));
+            missing.join(", ")
+        )));
     }
 
     let bb = client::BlackbookClient::from_session(&session)?;
@@ -1618,14 +1919,20 @@ async fn cmd_login(
     let pass = if reuse {
         // Re-login: the user must prove the existing passphrase (no confirm).
         credstore::resolve_passphrase(
-            None, &format!("Passphrase for existing profile '{profile}': "), false)
-            .map_err(|e| AppError::Config(format!(
-                "the existing profile is passphrase-protected: {e}")))?
+            None,
+            &format!("Passphrase for existing profile '{profile}': "),
+            false,
+        )
+        .map_err(|e| {
+            AppError::Config(format!("the existing profile is passphrase-protected: {e}"))
+        })?
     } else {
-        credstore::resolve_passphrase(
-            None, "Choose a passphrase to protect this profile: ", true)
-            .map_err(|e| AppError::Config(format!(
-                "a passphrase is required to protect local credentials: {e}")))?
+        credstore::resolve_passphrase(None, "Choose a passphrase to protect this profile: ", true)
+            .map_err(|e| {
+            AppError::Config(format!(
+                "a passphrase is required to protect local credentials: {e}"
+            ))
+        })?
     };
 
     // Carry the prior CMK forward; only mint one if there was none.
@@ -1633,10 +1940,18 @@ async fn cmd_login(
     let minted = session.ensure_cmk();
 
     let path = session.save_encrypted(&profile, &pass)?;
-    println!("Logged in to {} as {} ({}) via {}.", session.server, me.name, me.role, me.auth_method);
-    println!("Saved encrypted profile '{profile}' ({}); it is now active and unlocked.", path.display());
+    println!(
+        "Logged in to {} as {} ({}) via {}.",
+        session.server, me.name, me.role, me.auth_method
+    );
+    println!(
+        "Saved encrypted profile '{profile}' ({}); it is now active and unlocked.",
+        path.display()
+    );
     if reuse && !minted {
-        println!("Carried the existing client master key forward — external data stays decryptable.");
+        println!(
+            "Carried the existing client master key forward — external data stays decryptable."
+        );
     }
     // Default this profile to the identity's private user domain, so commands
     // land in the user's own namespace without needing -D. Only set it if the
@@ -1655,7 +1970,10 @@ async fn cmd_profile(cmd: ProfileCmd) -> Result<()> {
     match cmd {
         ProfileCmd::Ls => {
             let names = client::Session::list_profiles()?;
-            if names.is_empty() { println!("(no profiles — run `blackbook login`)"); return Ok(()); }
+            if names.is_empty() {
+                println!("(no profiles — run `blackbook login`)");
+                return Ok(());
+            }
             let active = client::active_profile();
             for n in names {
                 let mark = if n == active { "*" } else { " " };
@@ -1675,15 +1993,23 @@ async fn cmd_profile(cmd: ProfileCmd) -> Result<()> {
                 .map_err(|_| AppError::Config(format!("no such profile '{profile}'")))?;
             let bb = client::BlackbookClient::from_session(&session)?;
             match bb.whoami().await {
-                Ok(me) => println!("profile '{profile}': {} ({}) @ {} — auth: {}",
-                                   me.name, me.role, session.server, me.auth_method),
-                Err(e) => println!("profile '{profile}': {} (whoami failed: {e})", session.server),
+                Ok(me) => println!(
+                    "profile '{profile}': {} ({}) @ {} — auth: {}",
+                    me.name, me.role, session.server, me.auth_method
+                ),
+                Err(e) => println!(
+                    "profile '{profile}': {} (whoami failed: {e})",
+                    session.server
+                ),
             }
         }
         ProfileCmd::Rm { name, yes } => {
             if !yes {
                 eprint!("Delete profile '{name}'? [y/N]: ");
-                if read_stdin_line().to_lowercase() != "y" { println!("aborted"); return Ok(()); }
+                if read_stdin_line().to_lowercase() != "y" {
+                    println!("aborted");
+                    return Ok(());
+                }
             }
             if client::Session::clear_named(&name)? {
                 println!("deleted profile '{name}'");
@@ -1702,8 +2028,12 @@ fn build_client(
     mfa: Option<String>,
 ) -> Result<client::BlackbookClient> {
     let mut bb = client::BlackbookClient::from_session(session)?;
-    if let Some(d) = domain { bb = bb.with_domain(d); }
-    if let Some(c) = mfa { bb = bb.with_mfa(c); }
+    if let Some(d) = domain {
+        bb = bb.with_domain(d);
+    }
+    if let Some(c) = mfa {
+        bb = bb.with_mfa(c);
+    }
     Ok(bb)
 }
 
@@ -1711,26 +2041,36 @@ async fn cmd_logout() -> Result<()> {
     let profile = client::active_profile();
     // Drop any cached unlock key first so the credential can't be reopened.
     credstore::agent_clear(&profile);
-    if client::Session::clear()? { println!("Logged out of profile '{profile}'."); }
-    else { println!("No saved session for profile '{profile}'."); }
+    if client::Session::clear()? {
+        println!("Logged out of profile '{profile}'.");
+    } else {
+        println!("No saved session for profile '{profile}'.");
+    }
     Ok(())
 }
 
 async fn cmd_unlock(ttl_minutes: u64) -> Result<()> {
     let profile = client::active_profile();
-    let path = client::Session::path_for(&profile)
-        .map_err(|e| AppError::Config(e.to_string()))?;
-    let bytes = std::fs::read(&path)
-        .map_err(|_| AppError::Config(format!("no such profile '{profile}' — run `blackbook login` first")))?;
+    let path = client::Session::path_for(&profile).map_err(|e| AppError::Config(e.to_string()))?;
+    let bytes = std::fs::read(&path).map_err(|_| {
+        AppError::Config(format!(
+            "no such profile '{profile}' — run `blackbook login` first"
+        ))
+    })?;
     let env: credstore::EncryptedProfile = serde_json::from_slice(&bytes)
         .map_err(|_| AppError::Config(format!(
             "profile '{profile}' is not encrypted (legacy plaintext); re-run `blackbook login` to protect it")))?;
     let pass = credstore::resolve_passphrase(
-        None, &format!("Passphrase for profile '{profile}': "), false)?;
+        None,
+        &format!("Passphrase for profile '{profile}': "),
+        false,
+    )?;
     // Verify the passphrase actually opens the envelope before caching.
-    let kek = env.derive_kek(&pass).map_err(|e| AppError::Config(e.to_string()))?;
-    env.open_with_kek(kek.as_slice()).map_err(|_| AppError::Config(
-        "wrong passphrase — profile not unlocked".into()))?;
+    let kek = env
+        .derive_kek(&pass)
+        .map_err(|e| AppError::Config(e.to_string()))?;
+    env.open_with_kek(kek.as_slice())
+        .map_err(|_| AppError::Config("wrong passphrase — profile not unlocked".into()))?;
     let ttl = ttl_minutes.saturating_mul(60);
     credstore::agent_store(&profile, kek.as_slice(), ttl)
         .map_err(|e| AppError::Config(e.to_string()))?;
@@ -1755,37 +2095,52 @@ async fn cmd_lock() -> Result<()> {
 /// the on-disk wrapping changes.
 async fn cmd_passphrase(old: Option<String>, new: Option<String>) -> Result<()> {
     let profile = client::active_profile();
-    let path = client::Session::path_for(&profile)
-        .map_err(|e| AppError::Config(e.to_string()))?;
-    let bytes = std::fs::read(&path)
-        .map_err(|_| AppError::Config(format!("no such profile '{profile}' — run `blackbook login` first")))?;
+    let path = client::Session::path_for(&profile).map_err(|e| AppError::Config(e.to_string()))?;
+    let bytes = std::fs::read(&path).map_err(|_| {
+        AppError::Config(format!(
+            "no such profile '{profile}' — run `blackbook login` first"
+        ))
+    })?;
     let env: credstore::EncryptedProfile = serde_json::from_slice(&bytes)
         .map_err(|_| AppError::Config(format!(
             "profile '{profile}' is not an encrypted profile (legacy plaintext); re-run `blackbook login` to protect it")))?;
 
     // Current passphrase: flag → $BLACKBOOK_OLD_PASSPHRASE → $BLACKBOOK_PASSPHRASE → prompt.
-    let old_pp: Zeroizing<String> = match old.filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("BLACKBOOK_OLD_PASSPHRASE").ok().filter(|s| !s.is_empty())) {
+    let old_pp: Zeroizing<String> = match old.filter(|s| !s.is_empty()).or_else(|| {
+        std::env::var("BLACKBOOK_OLD_PASSPHRASE")
+            .ok()
+            .filter(|s| !s.is_empty())
+    }) {
         Some(p) => Zeroizing::new(p),
-        None => credstore::resolve_passphrase(None, &format!("Current passphrase for '{profile}': "), false)?,
+        None => credstore::resolve_passphrase(
+            None,
+            &format!("Current passphrase for '{profile}': "),
+            false,
+        )?,
     };
-    let inner = env.open_with_passphrase(&old_pp)
+    let inner = env
+        .open_with_passphrase(&old_pp)
         .map_err(|_| AppError::Config("current passphrase is incorrect".into()))?;
 
     // New passphrase: flag → $BLACKBOOK_NEW_PASSPHRASE → prompt (confirmed).
-    let new_pp: Zeroizing<String> = match new.filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("BLACKBOOK_NEW_PASSPHRASE").ok().filter(|s| !s.is_empty())) {
+    let new_pp: Zeroizing<String> = match new.filter(|s| !s.is_empty()).or_else(|| {
+        std::env::var("BLACKBOOK_NEW_PASSPHRASE")
+            .ok()
+            .filter(|s| !s.is_empty())
+    }) {
         Some(p) => Zeroizing::new(p),
         None => credstore::resolve_passphrase(None, "New passphrase: ", true)?,
     };
     if *new_pp == *old_pp {
-        return Err(AppError::Config("new passphrase is the same as the current one".into()));
+        return Err(AppError::Config(
+            "new passphrase is the same as the current one".into(),
+        ));
     }
 
     // Re-seal the exact inner bundle under the new passphrase, write atomically,
     // and refresh the agent so the session stays unlocked.
-    let sealed = credstore::seal_profile(&new_pp, &inner)
-        .map_err(|e| AppError::Config(e.to_string()))?;
+    let sealed =
+        credstore::seal_profile(&new_pp, &inner).map_err(|e| AppError::Config(e.to_string()))?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(&sealed)?)?;
     std::fs::rename(&tmp, &path)?;
@@ -1827,8 +2182,11 @@ fn cmd_completions(shell: &str) -> Result<()> {
         "bash" => print!("{}", bash_script(&exe, &cmd)),
         "zsh" => print!("{}", zsh_script(&exe, &cmd)),
         "fish" => print!("{}", fish_script(&exe, &cmd)),
-        other => return Err(AppError::Config(format!(
-            "unknown shell '{other}' — choose powershell, bash, zsh, or fish"))),
+        other => {
+            return Err(AppError::Config(format!(
+                "unknown shell '{other}' — choose powershell, bash, zsh, or fish"
+            )))
+        }
     }
     Ok(())
 }
@@ -1849,9 +2207,17 @@ fn cmd_complete(words: &[String]) {
 fn complete_candidates(words: &[String]) -> Vec<String> {
     // words[0] is the program name; the rest are real tokens. The final token
     // is the (possibly empty) word being completed.
-    let args = if words.is_empty() { &[][..] } else { &words[1..] };
+    let args = if words.is_empty() {
+        &[][..]
+    } else {
+        &words[1..]
+    };
     let cur = args.last().cloned().unwrap_or_default();
-    let prev = if args.len() >= 2 { args[args.len() - 2].clone() } else { String::new() };
+    let prev = if args.len() >= 2 {
+        args[args.len() - 2].clone()
+    } else {
+        String::new()
+    };
 
     // 1) Value completion: if the previous token is a flag that takes a known
     //    local value, complete that value set regardless of position.
@@ -1873,7 +2239,9 @@ fn complete_candidates(words: &[String]) -> Vec<String> {
     // Subcommand names (only if the current word isn't a flag).
     if !cur.starts_with('-') {
         for sub in ctx.get_subcommands() {
-            if sub.is_hide_set() { continue; }
+            if sub.is_hide_set() {
+                continue;
+            }
             out.push(sub.get_name().to_string());
         }
     }
@@ -1881,7 +2249,9 @@ fn complete_candidates(words: &[String]) -> Vec<String> {
     for a in ctx.get_arguments().chain(cmd.get_arguments()) {
         if let Some(long) = a.get_long() {
             let f = format!("--{long}");
-            if !out.contains(&f) { out.push(f); }
+            if !out.contains(&f) {
+                out.push(f);
+            }
         }
     }
     filter_prefix(out, &cur)
@@ -1899,14 +2269,16 @@ fn value_candidates_for_flag(flag: &str) -> Option<Vec<String>> {
 /// First-positional value completion for verbs whose argument is local.
 fn positional_value_candidates(args: &[String]) -> Option<Vec<String>> {
     // Find the first non-flag token (the subcommand path), e.g. ["profile","use"].
-    let path: Vec<&str> = args.iter()
+    let path: Vec<&str> = args
+        .iter()
         .map(|s| s.as_str())
         .filter(|s| !s.starts_with('-'))
         .collect();
     match path.as_slice() {
         // `profile use|show|rm <name>` → known profiles
-        ["profile", "use", ..] | ["profile", "show", ..] | ["profile", "rm", ..] =>
-            Some(local_profiles()),
+        ["profile", "use", ..] | ["profile", "show", ..] | ["profile", "rm", ..] => {
+            Some(local_profiles())
+        }
         // `domain use <name>` → known domains
         ["domain", "use", ..] => Some(local_domains()),
         // `file get|rm <name>` → resident files this machine actually holds
@@ -1920,9 +2292,13 @@ fn positional_value_candidates(args: &[String]) -> Option<Vec<String>> {
 fn resolve_subcommand<'a>(root: &'a clap::Command, args: &[String]) -> &'a clap::Command {
     let mut ctx = root;
     for tok in args {
-        if tok.starts_with('-') { continue; }
-        match ctx.get_subcommands().find(|s| s.get_name() == tok
-            || s.get_all_aliases().any(|a| a == tok)) {
+        if tok.starts_with('-') {
+            continue;
+        }
+        match ctx
+            .get_subcommands()
+            .find(|s| s.get_name() == tok || s.get_all_aliases().any(|a| a == tok))
+        {
             Some(sub) => ctx = sub,
             None => break,
         }
@@ -1951,7 +2327,9 @@ fn local_domains() -> Vec<String> {
     let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     set.insert("default".to_string());
     for p in local_profiles() {
-        if let Some(d) = client::Session::read_domain_pref(&p) { set.insert(d); }
+        if let Some(d) = client::Session::read_domain_pref(&p) {
+            set.insert(d);
+        }
     }
     set.into_iter().collect()
 }
@@ -1959,13 +2337,15 @@ fn local_domains() -> Vec<String> {
 /// Resident files this machine holds, from the local index (`<domain>/<name>`).
 /// Returns the bare names.
 fn local_resident_files() -> Vec<String> {
-    resident_index_load().keys()
+    resident_index_load()
+        .keys()
         .map(|k| k.rsplit('/').next().unwrap_or(k).to_string())
         .collect()
 }
 
 fn powershell_script(exe: &str, cmd: &str) -> String {
-    format!(r#"# Blackbook PowerShell completion. Add to your $PROFILE:
+    format!(
+        r#"# Blackbook PowerShell completion. Add to your $PROFILE:
 #   {cmd} completions powershell | Out-String | Invoke-Expression
 Register-ArgumentCompleter -Native -CommandName {cmd} -ScriptBlock {{
     param($wordToComplete, $commandAst, $cursorPosition)
@@ -1978,41 +2358,51 @@ Register-ArgumentCompleter -Native -CommandName {cmd} -ScriptBlock {{
         [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
     }}
 }}
-"#)
+"#
+    )
 }
 
 fn bash_script(exe: &str, cmd: &str) -> String {
-    format!(r#"# Blackbook bash completion. Source it:  source <({cmd} completions bash)
+    format!(
+        r#"# Blackbook bash completion. Source it:  source <({cmd} completions bash)
 _{cmd}() {{
     local IFS=$'\n'
     COMPREPLY=( $('{exe}' __complete -- "${{COMP_WORDS[@]}}" 2>/dev/null) )
 }}
 complete -F _{cmd} {cmd}
-"#)
+"#
+    )
 }
 
 fn zsh_script(exe: &str, cmd: &str) -> String {
-    format!(r#"# Blackbook zsh completion. Source it:  source <({cmd} completions zsh)
+    format!(
+        r#"# Blackbook zsh completion. Source it:  source <({cmd} completions zsh)
 _{cmd}() {{
     local -a c
     c=(${{(f)"$('{exe}' __complete -- ${{words[@]}} 2>/dev/null)"}})
     compadd -- $c
 }}
 compdef _{cmd} {cmd}
-"#)
+"#
+    )
 }
 
 fn fish_script(exe: &str, cmd: &str) -> String {
-    format!(r#"# Blackbook fish completion. Source it:  {cmd} completions fish | source
+    format!(
+        r#"# Blackbook fish completion. Source it:  {cmd} completions fish | source
 complete -c {cmd} -f -a "({exe} __complete -- (commandline -opc) (commandline -ct) 2>/dev/null)"
-"#)
+"#
+    )
 }
 
 async fn cmd_whoami() -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, None, None)?;
     let me = bb.whoami().await?;
-    println!("{} ({}) — id {} — auth: {}", me.name, me.role, me.id, me.auth_method);
+    println!(
+        "{} ({}) — id {} — auth: {}",
+        me.name, me.role, me.id, me.auth_method
+    );
     println!("server: {}", session.server);
     if let Some(ud) = me.user_domain.as_deref() {
         println!("user domain: {ud}");
@@ -2023,7 +2413,10 @@ async fn cmd_whoami() -> Result<()> {
     if let Some(cert_pem) = session.cert_pem.as_deref() {
         if let Ok(fp_hex) = tunnel_crypto::cert_fingerprint(cert_pem) {
             if let Ok(fp) = hex::decode(&fp_hex) {
-                println!("cert fingerprint (SHA3-256): {}", &fp_hex[..32.min(fp_hex.len())]);
+                println!(
+                    "cert fingerprint (SHA3-256): {}",
+                    &fp_hex[..32.min(fp_hex.len())]
+                );
                 println!("  braille: {}", presentation::braille(&fp));
                 println!("{}", presentation::randomart(&fp, &me.name));
             }
@@ -2034,13 +2427,20 @@ async fn cmd_whoami() -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_put(
-    name: String, value: Option<String>,
-    mfa_required: bool, delete_on_read: bool, max_reads: Option<i64>,
+    name: String,
+    value: Option<String>,
+    mfa_required: bool,
+    delete_on_read: bool,
+    max_reads: Option<i64>,
     rotate_on_read: bool,
-    quorum: Option<i32>, signatories: Vec<String>,
-    overwrite: bool, preserve_on_cleanup: bool, no_overwrite: bool,
+    quorum: Option<i32>,
+    signatories: Vec<String>,
+    overwrite: bool,
+    preserve_on_cleanup: bool,
+    no_overwrite: bool,
     ext: ExtFlags,
-    domain: Option<String>, mfa: Option<String>,
+    domain: Option<String>,
+    mfa: Option<String>,
 ) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, domain, mfa)?;
@@ -2055,20 +2455,34 @@ async fn cmd_put(
         return Err(AppError::Config(
             "--rotate-on-read is meaningless for client-side secrets (the server can't re-key what it can't read)".into()));
     }
-    let flags = if mfa_required || delete_on_read || max_reads.is_some()
-        || rotate_on_read || preserve_on_cleanup || no_overwrite {
+    let flags = if mfa_required
+        || delete_on_read
+        || max_reads.is_some()
+        || rotate_on_read
+        || preserve_on_cleanup
+        || no_overwrite
+    {
         Some(client::ResourceFlagsRequest {
-            mfa_required, delete_on_read, max_reads, rotate_on_read,
-            preserve_on_cleanup, no_overwrite,
+            mfa_required,
+            delete_on_read,
+            max_reads,
+            rotate_on_read,
+            preserve_on_cleanup,
+            no_overwrite,
         })
-    } else { None };
+    } else {
+        None
+    };
     let policy = match (quorum, signatories.is_empty()) {
-        (Some(_), true) => return Err(AppError::Config(
-            "--quorum requires --signatories <name,name,...>".into())),
-        (None, false) => return Err(AppError::Config(
-            "--signatories requires --quorum N".into())),
+        (Some(_), true) => {
+            return Err(AppError::Config(
+                "--quorum requires --signatories <name,name,...>".into(),
+            ))
+        }
+        (None, false) => return Err(AppError::Config("--signatories requires --quorum N".into())),
         (Some(k), false) => Some(client::AccessPolicyRequest {
-            threshold_k: k, signatories,
+            threshold_k: k,
+            signatories,
         }),
         (None, true) => None,
     };
@@ -2076,16 +2490,31 @@ async fn cmd_put(
     let resp = if let Some(spec) = spec {
         // Encrypt locally; the server only ever sees the opaque envelope.
         let key = ext_key_for_spec(&spec, &session, ext.passphrase)?;
-        ext_mode_label = match key { ExtKey::Cmk(_) => " [external-key/managed]", ExtKey::Passphrase(_) => " [external-key/passphrase]" };
+        ext_mode_label = match key {
+            ExtKey::Cmk(_) => " [external-key/managed]",
+            ExtKey::Passphrase(_) => " [external-key/passphrase]",
+        };
         let envelope = external_seal(&key, value.as_bytes())?;
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&envelope);
-        bb.store_external(&name, &b64, flags.as_ref(), policy.as_ref(), overwrite).await?
+        bb.store_external(&name, &b64, flags.as_ref(), policy.as_ref(), overwrite)
+            .await?
     } else {
-        bb.store(&name, &value, None, flags.as_ref(), policy.as_ref(), overwrite).await?
+        bb.store(
+            &name,
+            &value,
+            None,
+            flags.as_ref(),
+            policy.as_ref(),
+            overwrite,
+        )
+        .await?
     };
     let tag = ext_mode_label;
-    println!("{} {} ({}){}", resp.status, resp.resource_name, resp.resource_id, tag);
+    println!(
+        "{} {} ({}){}",
+        resp.status, resp.resource_name, resp.resource_id, tag
+    );
     Ok(())
 }
 
@@ -2096,7 +2525,10 @@ async fn cmd_mfa(cmd: MfaCmd) -> Result<()> {
         MfaCmd::Enroll => {
             let resp = bb.mfa_enroll().await?;
             println!("Provisioning URI:\n  {}\n", resp.provisioning_uri);
-            println!("Or enter this base32 secret in your authenticator:\n  {}\n", resp.secret_base32);
+            println!(
+                "Or enter this base32 secret in your authenticator:\n  {}\n",
+                resp.secret_base32
+            );
             println!("{}", resp.instructions);
         }
         MfaCmd::Verify { code } => {
@@ -2108,14 +2540,19 @@ async fn cmd_mfa(cmd: MfaCmd) -> Result<()> {
 }
 
 async fn cmd_get(
-    name: String, request_id: Option<String>,
-    wait: bool, wait_timeout: u64, external_passphrase: Option<String>,
-    domain: Option<String>, mfa: Option<String>,
+    name: String,
+    request_id: Option<String>,
+    wait: bool,
+    wait_timeout: u64,
+    external_passphrase: Option<String>,
+    domain: Option<String>,
+    mfa: Option<String>,
 ) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, domain, mfa)?;
     let resp = if !wait {
-        bb.retrieve_with_request(&name, request_id.as_deref()).await?
+        bb.retrieve_with_request(&name, request_id.as_deref())
+            .await?
     } else {
         // Block until the K-of-N request is approved (single call for automation).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout);
@@ -2123,10 +2560,19 @@ async fn cmd_get(
         loop {
             match bb.retrieve_with_request(&name, request_id.as_deref()).await {
                 Ok(r) => break r,
-                Err(client::ClientError::Api { status: 412, message }) => {
-                    if !announced { eprintln!("{message}"); eprintln!("waiting up to {wait_timeout}s for approval…"); announced = true; }
+                Err(client::ClientError::Api {
+                    status: 412,
+                    message,
+                }) => {
+                    if !announced {
+                        eprintln!("{message}");
+                        eprintln!("waiting up to {wait_timeout}s for approval…");
+                        announced = true;
+                    }
                     if std::time::Instant::now() >= deadline {
-                        return Err(AppError::Client(format!("timed out after {wait_timeout}s waiting for approval")));
+                        return Err(AppError::Client(format!(
+                            "timed out after {wait_timeout}s waiting for approval"
+                        )));
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 }
@@ -2138,17 +2584,23 @@ async fn cmd_get(
     // on stdout stays pipe-clean. (The short id correlates with the audit log.)
     if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         let trunc = |s: &str| s[..s.len().min(19)].to_string();
-        eprintln!("↳ {} (id {}, created {}, updated {})",
-                  resp.resource_name, short_id(&resp.resource_id),
-                  trunc(&resp.created_at), trunc(&resp.updated_at));
+        eprintln!(
+            "↳ {} (id {}, created {}, updated {})",
+            resp.resource_name,
+            short_id(&resp.resource_id),
+            trunc(&resp.created_at),
+            trunc(&resp.updated_at)
+        );
     }
     if resp.external {
         // Client-side secret: the server handed back an opaque envelope that
         // only our passphrase can open.
-        let envelope_b64 = resp.envelope.ok_or_else(||
-            AppError::Crypto("server marked secret external but returned no envelope".into()))?;
+        let envelope_b64 = resp.envelope.ok_or_else(|| {
+            AppError::Crypto("server marked secret external but returned no envelope".into())
+        })?;
         use base64::Engine as _;
-        let envelope = base64::engine::general_purpose::STANDARD.decode(&envelope_b64)
+        let envelope = base64::engine::general_purpose::STANDARD
+            .decode(&envelope_b64)
             .map_err(|_| AppError::Crypto("envelope is not valid base64".into()))?;
         let env = ext_decode(&envelope)?;
         let plain = external_open(&env, &session, external_passphrase)?;
@@ -2165,23 +2617,34 @@ async fn cmd_get(
 /// default to managed (the natural "drop the passphrase" choice). The two are
 /// mutually exclusive. Shared by `rekey` (secrets) and `file rekey`.
 fn rekey_target_key(
-    session: &client::Session, external_key: bool, new_passphrase: Option<String>,
+    session: &client::Session,
+    external_key: bool,
+    new_passphrase: Option<String>,
 ) -> Result<ExtKey> {
     let pass = new_passphrase.filter(|s| !s.is_empty());
     if external_key && pass.is_some() {
         return Err(AppError::Config(
-            "choose one target key: --external-key (managed) OR --external-passphrase (user).".into()));
+            "choose one target key: --external-key (managed) OR --external-passphrase (user)."
+                .into(),
+        ));
     }
     match pass {
         Some(p) => Ok(ExtKey::Passphrase(p)),
-        None => session.cmk_bytes().map(ExtKey::Cmk).ok_or_else(|| AppError::Config(
-            "this profile has no managed key (CMK) to rekey to. Re-run `blackbook login`, \
-             or pass --external-passphrase to set a user passphrase.".into())),
+        None => session.cmk_bytes().map(ExtKey::Cmk).ok_or_else(|| {
+            AppError::Config(
+                "this profile has no managed key (CMK) to rekey to. Re-run `blackbook login`, \
+             or pass --external-passphrase to set a user passphrase."
+                    .into(),
+            )
+        }),
     }
 }
 
 fn ext_key_label(k: &ExtKey) -> &'static str {
-    match k { ExtKey::Cmk(_) => "managed (CMK)", ExtKey::Passphrase(_) => "passphrase" }
+    match k {
+        ExtKey::Cmk(_) => "managed (CMK)",
+        ExtKey::Passphrase(_) => "passphrase",
+    }
 }
 
 /// Change the client-side key on an external secret. Fetches the opaque
@@ -2189,9 +2652,12 @@ fn ext_key_label(k: &ExtKey) -> &'static str {
 /// re-seals the *same plaintext* under the new key, then stores it back with
 /// `overwrite`. Only the wrapping changes.
 async fn cmd_rekey(
-    name: String, old_external_passphrase: Option<String>,
-    external_key: bool, external_passphrase: Option<String>,
-    domain: Option<String>, mfa: Option<String>,
+    name: String,
+    old_external_passphrase: Option<String>,
+    external_key: bool,
+    external_passphrase: Option<String>,
+    domain: Option<String>,
+    mfa: Option<String>,
 ) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, domain, mfa)?;
@@ -2200,10 +2666,12 @@ async fn cmd_rekey(
         return Err(AppError::Config(format!(
             "'{name}' is a normal (server-side) secret, not client-side — there is no external key to change.")));
     }
-    let envelope_b64 = resp.envelope.ok_or_else(||
-        AppError::Crypto("server marked secret external but returned no envelope".into()))?;
+    let envelope_b64 = resp.envelope.ok_or_else(|| {
+        AppError::Crypto("server marked secret external but returned no envelope".into())
+    })?;
     use base64::Engine as _;
-    let envelope = base64::engine::general_purpose::STANDARD.decode(&envelope_b64)
+    let envelope = base64::engine::general_purpose::STANDARD
+        .decode(&envelope_b64)
         .map_err(|_| AppError::Crypto("envelope is not valid base64".into()))?;
     let env = ext_decode(&envelope)?;
     // Decrypt with the *current* key.
@@ -2212,7 +2680,8 @@ async fn cmd_rekey(
     let new_key = rekey_target_key(&session, external_key, external_passphrase)?;
     let new_env = external_seal(&new_key, &plain)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&new_env);
-    bb.store_external(&name, &b64, None, None, /* overwrite = */ true).await?;
+    bb.store_external(&name, &b64, None, None, /* overwrite = */ true)
+        .await?;
     println!("✓ rekeyed secret '{name}' → {}.", ext_key_label(&new_key));
     Ok(())
 }
@@ -2221,8 +2690,10 @@ async fn cmd_approve(request_id: String) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, None, None)?;
     let v = bb.approve_request(&request_id).await?;
-    println!("approved — total approvers: {}",
-             v.get("approvers").and_then(|x| x.as_u64()).unwrap_or(0));
+    println!(
+        "approved — total approvers: {}",
+        v.get("approvers").and_then(|x| x.as_u64()).unwrap_or(0)
+    );
     Ok(())
 }
 
@@ -2234,15 +2705,26 @@ async fn cmd_requests(id: Option<String>, verbose: bool) -> Result<()> {
     if let Some(id) = id {
         let r = bb.get_access_request(&id).await?;
         println!("Request {}", r.id);
-        println!("  resource : {} ({}) in domain {}", r.resource_name, r.resource_kind, r.domain);
+        println!(
+            "  resource : {} ({}) in domain {}",
+            r.resource_name, r.resource_kind, r.domain
+        );
         println!("  requester: {}", r.requester);
-        println!("  threshold: {} of {} signatories", r.threshold_k, r.signatories.len());
+        println!(
+            "  threshold: {} of {} signatories",
+            r.threshold_k,
+            r.signatories.len()
+        );
         println!("  status   : {}", r.status);
         println!("  created  : {}", r.created_at);
         println!("  expires  : {}", r.expires_at);
         println!("  signatories (who can approve this request):");
         for s in &r.signatories {
-            let mark = if r.approvers.contains(s) { "[approved]" } else { "[ pending]" };
+            let mark = if r.approvers.contains(s) {
+                "[approved]"
+            } else {
+                "[ pending]"
+            };
             println!("    {mark}  {s}");
         }
         if r.approvers.iter().any(|a| !r.signatories.contains(a)) {
@@ -2253,20 +2735,36 @@ async fn cmd_requests(id: Option<String>, verbose: bool) -> Result<()> {
     }
 
     let list = bb.list_access_requests().await?;
-    if list.count == 0 { println!("(no access requests)"); return Ok(()); }
-    println!("{:<14}  {:<10}  {:<14}  {:<24}  {:<6}  {:<10}  STATUS",
-             "ID", "DOMAIN", "REQUESTER", "RESOURCE", "K", "APPROVERS");
+    if list.count == 0 {
+        println!("(no access requests)");
+        return Ok(());
+    }
+    println!(
+        "{:<14}  {:<10}  {:<14}  {:<24}  {:<6}  {:<10}  STATUS",
+        "ID", "DOMAIN", "REQUESTER", "RESOURCE", "K", "APPROVERS"
+    );
     println!("{}", "-".repeat(110));
     for r in list.requests {
-        println!("{:<14}  {:<10}  {:<14}  {:<24}  {:<6}  {:<10}  {}",
-                 r.id, r.domain, r.requester, r.resource_name,
-                 r.threshold_k,
-                 format!("{}/{}", r.approvers.len(), r.signatories.len()),
-                 r.status);
+        println!(
+            "{:<14}  {:<10}  {:<14}  {:<24}  {:<6}  {:<10}  {}",
+            r.id,
+            r.domain,
+            r.requester,
+            r.resource_name,
+            r.threshold_k,
+            format!("{}/{}", r.approvers.len(), r.signatories.len()),
+            r.status
+        );
         if verbose {
             println!("      can approve : {}", r.signatories.join(", "));
-            println!("      approved by : {}",
-                     if r.approvers.is_empty() { "(none yet)".to_string() } else { r.approvers.join(", ") });
+            println!(
+                "      approved by : {}",
+                if r.approvers.is_empty() {
+                    "(none yet)".to_string()
+                } else {
+                    r.approvers.join(", ")
+                }
+            );
             if let Some(ca) = &r.consumed_at {
                 println!("      consumed at : {ca}");
             }
@@ -2282,28 +2780,56 @@ async fn cmd_grants(cmd: GrantsCmd, domain: Option<String>) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, domain, None)?;
     match cmd {
-        GrantsCmd::Add { grantee, pattern, kind, max_uses, ttl_hours, expires_at, not_before } => {
+        GrantsCmd::Add {
+            grantee,
+            pattern,
+            kind,
+            max_uses,
+            ttl_hours,
+            expires_at,
+            not_before,
+        } => {
             if ttl_hours.is_none() && expires_at.is_none() {
                 return Err(AppError::Config(
-                    "a time limit is required: pass --ttl-hours H or --expires-at RFC3339".into()));
+                    "a time limit is required: pass --ttl-hours H or --expires-at RFC3339".into(),
+                ));
             }
             if kind != "secret" && kind != "file" {
                 return Err(AppError::Config("--kind must be 'secret' or 'file'".into()));
             }
             let opts = client::GrantAddOpts {
-                resource_kind: kind, max_uses, ttl_hours, expires_at, not_before,
+                resource_kind: kind,
+                max_uses,
+                ttl_hours,
+                expires_at,
+                not_before,
             };
             let v = bb.create_access_grant(&grantee, &pattern, &opts).await?;
             let gid = v.get("id").and_then(|x| x.as_str()).unwrap_or("?");
             let exp = v.get("expires_at").and_then(|x| x.as_str()).unwrap_or("?");
-            let cap = max_uses.map(|m| format!("{m} use(s)")).unwrap_or_else(|| "unlimited uses".into());
+            let cap = max_uses
+                .map(|m| format!("{m} use(s)"))
+                .unwrap_or_else(|| "unlimited uses".into());
             println!("pre-approved {grantee} for '{pattern}' ({cap}, expires {exp}) — grant {gid}");
         }
         GrantsCmd::Ls => {
             let list = bb.list_access_grants().await?;
-            if list.count == 0 { println!("(no advance grants)"); return Ok(()); }
-            println!("{:<14}  {:<12}  {:<12}  {:<10}  {:<6}  {:<20}  {:<7}  {:<23}  {:<11}  STATUS",
-                     "ID", "SIGNATORY", "GRANTEE", "DOMAIN", "KIND", "PATTERN", "USE", "VALIDITY", "CREATED");
+            if list.count == 0 {
+                println!("(no advance grants)");
+                return Ok(());
+            }
+            println!(
+                "{:<14}  {:<12}  {:<12}  {:<10}  {:<6}  {:<20}  {:<7}  {:<23}  {:<11}  STATUS",
+                "ID",
+                "SIGNATORY",
+                "GRANTEE",
+                "DOMAIN",
+                "KIND",
+                "PATTERN",
+                "USE",
+                "VALIDITY",
+                "CREATED"
+            );
             println!("{}", "-".repeat(150));
             for g in list.grants {
                 let use_disp = match g.max_uses {
@@ -2318,15 +2844,28 @@ async fn cmd_grants(cmd: GrantsCmd, domain: Option<String>) -> Result<()> {
                 };
                 let created = &g.created_at[..g.created_at.len().min(10)];
                 let status = if g.revoked { "revoked" } else { "active" };
-                println!("{:<14}  {:<12}  {:<12}  {:<10}  {:<6}  {:<20}  {:<7}  {:<23}  {:<11}  {}",
-                         g.id, g.signatory, g.grantee, g.domain, g.resource_kind,
-                         g.pattern, use_disp, validity, created, status);
+                println!(
+                    "{:<14}  {:<12}  {:<12}  {:<10}  {:<6}  {:<20}  {:<7}  {:<23}  {:<11}  {}",
+                    g.id,
+                    g.signatory,
+                    g.grantee,
+                    g.domain,
+                    g.resource_kind,
+                    g.pattern,
+                    use_disp,
+                    validity,
+                    created,
+                    status
+                );
             }
         }
         GrantsCmd::Rm { id, yes } => {
             if !yes {
                 eprint!("Revoke advance grant '{id}'? [y/N]: ");
-                if read_stdin_line().to_lowercase() != "y" { println!("aborted"); return Ok(()); }
+                if read_stdin_line().to_lowercase() != "y" {
+                    println!("aborted");
+                    return Ok(());
+                }
             }
             bb.revoke_access_grant(&id).await?;
             println!("revoked grant '{id}'");
@@ -2338,23 +2877,41 @@ async fn cmd_grants(cmd: GrantsCmd, domain: Option<String>) -> Result<()> {
 /// Compact, human-readable summary of a resource's enforced rules for list
 /// views — e.g. `mfa, max-reads 3/5, quorum 2-of-3, immutable`. Returns "-"
 /// when nothing special is set.
-fn rules_summary(flags: &client::ResourceFlagsView, read_count: i64,
-                 threshold_k: Option<i64>, signatory_count: Option<usize>) -> String {
+fn rules_summary(
+    flags: &client::ResourceFlagsView,
+    read_count: i64,
+    threshold_k: Option<i64>,
+    signatory_count: Option<usize>,
+) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if flags.mfa_required { parts.push("mfa".into()); }
-    if flags.delete_on_read { parts.push("burn-after-read".into()); }
+    if flags.mfa_required {
+        parts.push("mfa".into());
+    }
+    if flags.delete_on_read {
+        parts.push("burn-after-read".into());
+    }
     if let Some(max) = flags.max_reads {
         parts.push(format!("max-reads {}/{}", read_count, max));
     } else if read_count > 0 {
         parts.push(format!("reads {read_count}"));
     }
-    if flags.rotate_on_read { parts.push("rotate-on-read".into()); }
-    if flags.no_overwrite { parts.push("immutable".into()); }
-    if flags.preserve_on_cleanup { parts.push("preserve".into()); }
+    if flags.rotate_on_read {
+        parts.push("rotate-on-read".into());
+    }
+    if flags.no_overwrite {
+        parts.push("immutable".into());
+    }
+    if flags.preserve_on_cleanup {
+        parts.push("preserve".into());
+    }
     if let (Some(k), Some(n)) = (threshold_k, signatory_count) {
         parts.push(format!("quorum {k}-of-{n}"));
     }
-    if parts.is_empty() { "-".into() } else { parts.join(", ") }
+    if parts.is_empty() {
+        "-".into()
+    } else {
+        parts.join(", ")
+    }
 }
 
 async fn cmd_ls(domain: Option<String>, mfa: Option<String>, json: bool) -> Result<()> {
@@ -2365,8 +2922,14 @@ async fn cmd_ls(domain: Option<String>, mfa: Option<String>, json: bool) -> Resu
         println!("{}", serde_json::to_string(&resp)?);
         return Ok(());
     }
-    if resp.count == 0 { println!("(no secrets)"); return Ok(()); }
-    println!("{:<28}  {:<8}  {:<10}  {:<24}  {}", "NAME", "KIND", "STATUS", "UPDATED", "RULES");
+    if resp.count == 0 {
+        println!("(no secrets)");
+        return Ok(());
+    }
+    println!(
+        "{:<28}  {:<8}  {:<10}  {:<24}  {}",
+        "NAME", "KIND", "STATUS", "UPDATED", "RULES"
+    );
     println!("{}", "-".repeat(118));
     for r in resp.resources {
         let kind = if r.external { "external" } else { "server" };
@@ -2375,8 +2938,10 @@ async fn cmd_ls(domain: Option<String>, mfa: Option<String>, json: bool) -> Resu
             None => "active",
         };
         let rules = rules_summary(&r.flags, r.read_count, r.threshold_k, r.signatory_count);
-        println!("{:<28}  {:<8}  {:<10}  {:<24}  {}",
-                 r.resource_name, kind, status, r.updated_at, rules);
+        println!(
+            "{:<28}  {:<8}  {:<10}  {:<24}  {}",
+            r.resource_name, kind, status, r.updated_at, rules
+        );
     }
     Ok(())
 }
@@ -2388,8 +2953,10 @@ async fn cmd_cleanup(domain: Option<String>) -> Result<()> {
     if resp.deleted == 0 && resp.preserved == 0 {
         println!("no tombstoned resources to clean up");
     } else {
-        println!("purged {} tombstoned resource(s) ({} secret(s), {} file(s)); kept {} preserved",
-                 resp.deleted, resp.secrets_deleted, resp.files_deleted, resp.preserved);
+        println!(
+            "purged {} tombstoned resource(s) ({} secret(s), {} file(s)); kept {} preserved",
+            resp.deleted, resp.secrets_deleted, resp.files_deleted, resp.preserved
+        );
         for n in resp.names {
             println!("  - {n}");
         }
@@ -2397,18 +2964,35 @@ async fn cmd_cleanup(domain: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_rm(name: String, yes: bool, domain: Option<String>, mfa: Option<String>) -> Result<()> {
+async fn cmd_rm(
+    name: String,
+    yes: bool,
+    domain: Option<String>,
+    mfa: Option<String>,
+) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, domain, mfa)?;
     if !yes {
         eprint!("Delete '{name}'? [y/N]: ");
-        if read_stdin_line().to_lowercase() != "y" { println!("aborted"); return Ok(()); }
+        if read_stdin_line().to_lowercase() != "y" {
+            println!("aborted");
+            return Ok(());
+        }
     }
     let resp = bb.delete(&name).await?;
     if resp.deleted {
-        println!("deleted '{}' (id {}) at {}", name, short_id(&resp.resource_id), resp.deleted_at);
+        println!(
+            "deleted '{}' (id {}) at {}",
+            name,
+            short_id(&resp.resource_id),
+            resp.deleted_at
+        );
     } else {
-        println!("'{}' (id {}) was already gone — nothing to delete", name, short_id(&resp.resource_id));
+        println!(
+            "'{}' (id {}) was already gone — nothing to delete",
+            name,
+            short_id(&resp.resource_id)
+        );
     }
     Ok(())
 }
@@ -2419,77 +3003,127 @@ async fn cmd_tunnel(cmd: TunnelCmd) -> Result<()> {
     let bb = build_client(&session, None, None)?;
     let me = bb.whoami().await?;
     let my_name = me.name.clone();
-    let my_cert = session.cert_pem.clone()
+    let my_cert = session
+        .cert_pem
+        .clone()
         .ok_or_else(|| AppError::Config("profile has no client certificate".into()))?;
-    let my_key = session.key_pem.clone()
+    let my_key = session
+        .key_pem
+        .clone()
         .ok_or_else(|| AppError::Config("profile has no client key".into()))?;
 
     match cmd {
         TunnelCmd::Ls => {
             let v = bb.tunnel_list().await?;
-            let tunnels = v.get("tunnels").and_then(|x| x.as_array()).cloned().unwrap_or_default();
-            if tunnels.is_empty() { println!("(no active tunnels)"); return Ok(()); }
-            println!("{:<26}  {:<14}  {:<14}  {}", "ID", "OFFERER", "TARGET", "STATE");
+            let tunnels = v
+                .get("tunnels")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if tunnels.is_empty() {
+                println!("(no active tunnels)");
+                return Ok(());
+            }
+            println!(
+                "{:<26}  {:<14}  {:<14}  {}",
+                "ID", "OFFERER", "TARGET", "STATE"
+            );
             println!("{}", "-".repeat(70));
             for t in tunnels {
-                println!("{:<26}  {:<14}  {:<14}  {}",
+                println!(
+                    "{:<26}  {:<14}  {:<14}  {}",
                     t.get("id").and_then(|x| x.as_str()).unwrap_or("?"),
                     t.get("offerer").and_then(|x| x.as_str()).unwrap_or("?"),
                     t.get("target").and_then(|x| x.as_str()).unwrap_or("?"),
-                    t.get("state").and_then(|x| x.as_str()).unwrap_or("?"));
+                    t.get("state").and_then(|x| x.as_str()).unwrap_or("?")
+                );
             }
             Ok(())
         }
-        TunnelCmd::Forward { peer, listen, target, udp } => {
+        TunnelCmd::Forward {
+            peer,
+            listen,
+            target,
+            udp,
+        } => {
             let proto = if udp { Proto::Udp } else { Proto::Tcp };
             // Offer the tunnel, then connect and run the handshake.
             let tid = bb.tunnel_offer(&peer).await?;
             println!("🔌 offered tunnel {tid} to '{peer}'. Waiting for them to `tunnel accept`…");
-            let mut ws = bb.tunnel_connect_ws(&tid).await
+            let mut ws = bb
+                .tunnel_connect_ws(&tid)
+                .await
                 .map_err(|e| AppError::Client(e.to_string()))?;
             // `handshake` returns only after the peer's ECDSA signature is
             // verified against the fingerprint the server vouched, so
             // `sess.peer_*` is the *cryptographically authenticated* identity —
             // not merely the server's claim. Surface that, not the vouch.
-            let (sess, _vouch) = tunnel_client::handshake(&mut ws, &my_name, &my_cert, &my_key).await
+            let (sess, _vouch) = tunnel_client::handshake(&mut ws, &my_name, &my_cert, &my_key)
+                .await
                 .map_err(|e| AppError::Config(format!("tunnel handshake: {e}")))?;
             let peer_fp = &sess.peer_fingerprint[..16.min(sess.peer_fingerprint.len())];
-            println!("🔒 E2E secured — peer '{}' cryptographically verified (cert fp {peer_fp}…). \
-                      The server relays but cannot read this tunnel.", sess.peer_name);
-            println!("➡️  forwarding {} {listen} → {}:{target}",
-                     if udp { "udp" } else { "tcp" }, sess.peer_name);
-            tunnel_client::run_listener(ws, sess, proto, listen, target).await
+            println!(
+                "🔒 E2E secured — peer '{}' cryptographically verified (cert fp {peer_fp}…). \
+                      The server relays but cannot read this tunnel.",
+                sess.peer_name
+            );
+            println!(
+                "➡️  forwarding {} {listen} → {}:{target}",
+                if udp { "udp" } else { "tcp" },
+                sess.peer_name
+            );
+            tunnel_client::run_listener(ws, sess, proto, listen, target)
+                .await
                 .map_err(|e| AppError::Config(format!("tunnel: {e}")))?;
             Ok(())
         }
         TunnelCmd::Accept { from, wait_timeout } => {
             // Poll for an offer addressed to us, then connect + serve dials.
-            println!("👂 waiting for a tunnel offer{}…",
-                     from.as_deref().map(|f| format!(" from '{f}'")).unwrap_or_default());
+            println!(
+                "👂 waiting for a tunnel offer{}…",
+                from.as_deref()
+                    .map(|f| format!(" from '{f}'"))
+                    .unwrap_or_default()
+            );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout);
             let tid = loop {
                 let v = bb.tunnel_list().await?;
                 let found = v.get("tunnels").and_then(|x| x.as_array()).and_then(|arr| {
-                    arr.iter().find(|t| {
-                        t.get("target").and_then(|x| x.as_str()) == Some(my_name.as_str())
-                        && t.get("state").and_then(|x| x.as_str()) != Some("connected")
-                        && from.as_deref().map_or(true, |f| t.get("offerer").and_then(|x| x.as_str()) == Some(f))
-                    }).and_then(|t| t.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                    arr.iter()
+                        .find(|t| {
+                            t.get("target").and_then(|x| x.as_str()) == Some(my_name.as_str())
+                                && t.get("state").and_then(|x| x.as_str()) != Some("connected")
+                                && from.as_deref().map_or(true, |f| {
+                                    t.get("offerer").and_then(|x| x.as_str()) == Some(f)
+                                })
+                        })
+                        .and_then(|t| t.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()))
                 });
-                if let Some(id) = found { break id; }
+                if let Some(id) = found {
+                    break id;
+                }
                 if std::time::Instant::now() >= deadline {
-                    return Err(AppError::Config(format!("no tunnel offer within {wait_timeout}s")));
+                    return Err(AppError::Config(format!(
+                        "no tunnel offer within {wait_timeout}s"
+                    )));
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             };
-            let mut ws = bb.tunnel_connect_ws(&tid).await
+            let mut ws = bb
+                .tunnel_connect_ws(&tid)
+                .await
                 .map_err(|e| AppError::Client(e.to_string()))?;
-            let (sess, _vouch) = tunnel_client::handshake(&mut ws, &my_name, &my_cert, &my_key).await
+            let (sess, _vouch) = tunnel_client::handshake(&mut ws, &my_name, &my_cert, &my_key)
+                .await
                 .map_err(|e| AppError::Config(format!("tunnel handshake: {e}")))?;
             let peer_fp = &sess.peer_fingerprint[..16.min(sess.peer_fingerprint.len())];
-            println!("🔒 E2E secured — peer '{}' cryptographically verified (cert fp {peer_fp}…) \
-                      — serving their dial requests.", sess.peer_name);
-            tunnel_client::run_target(ws, sess).await
+            println!(
+                "🔒 E2E secured — peer '{}' cryptographically verified (cert fp {peer_fp}…) \
+                      — serving their dial requests.",
+                sess.peer_name
+            );
+            tunnel_client::run_target(ws, sess)
+                .await
                 .map_err(|e| AppError::Config(format!("tunnel: {e}")))?;
             Ok(())
         }
@@ -2500,31 +3134,70 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
     let session = client::Session::load()?;
     let bb = build_client(&session, domain, mfa)?;
     match cmd {
-        FileCmd::Put { path, name, mime, mfa_required, delete_on_read, max_reads,
-                       rotate_on_read, quorum, signatories, overwrite,
-                       preserve_on_cleanup, no_overwrite, external_key, external_passphrase,
-                       external, external_data, server_copy, shred, external_passphrase_env } => {
+        FileCmd::Put {
+            path,
+            name,
+            mime,
+            mfa_required,
+            delete_on_read,
+            max_reads,
+            rotate_on_read,
+            quorum,
+            signatories,
+            overwrite,
+            preserve_on_cleanup,
+            no_overwrite,
+            external_key,
+            external_passphrase,
+            external,
+            external_data,
+            server_copy,
+            shred,
+            external_passphrase_env,
+        } => {
             let body = std::fs::read(&path)?;
             let name = name.unwrap_or_else(|| {
-                path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
+                path.file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default()
             });
-            if name.is_empty() { return Err(AppError::Config("could not derive --name from path".into())); }
+            if name.is_empty() {
+                return Err(AppError::Config("could not derive --name from path".into()));
+            }
             // Files allow both axes. resolve_ext_spec validates key/data combos.
-            let ext = ExtFlags { external, external_key, external_data, passphrase: external_passphrase, passphrase_from_env: external_passphrase_env };
+            let ext = ExtFlags {
+                external,
+                external_key,
+                external_data,
+                passphrase: external_passphrase,
+                passphrase_from_env: external_passphrase_env,
+            };
             let spec = resolve_ext_spec(&ext, /* data_allowed = */ true)?;
-            let resident = matches!(spec, Some(ExtSpec { data: DataLoc::Resident, .. }));
+            let resident = matches!(
+                spec,
+                Some(ExtSpec {
+                    data: DataLoc::Resident,
+                    ..
+                })
+            );
             if spec.is_some() && rotate_on_read {
                 return Err(AppError::Config(
                     "--rotate-on-read is meaningless for client-side files (the server can't re-key what it can't read)".into()));
             }
             if !resident && (server_copy || shred) {
-                return Err(AppError::Config("--server-copy and --shred require --external-data (resident)".into()));
+                return Err(AppError::Config(
+                    "--server-copy and --shred require --external-data (resident)".into(),
+                ));
             }
             match (quorum, signatories.is_empty()) {
-                (Some(_), true) => return Err(AppError::Config(
-                    "--quorum requires --signatories <name,name,...>".into())),
-                (None, false) => return Err(AppError::Config(
-                    "--signatories requires --quorum N".into())),
+                (Some(_), true) => {
+                    return Err(AppError::Config(
+                        "--quorum requires --signatories <name,name,...>".into(),
+                    ))
+                }
+                (None, false) => {
+                    return Err(AppError::Config("--signatories requires --quorum N".into()))
+                }
                 _ => {}
             }
             let dom = domain_label(&bb);
@@ -2532,8 +3205,12 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
             if resident {
                 // Encrypt locally, stash the ciphertext on this machine, and
                 // upload only the manifest + the server's key-component half.
-                let key = ext_key_for_spec(spec.as_ref().unwrap(), &session, ext.passphrase.clone())?;
-                let label = match key { ExtKey::Cmk(_) => "managed", ExtKey::Passphrase(_) => "passphrase" };
+                let key =
+                    ext_key_for_spec(spec.as_ref().unwrap(), &session, ext.passphrase.clone())?;
+                let label = match key {
+                    ExtKey::Cmk(_) => "managed",
+                    ExtKey::Passphrase(_) => "passphrase",
+                };
                 let (stash, kc_b64, _) = resident_seal(&key, &body, &name)?;
                 // Persist the stash file under ~/.bbk/resident/<id>.bbkr.
                 let stash_id = format!("{}.bbkr", blackbook_core::Id::new(16).to_hex());
@@ -2545,15 +3222,27 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 // placeholder (the server requires a non-empty body but discards
                 // it for resident-no-copy).
                 let upload_body: Vec<u8> = if server_copy {
-                    let (_, ct) = resident_parts_from_stash(&stash)?; ct
-                } else { vec![0u8] };
+                    let (_, ct) = resident_parts_from_stash(&stash)?;
+                    ct
+                } else {
+                    vec![0u8]
+                };
                 let opts = client::FilePutOpts {
                     mime: mime.as_deref(),
-                    mfa_required, delete_on_read, max_reads, rotate_on_read: false,
-                    preserve_on_cleanup, no_overwrite, overwrite,
-                    quorum, signatories,
-                    external: false, external_meta: None,
-                    resident: true, key_component: Some(kc_b64), server_copy,
+                    mfa_required,
+                    delete_on_read,
+                    max_reads,
+                    rotate_on_read: false,
+                    preserve_on_cleanup,
+                    no_overwrite,
+                    overwrite,
+                    quorum,
+                    signatories,
+                    external: false,
+                    external_meta: None,
+                    resident: true,
+                    key_component: Some(kc_b64),
+                    server_copy,
                 };
                 match bb.file_put(&name, upload_body, &opts).await {
                     Ok(resp) => {
@@ -2564,11 +3253,24 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                         // --shred: overwrite the original plaintext before
                         // unlinking, so the cleartext isn't trivially recoverable
                         // from freed blocks (best-effort; see secure_delete docs).
-                        if shred { let _ = credstore::secure_delete(&path); }
+                        if shred {
+                            let _ = credstore::secure_delete(&path);
+                        }
                         let copy = if server_copy { " + server backup" } else { "" };
-                        let shred_note = if shred { "; original shredded (overwritten)" } else { "" };
-                        println!("registered resident {} (stash {}, sha3:{}…) [resident/{}{}]{}",
-                                 resp.name, stash_path.display(), &resp.content_hash[..16], label, copy, shred_note);
+                        let shred_note = if shred {
+                            "; original shredded (overwritten)"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "registered resident {} (stash {}, sha3:{}…) [resident/{}{}]{}",
+                            resp.name,
+                            stash_path.display(),
+                            &resp.content_hash[..16],
+                            label,
+                            copy,
+                            shred_note
+                        );
                     }
                     Err(e) => {
                         // Roll back the local stash so we don't leave an orphan;
@@ -2583,36 +3285,74 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 let mut file_ext_label = "";
                 let (upload_body, external_meta) = if let Some(spec) = spec.as_ref() {
                     let key = ext_key_for_spec(spec, &session, ext.passphrase.clone())?;
-                    file_ext_label = match key { ExtKey::Cmk(_) => " [external-key/managed]", ExtKey::Passphrase(_) => " [external-key/passphrase]" };
+                    file_ext_label = match key {
+                        ExtKey::Cmk(_) => " [external-key/managed]",
+                        ExtKey::Passphrase(_) => " [external-key/passphrase]",
+                    };
                     let (meta, ct) = external_seal_parts(&key, &body)?;
                     use base64::Engine as _;
-                    (ct, Some(base64::engine::general_purpose::STANDARD.encode(&meta)))
+                    (
+                        ct,
+                        Some(base64::engine::general_purpose::STANDARD.encode(&meta)),
+                    )
                 } else {
                     (body, None)
                 };
                 let opts = client::FilePutOpts {
                     mime: mime.as_deref(),
-                    mfa_required, delete_on_read, max_reads, rotate_on_read,
-                    preserve_on_cleanup, no_overwrite, overwrite,
-                    quorum, signatories,
-                    external: external_meta.is_some(), external_meta,
-                    resident: false, key_component: None, server_copy: false,
+                    mfa_required,
+                    delete_on_read,
+                    max_reads,
+                    rotate_on_read,
+                    preserve_on_cleanup,
+                    no_overwrite,
+                    overwrite,
+                    quorum,
+                    signatories,
+                    external: external_meta.is_some(),
+                    external_meta,
+                    resident: false,
+                    key_component: None,
+                    server_copy: false,
                 };
                 let resp = bb.file_put(&name, upload_body, &opts).await?;
-                println!("uploaded {} ({} bytes stored, sha3:{}…){}", resp.name, resp.size, &resp.content_hash[..16], file_ext_label);
+                println!(
+                    "uploaded {} ({} bytes stored, sha3:{}…){}",
+                    resp.name,
+                    resp.size,
+                    &resp.content_hash[..16],
+                    file_ext_label
+                );
             }
         }
-        FileCmd::Get { name, path, request_id, wait, wait_timeout, external_passphrase } => {
+        FileCmd::Get {
+            name,
+            path,
+            request_id,
+            wait,
+            wait_timeout,
+            external_passphrase,
+        } => {
             let dl = if wait {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout);
                 let mut announced = false;
                 loop {
                     match bb.file_get_download(&name, request_id.as_deref()).await {
                         Ok(b) => break b,
-                        Err(client::ClientError::Api { status: 412, message }) => {
-                            if !announced { eprintln!("{message}"); eprintln!("waiting up to {wait_timeout}s for approval…"); announced = true; }
+                        Err(client::ClientError::Api {
+                            status: 412,
+                            message,
+                        }) => {
+                            if !announced {
+                                eprintln!("{message}");
+                                eprintln!("waiting up to {wait_timeout}s for approval…");
+                                announced = true;
+                            }
                             if std::time::Instant::now() >= deadline {
-                                return Err(AppError::Client(format!("timed out after {wait_timeout}s waiting for approval")));
+                                return Err(AppError::Client(format!(
+                                    "timed out after {wait_timeout}s waiting for approval"
+                                )));
                             }
                             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         }
@@ -2626,12 +3366,18 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 // Resident file: the server returned only its key-component half.
                 // Find the local stash, recombine, decrypt locally.
                 let dom = domain_label(&bb);
-                let kc = dl.key_component.ok_or_else(|| AppError::Crypto(
-                    "server flagged file resident but returned no key component".into()))?;
+                let kc = dl.key_component.ok_or_else(|| {
+                    AppError::Crypto(
+                        "server flagged file resident but returned no key component".into(),
+                    )
+                })?;
                 let idx = resident_index_load();
-                let stash_id = idx.get(&resident_key(&dom, &name)).ok_or_else(|| AppError::Config(
-                    format!("no local stash for resident file '{name}' in domain '{dom}' — \
-                             this machine doesn't hold the ciphertext")))?;
+                let stash_id = idx.get(&resident_key(&dom, &name)).ok_or_else(|| {
+                    AppError::Config(format!(
+                        "no local stash for resident file '{name}' in domain '{dom}' — \
+                             this machine doesn't hold the ciphertext"
+                    ))
+                })?;
                 let stash = std::fs::read(resident_dir()?.join(stash_id))
                     .map_err(|e| AppError::Config(format!("reading resident stash: {e}")))?;
                 let (header, ct) = resident_parse(&stash)?;
@@ -2641,7 +3387,8 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 // carried the envelope header meta. `meta ++ ct` reconstitutes
                 // the full envelope, opened with the CMK or passphrase.
                 use base64::Engine as _;
-                let mut envelope = base64::engine::general_purpose::STANDARD.decode(&meta_b64)
+                let mut envelope = base64::engine::general_purpose::STANDARD
+                    .decode(&meta_b64)
                     .map_err(|_| AppError::Crypto("external meta is not valid base64".into()))?;
                 envelope.extend_from_slice(&dl.bytes);
                 let env = ext_decode(&envelope)?;
@@ -2654,7 +3401,10 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     use std::io::Write;
                     std::io::stdout().write_all(&bytes)?;
                 }
-                Some(p) => { std::fs::write(p, &bytes)?; eprintln!("wrote {} bytes to {}", bytes.len(), p); }
+                Some(p) => {
+                    std::fs::write(p, &bytes)?;
+                    eprintln!("wrote {} bytes to {}", bytes.len(), p);
+                }
                 None => {
                     let out = PathBuf::from(&name);
                     std::fs::write(&out, &bytes)?;
@@ -2668,8 +3418,14 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 println!("{}", serde_json::to_string(&list)?);
                 return Ok(());
             }
-            if list.count == 0 { println!("(no files)"); return Ok(()); }
-            println!("{:<32}  {:>9}  {:<14}  {:<16}  {}", "NAME", "SIZE", "OWNER", "KIND", "RULES");
+            if list.count == 0 {
+                println!("(no files)");
+                return Ok(());
+            }
+            println!(
+                "{:<32}  {:>9}  {:<14}  {:<16}  {}",
+                "NAME", "SIZE", "OWNER", "KIND", "RULES"
+            );
             println!("{}", "-".repeat(120));
             for f in list.files {
                 let kind = match f.external.as_str() {
@@ -2677,16 +3433,25 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     "resident" => "resident",
                     _ => "server",
                 };
-                let kind = if f.exhausted_at.is_some() { format!("{kind} (exhausted)") } else { kind.to_string() };
+                let kind = if f.exhausted_at.is_some() {
+                    format!("{kind} (exhausted)")
+                } else {
+                    kind.to_string()
+                };
                 let rules = rules_summary(&f.flags, f.read_count, f.threshold_k, f.signatory_count);
-                println!("{:<32}  {:>9}  {:<14}  {:<16}  {}",
-                         f.name, f.size, f.owner, kind, rules);
+                println!(
+                    "{:<32}  {:>9}  {:<14}  {:<16}  {}",
+                    f.name, f.size, f.owner, kind, rules
+                );
             }
         }
         FileCmd::Rm { name, yes } => {
             if !yes {
                 eprint!("Delete file '{name}'? [y/N]: ");
-                if read_stdin_line().to_lowercase() != "y" { println!("aborted"); return Ok(()); }
+                if read_stdin_line().to_lowercase() != "y" {
+                    println!("aborted");
+                    return Ok(());
+                }
             }
             bb.file_delete(&name).await?;
             println!("deleted '{name}'");
@@ -2695,7 +3460,12 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
             bb.file_rotate(&name).await?;
             println!("rotated DEK for '{name}'");
         }
-        FileCmd::Rekey { name, old_external_passphrase, external_key, external_passphrase } => {
+        FileCmd::Rekey {
+            name,
+            old_external_passphrase,
+            external_key,
+            external_passphrase,
+        } => {
             let dom = domain_label(&bb);
             let new_key = rekey_target_key(&session, external_key, external_passphrase)?;
             // Resident file? Then the ciphertext + server key-half never change —
@@ -2714,7 +3484,10 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 let tmp = stash_path.with_extension("bbkr.tmp");
                 std::fs::write(&tmp, &new_stash)?;
                 std::fs::rename(&tmp, &stash_path)?;
-                println!("✓ rekeyed resident file '{name}' → {} (local stash only; no re-upload).", ext_key_label(&new_key));
+                println!(
+                    "✓ rekeyed resident file '{name}' → {} (local stash only; no re-upload).",
+                    ext_key_label(&new_key)
+                );
             } else {
                 // External-key file: fetch, decrypt, re-seal, re-upload the envelope.
                 let dl = bb.file_get_download(&name, None).await?;
@@ -2725,7 +3498,8 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 let meta_b64 = dl.external_meta.ok_or_else(|| AppError::Config(format!(
                     "'{name}' is a normal (server-side) file, not client-side — there is no external key to change.")))?;
                 use base64::Engine as _;
-                let mut envelope = base64::engine::general_purpose::STANDARD.decode(&meta_b64)
+                let mut envelope = base64::engine::general_purpose::STANDARD
+                    .decode(&meta_b64)
                     .map_err(|_| AppError::Crypto("external meta is not valid base64".into()))?;
                 envelope.extend_from_slice(&dl.bytes);
                 let env = ext_decode(&envelope)?;
@@ -2733,15 +3507,26 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 let (meta, ct) = external_seal_parts(&new_key, &plain)?;
                 let opts = client::FilePutOpts {
                     mime: dl.content_type.as_deref(),
-                    mfa_required: false, delete_on_read: false, max_reads: None, rotate_on_read: false,
-                    preserve_on_cleanup: false, no_overwrite: false, overwrite: true,
-                    quorum: None, signatories: vec![],
+                    mfa_required: false,
+                    delete_on_read: false,
+                    max_reads: None,
+                    rotate_on_read: false,
+                    preserve_on_cleanup: false,
+                    no_overwrite: false,
+                    overwrite: true,
+                    quorum: None,
+                    signatories: vec![],
                     external: true,
                     external_meta: Some(base64::engine::general_purpose::STANDARD.encode(&meta)),
-                    resident: false, key_component: None, server_copy: false,
+                    resident: false,
+                    key_component: None,
+                    server_copy: false,
                 };
                 bb.file_put(&name, ct, &opts).await?;
-                println!("✓ rekeyed external-key file '{name}' → {}.", ext_key_label(&new_key));
+                println!(
+                    "✓ rekeyed external-key file '{name}' → {}.",
+                    ext_key_label(&new_key)
+                );
             }
         }
     }
@@ -2752,7 +3537,12 @@ async fn cmd_client(cmd: ClientCmd) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, None, None)?;
     match cmd {
-        ClientCmd::Create { name, role, ttl_days, out } => {
+        ClientCmd::Create {
+            name,
+            role,
+            ttl_days,
+            out,
+        } => {
             let new = bb.create_client(&name, &role, ttl_days).await?;
             let bundle = serde_json::json!({
                 "server": session.server,
@@ -2767,20 +3557,39 @@ async fn cmd_client(cmd: ClientCmd) -> Result<()> {
             let pretty = serde_json::to_string_pretty(&bundle)?;
             if let Some(path) = out {
                 std::fs::write(&path, &pretty)?;
-                eprintln!("Bundle written to {} — share with {} via a secure channel.", path.display(), new.name);
+                eprintln!(
+                    "Bundle written to {} — share with {} via a secure channel.",
+                    path.display(),
+                    new.name
+                );
             } else {
                 println!("{pretty}");
                 eprintln!();
-                eprintln!("Save the JSON above and run `blackbook login --bundle PATH` on the client.");
+                eprintln!(
+                    "Save the JSON above and run `blackbook login --bundle PATH` on the client."
+                );
                 eprintln!("This is the ONLY time the cert/key/token appear in plaintext.");
             }
             // Confirm what was provisioned: the new client's id (which appears as
             // `client_id` in the audit log) and the private user domain it gets.
-            let udom = if new.user_domain.is_empty() { format!("~{}", new.name) } else { new.user_domain.clone() };
-            eprintln!("Provisioned client '{}' — id {}, role {}, private domain '{}'.",
-                      new.name, short_id(&new.id), new.role, udom);
+            let udom = if new.user_domain.is_empty() {
+                format!("~{}", new.name)
+            } else {
+                new.user_domain.clone()
+            };
+            eprintln!(
+                "Provisioned client '{}' — id {}, role {}, private domain '{}'.",
+                new.name,
+                short_id(&new.id),
+                new.role,
+                udom
+            );
         }
-        ClientCmd::Rotate { name, ttl_days, out } => {
+        ClientCmd::Rotate {
+            name,
+            ttl_days,
+            out,
+        } => {
             let new = bb.rotate_my_or_client(&name, ttl_days).await?;
             let bundle = serde_json::json!({
                 "server": session.server,
@@ -2795,7 +3604,11 @@ async fn cmd_client(cmd: ClientCmd) -> Result<()> {
             let pretty = serde_json::to_string_pretty(&bundle)?;
             if let Some(path) = out {
                 std::fs::write(&path, &pretty)?;
-                eprintln!("New bundle for '{}' written to {}.", new.name, path.display());
+                eprintln!(
+                    "New bundle for '{}' written to {}.",
+                    new.name,
+                    path.display()
+                );
             } else {
                 println!("{pretty}");
                 eprintln!();
@@ -2804,22 +3617,35 @@ async fn cmd_client(cmd: ClientCmd) -> Result<()> {
         }
         ClientCmd::Ls => {
             let list = bb.list_clients().await?;
-            if list.count == 0 { println!("(no clients)"); return Ok(()); }
-            println!("{:<10}  {:<22}  {:<8}  {:<22}  {:<22}  {}",
-                     "ID", "NAME", "ROLE", "CREATED", "EXPIRES", "REVOKED");
+            if list.count == 0 {
+                println!("(no clients)");
+                return Ok(());
+            }
+            println!(
+                "{:<10}  {:<22}  {:<8}  {:<22}  {:<22}  {}",
+                "ID", "NAME", "ROLE", "CREATED", "EXPIRES", "REVOKED"
+            );
             println!("{}", "-".repeat(100));
             for c in list.clients {
                 // Short id (correlates with `client_id` in the audit log).
-                println!("{:<10}  {:<22}  {:<8}  {:<22}  {:<22}  {}",
-                         short_id(&c.id), c.name, c.role, c.created_at,
-                         c.expires_at.as_deref().unwrap_or("never"),
-                         c.revoked_at.as_deref().unwrap_or("-"));
+                println!(
+                    "{:<10}  {:<22}  {:<8}  {:<22}  {:<22}  {}",
+                    short_id(&c.id),
+                    c.name,
+                    c.role,
+                    c.created_at,
+                    c.expires_at.as_deref().unwrap_or("never"),
+                    c.revoked_at.as_deref().unwrap_or("-")
+                );
             }
         }
         ClientCmd::Revoke { name, yes } => {
             if !yes {
                 eprint!("Revoke '{name}'? Its token and cert stop working immediately. [y/N]: ");
-                if read_stdin_line().to_lowercase() != "y" { println!("aborted"); return Ok(()); }
+                if read_stdin_line().to_lowercase() != "y" {
+                    println!("aborted");
+                    return Ok(());
+                }
             }
             bb.revoke_client(&name).await?;
             println!("revoked '{name}'");
@@ -2831,22 +3657,34 @@ async fn cmd_client(cmd: ClientCmd) -> Result<()> {
 /// Parse a rate string `N/PERIOD` → (max, period_secs). PERIOD is a number with
 /// an optional unit suffix `s`/`m`/`h`/`d` (a bare number means seconds).
 fn parse_rate(s: &str) -> Result<(i32, i32)> {
-    let (n, period) = s.split_once('/').ok_or_else(|| AppError::Config(
-        format!("rate must be N/PERIOD, e.g. 10/1h — got '{s}'")))?;
-    let max: i32 = n.trim().parse().map_err(|_| AppError::Config(format!("bad rate count '{n}'")))?;
+    let (n, period) = s.split_once('/').ok_or_else(|| {
+        AppError::Config(format!("rate must be N/PERIOD, e.g. 10/1h — got '{s}'"))
+    })?;
+    let max: i32 = n
+        .trim()
+        .parse()
+        .map_err(|_| AppError::Config(format!("bad rate count '{n}'")))?;
     let p = period.trim();
     let split = p.find(|c: char| c.is_alphabetic()).unwrap_or(p.len());
     let (num, unit) = p.split_at(split);
-    let num: i64 = num.parse().map_err(|_| AppError::Config(format!("bad rate period '{p}'")))?;
+    let num: i64 = num
+        .parse()
+        .map_err(|_| AppError::Config(format!("bad rate period '{p}'")))?;
     let secs = match unit {
         "" | "s" => num,
         "m" => num * 60,
         "h" => num * 3600,
         "d" => num * 86_400,
-        other => return Err(AppError::Config(format!("unknown period unit '{other}' (use s/m/h/d)"))),
+        other => {
+            return Err(AppError::Config(format!(
+                "unknown period unit '{other}' (use s/m/h/d)"
+            )))
+        }
     };
     if max <= 0 || secs <= 0 {
-        return Err(AppError::Config("rate count and period must be positive".into()));
+        return Err(AppError::Config(
+            "rate count and period must be positive".into(),
+        ));
     }
     Ok((max, secs as i32))
 }
@@ -2854,67 +3692,117 @@ fn parse_rate(s: &str) -> Result<(i32, i32)> {
 /// Render a period in whole seconds back to the most natural unit.
 fn fmt_period(secs: i32) -> String {
     let s = secs as i64;
-    if s % 86_400 == 0 { format!("{}d", s / 86_400) }
-    else if s % 3600 == 0 { format!("{}h", s / 3600) }
-    else if s % 60 == 0 { format!("{}m", s / 60) }
-    else { format!("{s}s") }
+    if s % 86_400 == 0 {
+        format!("{}d", s / 86_400)
+    } else if s % 3600 == 0 {
+        format!("{}h", s / 3600)
+    } else if s % 60 == 0 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{s}s")
+    }
 }
 
 /// A short, git-style prefix of a UUID for compact list columns. Enough to
 /// eyeball and to correlate a row with the same id elsewhere (e.g. a
 /// `client_id` in the audit log) without printing the full 36-char UUID.
-fn short_id(id: &str) -> &str { &id[..id.len().min(8)] }
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
 
 async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, None, None)?;
     match cmd {
         AclCmd::Grant {
-            subject, pattern,
-            create, read, update, delete,
-            expires_at, not_before, max_uses, rate, schedule,
+            subject,
+            pattern,
+            create,
+            read,
+            update,
+            delete,
+            expires_at,
+            not_before,
+            max_uses,
+            rate,
+            schedule,
         } => {
             // The rule's domain comes from the global --domain (default).
             let domain = domain.unwrap_or_else(|| "default".to_string());
             let mut actions: Vec<&str> = Vec::new();
-            if create { actions.push("create"); }
-            if read   { actions.push("read"); }
-            if update { actions.push("update"); }
-            if delete { actions.push("delete"); }
+            if create {
+                actions.push("create");
+            }
+            if read {
+                actions.push("read");
+            }
+            if update {
+                actions.push("update");
+            }
+            if delete {
+                actions.push("delete");
+            }
             if actions.is_empty() {
-                return Err(AppError::Config("at least one of --create/--read/--update/--delete required".into()));
+                return Err(AppError::Config(
+                    "at least one of --create/--read/--update/--delete required".into(),
+                ));
             }
             let (rate_max, rate_period_secs) = match rate.as_deref() {
-                Some(s) => { let (m, p) = parse_rate(s)?; (Some(m), Some(p)) }
+                Some(s) => {
+                    let (m, p) = parse_rate(s)?;
+                    (Some(m), Some(p))
+                }
                 None => (None, None),
             };
             let (client_name, group_domain) = match subject.strip_prefix('@') {
                 Some(g) => (None, Some(g.to_string())),
-                None    => (Some(subject.clone()), None),
+                None => (Some(subject.clone()), None),
             };
             let opts = client::GrantOpts {
-                client_name, group_domain,
+                client_name,
+                group_domain,
                 domain: Some(domain.clone()),
-                expires_at, not_before, max_uses,
-                rate_max, rate_period_secs, schedule: schedule.clone(),
+                expires_at,
+                not_before,
+                max_uses,
+                rate_max,
+                rate_period_secs,
+                schedule: schedule.clone(),
             };
             bb.grant_acl(&pattern, &actions, opts).await?;
             let extra = [
                 rate.as_ref().map(|r| format!("rate={r}")),
                 schedule.as_ref().map(|s| format!("schedule='{s}'")),
-            ].into_iter().flatten().collect::<Vec<_>>().join(", ");
-            println!("granted {} on '{pattern}' to {} (domain={domain}){}",
-                     actions.join("+"), subject,
-                     if extra.is_empty() { String::new() } else { format!(" [{extra}]") });
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+            println!(
+                "granted {} on '{pattern}' to {} (domain={domain}){}",
+                actions.join("+"),
+                subject,
+                if extra.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{extra}]")
+                }
+            );
         }
         AclCmd::Ls => {
             let list = bb.list_acl().await?;
-            if list.count == 0 { println!("(no acl entries)"); return Ok(()); }
-            println!("{:<14}  {:<10}  {:<20}  {:<24}  {:<10}  {:<8}  {:<12}  {}",
-                     "ID", "DOMAIN", "SUBJECT", "PATTERN", "ACTIONS", "USE", "GRANTED", "LIMITS");
+            if list.count == 0 {
+                println!("(no acl entries)");
+                return Ok(());
+            }
+            println!(
+                "{:<14}  {:<10}  {:<20}  {:<24}  {:<10}  {:<8}  {:<12}  {}",
+                "ID", "DOMAIN", "SUBJECT", "PATTERN", "ACTIONS", "USE", "GRANTED", "LIMITS"
+            );
             println!("{}", "-".repeat(152));
             for e in list.entries {
-                let subject = e.client_name
+                let subject = e
+                    .client_name
                     .or_else(|| e.group_domain.map(|g| format!("@{g}")))
                     .unwrap_or_else(|| "?".into());
                 let use_disp = match (e.max_uses, e.use_count) {
@@ -2926,14 +3814,30 @@ async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
                 if let (Some(m), Some(p)) = (e.rate_max, e.rate_period_secs) {
                     limits.push(format!("rate {m}/{}", fmt_period(p)));
                 }
-                if let Some(s) = &e.schedule { limits.push(format!("cron \"{s}\"")); }
-                if let Some(nb) = &e.not_before { limits.push(format!("nbf {}", &nb[..nb.len().min(10)])); }
-                if let Some(x) = &e.expires_at { limits.push(format!("exp {}", &x[..x.len().min(10)])); }
-                println!("{:<14}  {:<10}  {:<20}  {:<24}  {:<10}  {:<8}  {:<12}  {}",
-                         e.id, e.domain, subject, e.resource_pattern,
-                         e.actions.join(","), use_disp,
-                         &e.granted_at[..e.granted_at.len().min(10)],
-                         if limits.is_empty() { "-".into() } else { limits.join(", ") });
+                if let Some(s) = &e.schedule {
+                    limits.push(format!("cron \"{s}\""));
+                }
+                if let Some(nb) = &e.not_before {
+                    limits.push(format!("nbf {}", &nb[..nb.len().min(10)]));
+                }
+                if let Some(x) = &e.expires_at {
+                    limits.push(format!("exp {}", &x[..x.len().min(10)]));
+                }
+                println!(
+                    "{:<14}  {:<10}  {:<20}  {:<24}  {:<10}  {:<8}  {:<12}  {}",
+                    e.id,
+                    e.domain,
+                    subject,
+                    e.resource_pattern,
+                    e.actions.join(","),
+                    use_disp,
+                    &e.granted_at[..e.granted_at.len().min(10)],
+                    if limits.is_empty() {
+                        "-".into()
+                    } else {
+                        limits.join(", ")
+                    }
+                );
             }
         }
         AclCmd::Revoke { id } => {
@@ -2954,12 +3858,23 @@ async fn cmd_domain(cmd: DomainCmd) -> Result<()> {
         }
         DomainCmd::Ls => {
             let list = bb.list_domains().await?;
-            if list.count == 0 { println!("(no domains visible)"); return Ok(()); }
-            println!("{:<10}  {:<24}  {:<24}  {}", "ID", "NAME", "CREATED", "DESCRIPTION");
+            if list.count == 0 {
+                println!("(no domains visible)");
+                return Ok(());
+            }
+            println!(
+                "{:<10}  {:<24}  {:<24}  {}",
+                "ID", "NAME", "CREATED", "DESCRIPTION"
+            );
             println!("{}", "-".repeat(90));
             for d in list.domains {
-                println!("{:<10}  {:<24}  {:<24}  {}", short_id(&d.id), d.name, d.created_at,
-                         d.description.as_deref().unwrap_or(""));
+                println!(
+                    "{:<10}  {:<24}  {:<24}  {}",
+                    short_id(&d.id),
+                    d.name,
+                    d.created_at,
+                    d.description.as_deref().unwrap_or("")
+                );
             }
         }
         DomainCmd::Use { name, clear } => {
@@ -2982,18 +3897,28 @@ async fn cmd_domain(cmd: DomainCmd) -> Result<()> {
         }
         DomainCmd::Members { domain } => {
             let list = bb.list_domain_members(&domain).await?;
-            if list.count == 0 { println!("(no members)"); return Ok(()); }
+            if list.count == 0 {
+                println!("(no members)");
+                return Ok(());
+            }
             println!("{:<24}  {:<8}  {}", "CLIENT", "ROLE", "ADDED");
             println!("{}", "-".repeat(64));
             for m in list.members {
                 println!("{:<24}  {:<8}  {}", m.client_name, m.role, m.added_at);
             }
         }
-        DomainCmd::AddMember { domain, client: cname, role } => {
+        DomainCmd::AddMember {
+            domain,
+            client: cname,
+            role,
+        } => {
             bb.add_domain_member(&domain, &cname, &role).await?;
             println!("added '{cname}' to '{domain}' as {role}");
         }
-        DomainCmd::RmMember { domain, client: cname } => {
+        DomainCmd::RmMember {
+            domain,
+            client: cname,
+        } => {
             bb.remove_domain_member(&domain, &cname).await?;
             println!("removed '{cname}' from '{domain}'");
         }
@@ -3003,8 +3928,14 @@ async fn cmd_domain(cmd: DomainCmd) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_audit(
-    limit: i64, verify: bool, archive: bool, keep_last: Option<i64>, before: Option<String>,
-    prune: bool, verify_archive: Option<String>, list_archives: bool,
+    limit: i64,
+    verify: bool,
+    archive: bool,
+    keep_last: Option<i64>,
+    before: Option<String>,
+    prune: bool,
+    verify_archive: Option<String>,
+    list_archives: bool,
 ) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, None, None)?;
@@ -3013,43 +3944,68 @@ async fn cmd_audit(
         let v = bb.audit_archive_verify(&file).await?;
         let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
         if ok {
-            println!("archive '{file}' OK — verified {} row(s) (id {}..{})",
-                     v.get("verified").and_then(|x| x.as_i64()).unwrap_or(0),
-                     v.get("first_id").and_then(|x| x.as_i64()).unwrap_or(0),
-                     v.get("last_id").and_then(|x| x.as_i64()).unwrap_or(0));
+            println!(
+                "archive '{file}' OK — verified {} row(s) (id {}..{})",
+                v.get("verified").and_then(|x| x.as_i64()).unwrap_or(0),
+                v.get("first_id").and_then(|x| x.as_i64()).unwrap_or(0),
+                v.get("last_id").and_then(|x| x.as_i64()).unwrap_or(0)
+            );
         } else {
-            println!("archive '{file}' BROKEN — {}", v.get("reason").and_then(|x| x.as_str()).unwrap_or("unknown"));
+            println!(
+                "archive '{file}' BROKEN — {}",
+                v.get("reason")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+            );
         }
         return Ok(());
     }
     if list_archives {
         let v = bb.audit_archives().await?;
         let empty = vec![];
-        let arr = v.get("archives").and_then(|x| x.as_array()).unwrap_or(&empty);
-        if arr.is_empty() { println!("(no archives)"); return Ok(()); }
+        let arr = v
+            .get("archives")
+            .and_then(|x| x.as_array())
+            .unwrap_or(&empty);
+        if arr.is_empty() {
+            println!("(no archives)");
+            return Ok(());
+        }
         println!("{:<44}  {}", "FILE", "SIZE");
         println!("{}", "-".repeat(60));
         for a in arr {
-            println!("{:<44}  {}", a.get("file").and_then(|x| x.as_str()).unwrap_or("?"),
-                     a.get("size_bytes").and_then(|x| x.as_u64()).unwrap_or(0));
+            println!(
+                "{:<44}  {}",
+                a.get("file").and_then(|x| x.as_str()).unwrap_or("?"),
+                a.get("size_bytes").and_then(|x| x.as_u64()).unwrap_or(0)
+            );
         }
         return Ok(());
     }
     if archive {
         if keep_last.is_none() && before.is_none() {
-            return Err(AppError::Config("specify --keep-last N or --before TIMESTAMP".into()));
+            return Err(AppError::Config(
+                "specify --keep-last N or --before TIMESTAMP".into(),
+            ));
         }
-        let v = bb.audit_archive(keep_last, before.as_deref(), prune).await?;
+        let v = bb
+            .audit_archive(keep_last, before.as_deref(), prune)
+            .await?;
         let n = v.get("archived").and_then(|x| x.as_i64()).unwrap_or(0);
         if n == 0 {
-            println!("nothing archived — {}", v.get("message").and_then(|x| x.as_str()).unwrap_or(""));
+            println!(
+                "nothing archived — {}",
+                v.get("message").and_then(|x| x.as_str()).unwrap_or("")
+            );
         } else {
-            println!("archived {n} row(s) (id {}..{}) → {} ({} bytes); pruned {}",
-                     v.get("first_id").and_then(|x| x.as_i64()).unwrap_or(0),
-                     v.get("last_id").and_then(|x| x.as_i64()).unwrap_or(0),
-                     v.get("file").and_then(|x| x.as_str()).unwrap_or("?"),
-                     v.get("size_bytes").and_then(|x| x.as_u64()).unwrap_or(0),
-                     v.get("pruned").and_then(|x| x.as_u64()).unwrap_or(0));
+            println!(
+                "archived {n} row(s) (id {}..{}) → {} ({} bytes); pruned {}",
+                v.get("first_id").and_then(|x| x.as_i64()).unwrap_or(0),
+                v.get("last_id").and_then(|x| x.as_i64()).unwrap_or(0),
+                v.get("file").and_then(|x| x.as_str()).unwrap_or("?"),
+                v.get("size_bytes").and_then(|x| x.as_u64()).unwrap_or(0),
+                v.get("pruned").and_then(|x| x.as_u64()).unwrap_or(0)
+            );
         }
         return Ok(());
     }
@@ -3057,31 +4013,52 @@ async fn cmd_audit(
     if verify {
         let v = bb.audit_verify().await?;
         let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
-        let through = v.get("verified_through").and_then(|x| x.as_i64()).unwrap_or(0);
+        let through = v
+            .get("verified_through")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0);
         if ok {
             println!("audit chain OK — verified {through} row(s)");
         } else {
             let bad = v.get("first_bad_id").and_then(|x| x.as_i64()).unwrap_or(-1);
-            let reason = v.get("reason").and_then(|x| x.as_str()).unwrap_or("unknown");
-            println!("audit chain BROKEN after {through} verified row(s): first bad id {bad} — {reason}");
+            let reason = v
+                .get("reason")
+                .and_then(|x| x.as_str())
+                .unwrap_or("unknown");
+            println!(
+                "audit chain BROKEN after {through} verified row(s): first bad id {bad} — {reason}"
+            );
         }
         return Ok(());
     }
     let list = bb.audit(limit).await?;
-    if list.count == 0 { println!("(no audit entries)"); return Ok(()); }
-    println!("{:<8}  {:<26}  {:<14}  {:<16}  {:<8}  {:<20}  {}",
-             "ID", "TS", "CLIENT", "ACTION", "STATUS", "RESOURCE", "MESSAGE");
+    if list.count == 0 {
+        println!("(no audit entries)");
+        return Ok(());
+    }
+    println!(
+        "{:<8}  {:<26}  {:<14}  {:<16}  {:<8}  {:<20}  {}",
+        "ID", "TS", "CLIENT", "ACTION", "STATUS", "RESOURCE", "MESSAGE"
+    );
     println!("{}", "-".repeat(120));
     for e in list.entries {
         // Prefer the resolved client name; fall back to a short client_id for
         // system/unnamed events. `message` carries the per-event detail.
-        let who = e.client_name.clone()
+        let who = e
+            .client_name
+            .clone()
             .or_else(|| e.client_id.as_deref().map(|c| short_id(c).to_string()))
             .unwrap_or_else(|| "-".into());
-        println!("{:<8}  {:<26}  {:<14}  {:<16}  {:<8}  {:<20}  {}",
-                 e.id, e.ts, who, e.action, e.status,
-                 e.resource.as_deref().unwrap_or("-"),
-                 e.message.as_deref().unwrap_or(""));
+        println!(
+            "{:<8}  {:<26}  {:<14}  {:<16}  {:<8}  {:<20}  {}",
+            e.id,
+            e.ts,
+            who,
+            e.action,
+            e.status,
+            e.resource.as_deref().unwrap_or("-"),
+            e.message.as_deref().unwrap_or("")
+        );
     }
     Ok(())
 }
@@ -3092,13 +4069,19 @@ async fn cmd_audit(
 /// to `"default"`. The row's name is AEAD-encrypted just like any other
 /// domain — no plaintext "default" string ends up in the DB.
 async fn ensure_default_domain(
-    pool: &Pool<Postgres>, metadata_enc_key: &[u8], name_index_key: &[u8],
+    pool: &Pool<Postgres>,
+    metadata_enc_key: &[u8],
+    name_index_key: &[u8],
 ) -> Result<()> {
     let name_id = server::domain_name_id_hex(name_index_key, "default");
-    let exists: Option<(String,)> = sqlx::query_as(
-        "SELECT id FROM blackbook_domains WHERE name_id = $1",
-    ).bind(&name_id).fetch_optional(pool).await?;
-    if exists.is_some() { return Ok(()); }
+    let exists: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM blackbook_domains WHERE name_id = $1")
+            .bind(&name_id)
+            .fetch_optional(pool)
+            .await?;
+    if exists.is_some() {
+        return Ok(());
+    }
     let id = "default".to_string();
     let name_enc = server::enc_str(metadata_enc_key, "default")
         .map_err(|e| AppError::Config(format!("encrypt default domain name: {e}")))?;
@@ -3108,8 +4091,13 @@ async fn ensure_default_domain(
         "INSERT INTO blackbook_domains (id, name_enc, name_id, description_enc)
          VALUES ($1, $2, $3, $4)
          ON CONFLICT (id) DO NOTHING",
-    ).bind(&id).bind(&name_enc).bind(&name_id).bind(&desc_enc)
-    .execute(pool).await?;
+    )
+    .bind(&id)
+    .bind(&name_enc)
+    .bind(&name_id)
+    .bind(&desc_enc)
+    .execute(pool)
+    .await?;
     log::info!("provisioned default domain");
     Ok(())
 }
@@ -3117,17 +4105,28 @@ async fn ensure_default_domain(
 fn server_sans(bind: &str) -> Vec<String> {
     let mut sans: Vec<String> = std::env::var("BLACKBOOK_SERVER_SANS")
         .ok()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     if sans.is_empty() {
         sans = vec![
-            "localhost".into(), "127.0.0.1".into(),
-            "blackbook".into(), "blackbook-app".into(),
+            "localhost".into(),
+            "127.0.0.1".into(),
+            "blackbook".into(),
+            "blackbook-app".into(),
         ];
         // Plus whatever host was on the bind line if it isn't 0.0.0.0.
         if let Some(host) = bind.rsplit_once(':').map(|(h, _)| h) {
             let host = host.trim_start_matches('[').trim_end_matches(']');
-            if !host.is_empty() && host != "0.0.0.0" && host != "::" && !sans.iter().any(|s| s == host) {
+            if !host.is_empty()
+                && host != "0.0.0.0"
+                && host != "::"
+                && !sans.iter().any(|s| s == host)
+            {
                 sans.push(host.to_string());
             }
         }
@@ -3151,11 +4150,15 @@ fn server_sans(bind: &str) -> Vec<String> {
 /// Every step is best-effort: in a hardened container `mlockall` can fail on a
 /// low `RLIMIT_MEMLOCK`, so we log and continue rather than refuse to boot.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // the crate denies unsafe_code; this block is the audited exception
 fn harden_process() {
     // SAFETY: plain libc calls with valid arguments; we only read their return
     // codes and never dereference anything we didn't allocate on the stack.
     unsafe {
-        let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let no_core = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0 {
             log::warn!("hardening: could not disable core dumps (RLIMIT_CORE)");
         }
@@ -3163,9 +4166,11 @@ fn harden_process() {
             log::warn!("hardening: could not set PR_SET_DUMPABLE=0");
         }
         if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) != 0 {
-            log::warn!("hardening: mlockall() failed (RLIMIT_MEMLOCK too low under this \
+            log::warn!(
+                "hardening: mlockall() failed (RLIMIT_MEMLOCK too low under this \
                         container/cgroup?) — secret pages may be swappable. Raise the \
-                        memlock limit or disable swap on the host for full protection.");
+                        memlock limit or disable swap on the host for full protection."
+            );
         } else {
             log::info!("hardening: core dumps disabled and process memory locked (no swap).");
         }
@@ -3194,7 +4199,9 @@ async fn main() -> Result<()> {
     // order: explicit --profile/-P (or $BLACKBOOK_PROFILE, via clap `env`) →
     // the persisted `~/.bbk/active` pointer → `default`. Stashed once so every
     // Session::load() in this process targets the same profile.
-    let resolved_profile = cli.profile.clone()
+    let resolved_profile = cli
+        .profile
+        .clone()
         .or_else(|| client::Session::read_active_pointer().ok().flatten())
         .unwrap_or_else(|| "default".to_string());
     client::set_active_profile(resolved_profile.clone());
@@ -3203,16 +4210,23 @@ async fn main() -> Result<()> {
     // (or $BLACKBOOK_DOMAIN, via clap `env`) → the profile's saved default
     // (`domain use`) → None (the server treats absence as `default`). Computed
     // once so no command needs `-D` when a profile default is set.
-    let effective_domain: Option<String> = cli.domain.clone()
+    let effective_domain: Option<String> = cli
+        .domain
+        .clone()
         .or_else(|| client::Session::read_domain_pref(&resolved_profile));
 
     match cli.command {
         Commands::Health => {
-            let db_url = cli.database_url.ok_or_else(|| AppError::Config("DATABASE_URL not provided".into()))?;
+            let db_url = cli
+                .database_url
+                .ok_or_else(|| AppError::Config("DATABASE_URL not provided".into()))?;
             let db = Database::new(&db_url).await?;
             match db.health_check().await {
                 Ok(_) => println!("ok"),
-                Err(e) => { eprintln!("db unhealthy: {e}"); std::process::exit(1); }
+                Err(e) => {
+                    eprintln!("db unhealthy: {e}");
+                    std::process::exit(1);
+                }
             }
         }
 
@@ -3224,15 +4238,23 @@ async fn main() -> Result<()> {
                 .map_err(|e| AppError::Config(format!("master key: {e}")))?;
             persistence::rekey_master_dek(&paths, &provider)
                 .map_err(|e| AppError::Config(format!("rekey: {e}")))?;
-            println!("✓ master DEK rotated under the '{}' provider (master key unchanged; \
-                      restart the server if you also rotated the keyfile).", provider.kind());
+            println!(
+                "✓ master DEK rotated under the '{}' provider (master key unchanged; \
+                      restart the server if you also rotated the keyfile).",
+                provider.kind()
+            );
         }
 
         Commands::Web { bind } => {
-            webui::run_web(&bind).await.map_err(|e| AppError::Config(e.to_string()))?;
+            webui::run_web(&bind)
+                .await
+                .map_err(|e| AppError::Config(e.to_string()))?;
         }
 
-        Commands::Mcp { offline, allow_write } => {
+        Commands::Mcp {
+            offline,
+            allow_write,
+        } => {
             // Online tools act as the resolved active profile — but only if it
             // actually exists on disk; otherwise the server is crypto-only.
             let profile = if offline {
@@ -3250,13 +4272,17 @@ async fn main() -> Result<()> {
                 allow_write,
                 domain: effective_domain.clone(),
             };
-            mcp::run(cfg).await.map_err(|e| AppError::Config(e.to_string()))?;
+            mcp::run(cfg)
+                .await
+                .map_err(|e| AppError::Config(e.to_string()))?;
         }
 
         Commands::Server { bind } => {
             // Lock the process down before any key material is loaded into RAM.
             harden_process();
-            let db_url = cli.database_url.ok_or_else(|| AppError::Config("DATABASE_URL not provided".into()))?;
+            let db_url = cli
+                .database_url
+                .ok_or_else(|| AppError::Config("DATABASE_URL not provided".into()))?;
             log::info!("Initializing Blackbook server...");
             let db = Database::new(&db_url).await?;
             db.initialize().await?;
@@ -3264,7 +4290,8 @@ async fn main() -> Result<()> {
             let pool = PgPoolOptions::new()
                 .max_connections(20)
                 .acquire_timeout(Duration::from_secs(10))
-                .connect(&db_url).await?;
+                .connect(&db_url)
+                .await?;
 
             let data_dir = std::env::var("BLACKBOOK_DATA_DIR")
                 .unwrap_or_else(|_| "/opt/blackbook/data".to_string());
@@ -3273,15 +4300,20 @@ async fn main() -> Result<()> {
             // CA + server cert (auto-generated on first boot).
             let (ca, ca_new) = persistence::load_or_init_ca(&paths)
                 .map_err(|e| AppError::Config(format!("persistence/ca: {e}")))?;
-            log::info!("CA {} ({})",
-                       if ca_new { "generated" } else { "loaded" },
-                       paths.ca_cert.display());
+            log::info!(
+                "CA {} ({})",
+                if ca_new { "generated" } else { "loaded" },
+                paths.ca_cert.display()
+            );
             let sans = server_sans(&bind);
             let server_cert_new = persistence::load_or_init_server_cert(&paths, &ca, &sans)
                 .map_err(|e| AppError::Config(format!("persistence/server-cert: {e}")))?;
-            log::info!("Server cert {} ({}) SAN={:?}",
-                       if server_cert_new { "issued" } else { "loaded" },
-                       paths.server_cert.display(), sans);
+            log::info!(
+                "Server cert {} ({}) SAN={:?}",
+                if server_cert_new { "issued" } else { "loaded" },
+                paths.server_cert.display(),
+                sans
+            );
             let ca_shared: tls::SharedCa = Arc::new(ca);
 
             // DEK + master key. The outermost key is produced by a provider
@@ -3296,16 +4328,22 @@ async fn main() -> Result<()> {
             let (keys, keys_new) = persistence::load_or_init_master(&paths, &dek)
                 .map_err(|e| AppError::Config(format!("persistence/master: {e}")))?;
             drop(dek); // DEK is no longer needed; wipe it now rather than at scope end.
-            log::info!("Master key {} at {}",
-                       if keys_new { "generated" } else { "loaded" },
-                       paths.master_key.display());
+            log::info!(
+                "Master key {} at {}",
+                if keys_new { "generated" } else { "loaded" },
+                paths.master_key.display()
+            );
 
             // Bootstrap admin (token + cert). The metadata keys are needed
             // because the admin row's name lives encrypted (`name_enc`) and
             // is looked up via the HMAC `name_id`.
-            let metadata_enc_key_b = keys.index.handle_with_info(b"metadata-enc/v1")
+            let metadata_enc_key_b = keys
+                .index
+                .handle_with_info(b"metadata-enc/v1")
                 .map_err(|e| AppError::Config(format!("derive metadata-enc key: {e}")))?;
-            let name_index_key_b = keys.index.handle()
+            let name_index_key_b = keys
+                .index
+                .handle()
                 .map_err(|e| AppError::Config(format!("derive name index key: {e}")))?;
             // URL the operator's CLI will connect to. The server can't know
             // its own published address, so default to the docker-local
@@ -3313,11 +4351,20 @@ async fn main() -> Result<()> {
             let public_url = std::env::var("BLACKBOOK_PUBLIC_URL")
                 .unwrap_or_else(|_| "https://127.0.0.1:8443".to_string());
             match auth::bootstrap_admin_if_needed(
-                &pool, &ca_shared, &metadata_enc_key_b, &name_index_key_b,
-            ).await {
+                &pool,
+                &ca_shared,
+                &metadata_enc_key_b,
+                &name_index_key_b,
+            )
+            .await
+            {
                 Ok(Some((token, cert))) => {
                     if let Err(e) = persistence::write_admin_bundle(
-                        &paths, &token, &cert, &ca_shared.cert_pem, &public_url,
+                        &paths,
+                        &token,
+                        &cert,
+                        &ca_shared.cert_pem,
+                        &public_url,
                     ) {
                         log::warn!("could not write admin bundle: {e}");
                     }
@@ -3329,10 +4376,17 @@ async fn main() -> Result<()> {
                     log::warn!("================================================================");
                     log::warn!("BLACKBOOK FIRST-RUN ADMIN BUNDLE  --  RETRIEVE IT NOW");
                     log::warn!("");
-                    log::warn!("    Bundle : {}  (mode 0600, contains the token)", paths.admin_bundle.display());
+                    log::warn!(
+                        "    Bundle : {}  (mode 0600, contains the token)",
+                        paths.admin_bundle.display()
+                    );
                     log::warn!("");
-                    log::warn!("    docker cp blackbook-app:/opt/blackbook/data/admin-bundle.json .");
-                    log::warn!("    blackbook login admin-bundle.json      # saves to profile 'admin'");
+                    log::warn!(
+                        "    docker cp blackbook-app:/opt/blackbook/data/admin-bundle.json ."
+                    );
+                    log::warn!(
+                        "    blackbook login admin-bundle.json      # saves to profile 'admin'"
+                    );
                     log::warn!("");
                     log::warn!("    (The bundle's server URL defaults to {public_url};");
                     log::warn!("     override at login with `-s https://your-host:8443`.)");
@@ -3350,31 +4404,40 @@ async fn main() -> Result<()> {
             // does not rotate yet); audit() and the name_id helpers read
             // them on every request.
             let audit_hmac_key = std::sync::Arc::new(
-                keys.hmac.handle()
+                keys.hmac
+                    .handle()
                     .map_err(|e| AppError::Config(format!("derive audit hmac key: {e}")))?,
             );
             let name_index_key = std::sync::Arc::new(
-                keys.index.handle()
+                keys.index
+                    .handle()
                     .map_err(|e| AppError::Config(format!("derive name index key: {e}")))?,
             );
             // Per-field AEAD key for at-rest encryption of every user-supplied
             // identifier (resource/client/domain names, ACL patterns, audit
             // resource/message, file metadata). Same root, distinct info tag.
             let metadata_enc_key = std::sync::Arc::new(
-                keys.index.handle_with_info(b"metadata-enc/v1")
+                keys.index
+                    .handle_with_info(b"metadata-enc/v1")
                     .map_err(|e| AppError::Config(format!("derive metadata-enc key: {e}")))?,
             );
 
             // KEK for managed-key material at rest. Same root, distinct info tag.
             let managed_key_kek = std::sync::Arc::new(
-                keys.file_dek_kek.handle_with_info(b"managed-keys/v1")
+                keys.file_dek_kek
+                    .handle_with_info(b"managed-keys/v1")
                     .map_err(|e| AppError::Config(format!("derive managed-key kek: {e}")))?,
             );
 
             // Auto-provision the `default` domain on first boot so secrets /
             // files / ACL rows (which have a NOT NULL FK to blackbook_domains)
             // can be created against the default `?domain=` query parameter.
-            ensure_default_domain(&pool, metadata_enc_key.as_slice(), name_index_key.as_slice()).await?;
+            ensure_default_domain(
+                &pool,
+                metadata_enc_key.as_slice(),
+                name_index_key.as_slice(),
+            )
+            .await?;
 
             let app_state = server::AppState {
                 keys: std::sync::Arc::new(tokio::sync::RwLock::new(keys)),
@@ -3392,14 +4455,25 @@ async fn main() -> Result<()> {
             server::run_server(
                 app_state,
                 &bind,
-                paths.server_cert.to_str().ok_or_else(|| AppError::Config("non-utf8 server_cert path".into()))?,
-                paths.server_key.to_str().ok_or_else(|| AppError::Config("non-utf8 server_key path".into()))?,
-                paths.ca_cert.to_str().ok_or_else(|| AppError::Config("non-utf8 ca_cert path".into()))?,
-            ).await?;
+                paths
+                    .server_cert
+                    .to_str()
+                    .ok_or_else(|| AppError::Config("non-utf8 server_cert path".into()))?,
+                paths
+                    .server_key
+                    .to_str()
+                    .ok_or_else(|| AppError::Config("non-utf8 server_key path".into()))?,
+                paths
+                    .ca_cert
+                    .to_str()
+                    .ok_or_else(|| AppError::Config("non-utf8 ca_cert path".into()))?,
+            )
+            .await?;
         }
 
-        Commands::Login { bundle, server } =>
-            cmd_login(bundle, server, cli.profile.clone()).await?,
+        Commands::Login { bundle, server } => {
+            cmd_login(bundle, server, cli.profile.clone()).await?
+        }
         Commands::Logout => cmd_logout().await?,
         Commands::Unlock { ttl_minutes } => cmd_unlock(ttl_minutes).await?,
         Commands::Lock => cmd_lock().await?,
@@ -3408,21 +4482,93 @@ async fn main() -> Result<()> {
         Commands::Complete { words } => cmd_complete(&words),
         Commands::Profile(cmd) => cmd_profile(cmd).await?,
         Commands::Whoami => cmd_whoami().await?,
-        Commands::Put { name, value, mfa_required, delete_on_read, max_reads, rotate_on_read, quorum, signatories, overwrite, preserve_on_cleanup, no_overwrite, external_key, external_passphrase, external, external_data, external_passphrase_env } =>
-            cmd_put(name, value, mfa_required, delete_on_read, max_reads, rotate_on_read,
-                    quorum, signatories, overwrite, preserve_on_cleanup, no_overwrite,
-                    ExtFlags { external, external_key, external_data, passphrase: external_passphrase, passphrase_from_env: external_passphrase_env },
-                    effective_domain.clone(), cli.mfa.clone()).await?,
-        Commands::Get { name, request_id, wait, wait_timeout, external_passphrase } =>
-            cmd_get(name, request_id, wait, wait_timeout, external_passphrase, effective_domain.clone(), cli.mfa.clone()).await?,
+        Commands::Put {
+            name,
+            value,
+            mfa_required,
+            delete_on_read,
+            max_reads,
+            rotate_on_read,
+            quorum,
+            signatories,
+            overwrite,
+            preserve_on_cleanup,
+            no_overwrite,
+            external_key,
+            external_passphrase,
+            external,
+            external_data,
+            external_passphrase_env,
+        } => {
+            cmd_put(
+                name,
+                value,
+                mfa_required,
+                delete_on_read,
+                max_reads,
+                rotate_on_read,
+                quorum,
+                signatories,
+                overwrite,
+                preserve_on_cleanup,
+                no_overwrite,
+                ExtFlags {
+                    external,
+                    external_key,
+                    external_data,
+                    passphrase: external_passphrase,
+                    passphrase_from_env: external_passphrase_env,
+                },
+                effective_domain.clone(),
+                cli.mfa.clone(),
+            )
+            .await?
+        }
+        Commands::Get {
+            name,
+            request_id,
+            wait,
+            wait_timeout,
+            external_passphrase,
+        } => {
+            cmd_get(
+                name,
+                request_id,
+                wait,
+                wait_timeout,
+                external_passphrase,
+                effective_domain.clone(),
+                cli.mfa.clone(),
+            )
+            .await?
+        }
         Commands::Ls { json } => cmd_ls(effective_domain.clone(), cli.mfa.clone(), json).await?,
-        Commands::Rm { name, yes } => cmd_rm(name, yes, effective_domain.clone(), cli.mfa.clone()).await?,
-        Commands::Rekey { name, old_external_passphrase, external_key, external_passphrase } =>
-            cmd_rekey(name, old_external_passphrase, external_key, external_passphrase,
-                      effective_domain.clone(), cli.mfa.clone()).await?,
+        Commands::Rm { name, yes } => {
+            cmd_rm(name, yes, effective_domain.clone(), cli.mfa.clone()).await?
+        }
+        Commands::Rekey {
+            name,
+            old_external_passphrase,
+            external_key,
+            external_passphrase,
+        } => {
+            cmd_rekey(
+                name,
+                old_external_passphrase,
+                external_key,
+                external_passphrase,
+                effective_domain.clone(),
+                cli.mfa.clone(),
+            )
+            .await?
+        }
         Commands::File(cmd) => cmd_file(cmd, effective_domain.clone(), cli.mfa.clone()).await?,
-        Commands::Key(cmd) => crypto_cli::cmd_key(cmd, effective_domain.clone(), cli.mfa.clone()).await?,
-        Commands::Crypto(cmd) => crypto_cli::cmd_crypto(cmd, effective_domain.clone(), cli.mfa.clone()).await?,
+        Commands::Key(cmd) => {
+            crypto_cli::cmd_key(cmd, effective_domain.clone(), cli.mfa.clone()).await?
+        }
+        Commands::Crypto(cmd) => {
+            crypto_cli::cmd_crypto(cmd, effective_domain.clone(), cli.mfa.clone()).await?
+        }
         Commands::Tunnel(cmd) => cmd_tunnel(cmd).await?,
         Commands::Client(cmd) => cmd_client(cmd).await?,
         Commands::Acl(cmd) => cmd_acl(cmd, effective_domain.clone()).await?,
@@ -3431,8 +4577,28 @@ async fn main() -> Result<()> {
         Commands::Approve { request_id } => cmd_approve(request_id).await?,
         Commands::Requests { id, verbose } => cmd_requests(id, verbose).await?,
         Commands::Grants(cmd) => cmd_grants(cmd, effective_domain.clone()).await?,
-        Commands::Audit { limit, verify, archive, keep_last, before, prune, verify_archive, list_archives } =>
-            cmd_audit(limit, verify, archive, keep_last, before, prune, verify_archive, list_archives).await?,
+        Commands::Audit {
+            limit,
+            verify,
+            archive,
+            keep_last,
+            before,
+            prune,
+            verify_archive,
+            list_archives,
+        } => {
+            cmd_audit(
+                limit,
+                verify,
+                archive,
+                keep_last,
+                before,
+                prune,
+                verify_archive,
+                list_archives,
+            )
+            .await?
+        }
         Commands::Cleanup => cmd_cleanup(effective_domain.clone()).await?,
     }
 
@@ -3445,8 +4611,11 @@ mod tests {
 
     fn flags() -> ExtFlags {
         ExtFlags {
-            external: false, external_key: false, external_data: false,
-            passphrase: None, passphrase_from_env: false,
+            external: false,
+            external_key: false,
+            external_data: false,
+            passphrase: None,
+            passphrase_from_env: false,
         }
     }
 
@@ -3463,7 +4632,10 @@ mod tests {
 
     #[test]
     fn external_key_selects_managed_in_server() {
-        let f = ExtFlags { external_key: true, ..flags() };
+        let f = ExtFlags {
+            external_key: true,
+            ..flags()
+        };
         let spec = resolve_ext_spec(&f, false).unwrap().expect("external");
         assert!(matches!(spec.key, KeySource::Managed));
         assert!(matches!(spec.data, DataLoc::InServer));
@@ -3475,7 +4647,10 @@ mod tests {
         // passphrase value was supplied (the value is sourced later, in
         // ext_key_for_spec). This is what lets the web console create a
         // passphrase-sealed secret without the passphrase touching argv.
-        let f = ExtFlags { passphrase_from_env: true, ..flags() };
+        let f = ExtFlags {
+            passphrase_from_env: true,
+            ..flags()
+        };
         let spec = resolve_ext_spec(&f, false).unwrap().expect("external");
         assert!(matches!(spec.key, KeySource::Passphrase));
         assert!(matches!(spec.data, DataLoc::InServer));
@@ -3485,7 +4660,11 @@ mod tests {
     fn passphrase_env_plus_managed_is_rejected() {
         // Managed key and a passphrase opt-in are contradictory — must be a
         // clear error, not a silent pick.
-        let f = ExtFlags { passphrase_from_env: true, external_key: true, ..flags() };
+        let f = ExtFlags {
+            passphrase_from_env: true,
+            external_key: true,
+            ..flags()
+        };
         assert!(resolve_ext_spec(&f, false).is_err());
     }
 }

@@ -86,9 +86,11 @@ pub enum PersistenceError {
              unwraps a locally-stored wrapped DEK")]
     NoProvider,
 
-    #[error("this data volume was initialized with the '{existing}' key provider, but '{requested}' \
+    #[error(
+        "this data volume was initialized with the '{existing}' key provider, but '{requested}' \
              is configured now — they derive different DEKs and the master key won't decrypt. \
-             Restore the original provider, or re-initialize the volume.")]
+             Restore the original provider, or re-initialize the volume."
+    )]
     ProviderMismatch { existing: String, requested: String },
 
     #[error("master keyfile {path}: {detail}")]
@@ -167,19 +169,27 @@ impl DekProvider {
     /// than inventing a raw on-disk DEK. Precedence: a passphrase (direct env or
     /// a `…_FILE` secret) wins over a keyfile.
     pub fn from_env() -> Result<DekProvider> {
-        let passphrase = std::env::var("BLACKBOOK_MASTER_PASSPHRASE").ok()
+        let passphrase = std::env::var("BLACKBOOK_MASTER_PASSPHRASE")
+            .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| std::env::var("BLACKBOOK_MASTER_PASSPHRASE_FILE").ok()
-                .and_then(|p| fs::read_to_string(p).ok())
-                // Secret files commonly carry a trailing newline; trim it.
-                .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
-                .filter(|s| !s.is_empty()));
+            .or_else(|| {
+                std::env::var("BLACKBOOK_MASTER_PASSPHRASE_FILE")
+                    .ok()
+                    .and_then(|p| fs::read_to_string(p).ok())
+                    // Secret files commonly carry a trailing newline; trim it.
+                    .map(|s| s.trim_end_matches(['\n', '\r']).to_string())
+                    .filter(|s| !s.is_empty())
+            });
         if let Some(p) = passphrase {
-            if p.len() < MIN_PASSPHRASE_LEN { return Err(PersistenceError::PassphraseTooShort); }
+            if p.len() < MIN_PASSPHRASE_LEN {
+                return Err(PersistenceError::PassphraseTooShort);
+            }
             return Ok(DekProvider::Passphrase(Zeroizing::new(p)));
         }
         if let Ok(kf) = std::env::var("BLACKBOOK_MASTER_KEYFILE") {
-            if !kf.is_empty() { return Ok(DekProvider::Keyfile(PathBuf::from(kf))); }
+            if !kf.is_empty() {
+                return Ok(DekProvider::Keyfile(PathBuf::from(kf)));
+            }
         }
         Err(PersistenceError::NoProvider)
     }
@@ -200,12 +210,17 @@ struct DekMeta {
     v: u8,
     provider: String,
     // Passphrase provider:
-    #[serde(default, skip_serializing_if = "Option::is_none")] salt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] m_cost: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] t_cost: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")] p_cost: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    salt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    m_cost: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    t_cost: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    p_cost: Option<u32>,
     // Keyfile provider:
-    #[serde(default, skip_serializing_if = "Option::is_none")] wrapped_dek: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    wrapped_dek: Option<String>,
 }
 
 /// Derive the 32-byte KEK that wraps the DEK from a keyfile's bytes. The keyfile
@@ -214,12 +229,15 @@ struct DekMeta {
 fn keyfile_kek(path: &Path) -> Result<Zeroizing<[u8; 32]>> {
     let bytes = Zeroizing::new(fs::read(path).map_err(|e| PersistenceError::Keyfile {
         path: path.display().to_string(),
-        detail: format!("cannot read keyfile: {e} (it must exist and be readable, and should \
-                         live OUTSIDE the data volume — e.g. a Docker secret)"),
+        detail: format!(
+            "cannot read keyfile: {e} (it must exist and be readable, and should \
+                         live OUTSIDE the data volume — e.g. a Docker secret)"
+        ),
     })?);
     if bytes.is_empty() {
         return Err(PersistenceError::Keyfile {
-            path: path.display().to_string(), detail: "keyfile is empty".into(),
+            path: path.display().to_string(),
+            detail: "keyfile is empty".into(),
         });
     }
     let mut h = Sha3_256::new();
@@ -241,9 +259,12 @@ fn init_dek(provider: &DekProvider) -> Result<(Zeroizing<[u8; DEK_LEN]>, DekMeta
             let (dek, m, t, p) = crate::credstore::argon2_key(pass, &salt)
                 .map_err(|e| PersistenceError::Migration(format!("argon2: {e}")))?;
             let meta = DekMeta {
-                v: 1, provider: "passphrase".into(),
+                v: 1,
+                provider: "passphrase".into(),
                 salt: Some(b64().encode(salt)),
-                m_cost: Some(m), t_cost: Some(t), p_cost: Some(p),
+                m_cost: Some(m),
+                t_cost: Some(t),
+                p_cost: Some(p),
                 wrapped_dek: None,
             };
             Ok((dek, meta))
@@ -254,8 +275,12 @@ fn init_dek(provider: &DekProvider) -> Result<(Zeroizing<[u8; DEK_LEN]>, DekMeta
             rand::thread_rng().fill_bytes(dek.as_mut_slice());
             let wrapped = aead_seal(dek.as_slice(), kek.as_slice())?;
             let meta = DekMeta {
-                v: 1, provider: "keyfile".into(),
-                salt: None, m_cost: None, t_cost: None, p_cost: None,
+                v: 1,
+                provider: "keyfile".into(),
+                salt: None,
+                m_cost: None,
+                t_cost: None,
+                p_cost: None,
                 wrapped_dek: Some(b64().encode(&wrapped)),
             };
             Ok((dek, meta))
@@ -273,24 +298,51 @@ fn reconstruct_dek(provider: &DekProvider, meta: &DekMeta) -> Result<Zeroizing<[
     }
     match provider {
         DekProvider::Passphrase(pass) => {
-            let salt = b64().decode(meta.salt.as_deref().ok_or_else(|| PersistenceError::Corrupt {
-                what: "dek.meta", detail: "passphrase provider missing salt".into() })?)
-                .map_err(|e| PersistenceError::Corrupt { what: "dek.meta", detail: format!("salt b64: {e}") })?;
-            let (m, t, p) = (meta.m_cost.unwrap_or(0), meta.t_cost.unwrap_or(0), meta.p_cost.unwrap_or(0));
+            let salt = b64()
+                .decode(
+                    meta.salt
+                        .as_deref()
+                        .ok_or_else(|| PersistenceError::Corrupt {
+                            what: "dek.meta",
+                            detail: "passphrase provider missing salt".into(),
+                        })?,
+                )
+                .map_err(|e| PersistenceError::Corrupt {
+                    what: "dek.meta",
+                    detail: format!("salt b64: {e}"),
+                })?;
+            let (m, t, p) = (
+                meta.m_cost.unwrap_or(0),
+                meta.t_cost.unwrap_or(0),
+                meta.p_cost.unwrap_or(0),
+            );
             crate::credstore::argon2_key_with(pass, &salt, m, t, p)
                 .map_err(|e| PersistenceError::Migration(format!("argon2: {e}")))
         }
         DekProvider::Keyfile(path) => {
             let kek = keyfile_kek(path)?;
-            let wrapped = b64().decode(meta.wrapped_dek.as_deref().ok_or_else(|| PersistenceError::Corrupt {
-                what: "dek.meta", detail: "keyfile provider missing wrapped_dek".into() })?)
-                .map_err(|e| PersistenceError::Corrupt { what: "dek.meta", detail: format!("wrapped_dek b64: {e}") })?;
-            let plain = aead_open(&wrapped, kek.as_slice())
-                .map_err(|_| PersistenceError::Keyfile {
+            let wrapped =
+                b64()
+                    .decode(meta.wrapped_dek.as_deref().ok_or_else(|| {
+                        PersistenceError::Corrupt {
+                            what: "dek.meta",
+                            detail: "keyfile provider missing wrapped_dek".into(),
+                        }
+                    })?)
+                    .map_err(|e| PersistenceError::Corrupt {
+                        what: "dek.meta",
+                        detail: format!("wrapped_dek b64: {e}"),
+                    })?;
+            let plain =
+                aead_open(&wrapped, kek.as_slice()).map_err(|_| PersistenceError::Keyfile {
                     path: path.display().to_string(),
-                    detail: "wrong keyfile — wrapped DEK did not unwrap".into() })?;
+                    detail: "wrong keyfile — wrapped DEK did not unwrap".into(),
+                })?;
             if plain.len() != DEK_LEN {
-                return Err(PersistenceError::Corrupt { what: "wrapped_dek", detail: "not 32 bytes".into() });
+                return Err(PersistenceError::Corrupt {
+                    what: "wrapped_dek",
+                    detail: "not 32 bytes".into(),
+                });
             }
             let mut dek = Zeroizing::new([0u8; DEK_LEN]);
             dek.copy_from_slice(&plain);
@@ -325,7 +377,10 @@ pub fn resolve_dek(paths: &DataPaths, provider: &DekProvider) -> Result<Zeroizin
     // Fresh volume: mint the DEK and persist only its (non-secret) metadata.
     let (dek, meta) = init_dek(provider)?;
     write_secret(&paths.dek_meta, &serde_json::to_vec_pretty(&meta)?)?;
-    log::info!("initialized master DEK with the '{}' provider (no raw key on disk)", provider.kind());
+    log::info!(
+        "initialized master DEK with the '{}' provider (no raw key on disk)",
+        provider.kind()
+    );
     Ok(dek)
 }
 
@@ -347,15 +402,17 @@ pub fn rekey_master_dek(paths: &DataPaths, provider: &DekProvider) -> Result<()>
     // Reconstruct the current DEK and decrypt the master key with it.
     let old_dek = resolve_dek(paths, provider)?;
     let env = fs::read(&paths.master_key)?;
-    let plain = Zeroizing::new(decrypt_aes_gcm(&env, old_dek.as_slice()).map_err(|_|
+    let plain = Zeroizing::new(decrypt_aes_gcm(&env, old_dek.as_slice()).map_err(|_| {
         PersistenceError::Migration(
-            "the current DEK did not decrypt master.bbkey — wrong keyfile/passphrase?".into()))?);
+            "the current DEK did not decrypt master.bbkey — wrong keyfile/passphrase?".into(),
+        )
+    })?);
     // Mint a fresh DEK + metadata and re-encrypt the *same* master under it.
     let (new_dek, meta) = init_dek(provider)?;
     let new_env = encrypt_aes_gcm(&plain, new_dek.as_slice())?;
     let tmp = paths.master_key.with_extension("bbkey.rekey");
     write_secret(&tmp, &new_env)?;
-    fs::rename(&tmp, &paths.master_key)?;        // atomic swap of the wrapped key
+    fs::rename(&tmp, &paths.master_key)?; // atomic swap of the wrapped key
     write_secret(&paths.dek_meta, &serde_json::to_vec_pretty(&meta)?)?;
     Ok(())
 }
@@ -365,9 +422,14 @@ pub fn rekey_master_dek(paths: &DataPaths, provider: &DekProvider) -> Result<()>
 /// did, re-encrypts `master.bbkey` under a fresh provider DEK (atomically), then
 /// securely deletes the raw `dek`/`dek.mode`. After this the on-disk DEK is gone.
 fn migrate_legacy_dek(paths: &DataPaths, provider: &DekProvider) -> Result<()> {
-    let mode = fs::read(&paths.mode).ok().and_then(|b| b.first().copied()).unwrap_or(MODE_AUTO);
-    let material = Zeroizing::new(fs::read(&paths.dek).map_err(|e|
-        PersistenceError::Migration(format!("reading legacy dek: {e}")))?);
+    let mode = fs::read(&paths.mode)
+        .ok()
+        .and_then(|b| b.first().copied())
+        .unwrap_or(MODE_AUTO);
+    let material = Zeroizing::new(
+        fs::read(&paths.dek)
+            .map_err(|e| PersistenceError::Migration(format!("reading legacy dek: {e}")))?,
+    );
 
     // Recover the legacy DEK.
     let mut old_dek = Zeroizing::new([0u8; DEK_LEN]);
@@ -375,7 +437,9 @@ fn migrate_legacy_dek(paths: &DataPaths, provider: &DekProvider) -> Result<()> {
         MODE_AUTO => {
             if material.len() != DEK_LEN {
                 return Err(PersistenceError::Migration(format!(
-                    "legacy raw dek is {} bytes, expected {DEK_LEN}", material.len())));
+                    "legacy raw dek is {} bytes, expected {DEK_LEN}",
+                    material.len()
+                )));
             }
             old_dek.copy_from_slice(&material);
         }
@@ -385,23 +449,32 @@ fn migrate_legacy_dek(paths: &DataPaths, provider: &DekProvider) -> Result<()> {
             let DekProvider::Passphrase(pass) = provider else {
                 return Err(PersistenceError::Migration(
                     "this volume used a master passphrase; set BLACKBOOK_MASTER_PASSPHRASE \
-                     to the SAME passphrase to migrate it".into()));
+                     to the SAME passphrase to migrate it"
+                        .into(),
+                ));
             };
             let d = crate::blackbook_core::scrypt_dek(pass.as_bytes(), &material)
                 .map_err(|e| PersistenceError::Migration(format!("legacy scrypt: {e}")))?;
             old_dek.copy_from_slice(d.as_slice());
         }
-        other => return Err(PersistenceError::Migration(format!("unknown legacy mode byte {other}"))),
+        other => {
+            return Err(PersistenceError::Migration(format!(
+                "unknown legacy mode byte {other}"
+            )))
+        }
     }
 
     // Re-encrypt the master key under a fresh provider-backed DEK.
     let (new_dek, meta) = init_dek(provider)?;
     if paths.master_key.exists() {
         let env = fs::read(&paths.master_key)?;
-        let plain = Zeroizing::new(decrypt_aes_gcm(&env, old_dek.as_slice()).map_err(|_|
+        let plain = Zeroizing::new(decrypt_aes_gcm(&env, old_dek.as_slice()).map_err(|_| {
             PersistenceError::Migration(
                 "could not decrypt master.bbkey with the legacy DEK (wrong passphrase, or the \
-                 raw dek was already removed)".into()))?);
+                 raw dek was already removed)"
+                    .into(),
+            )
+        })?);
         let new_env = encrypt_aes_gcm(&plain, new_dek.as_slice())?;
         // Atomic swap so a crash mid-migration can't corrupt the master key.
         let tmp = paths.master_key.with_extension("bbkey.migrating");
@@ -412,8 +485,10 @@ fn migrate_legacy_dek(paths: &DataPaths, provider: &DekProvider) -> Result<()> {
     // Scrub the raw key material from disk.
     let _ = crate::credstore::secure_delete(&paths.dek);
     let _ = crate::credstore::secure_delete(&paths.mode);
-    log::warn!("migrated legacy on-disk DEK → '{}' provider; the raw DEK has been securely erased",
-               provider.kind());
+    log::warn!(
+        "migrated legacy on-disk DEK → '{}' provider; the raw DEK has been securely erased",
+        provider.kind()
+    );
     Ok(())
 }
 
@@ -514,8 +589,11 @@ mod tests {
     use super::*;
 
     fn unique_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir()
-            .join(format!("bbk-persist-{tag}-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let d = std::env::temp_dir().join(format!(
+            "bbk-persist-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
@@ -541,8 +619,10 @@ mod tests {
         assert!(!paths.dek.exists(), "raw dek file must not be written");
         assert!(paths.dek_meta.exists());
         let meta_bytes = fs::read(&paths.dek_meta).unwrap();
-        assert!(!meta_bytes.windows(DEK_LEN).any(|w| w == dek1.as_slice()),
-            "plaintext DEK must not appear anywhere in dek.meta");
+        assert!(
+            !meta_bytes.windows(DEK_LEN).any(|w| w == dek1.as_slice()),
+            "plaintext DEK must not appear anywhere in dek.meta"
+        );
 
         // Second boot: same keyfile reconstructs the same DEK and opens master.
         let dek2 = resolve_dek(&paths, &provider).unwrap();
@@ -560,8 +640,10 @@ mod tests {
         let _ = load_or_init_master(&paths, &dek).unwrap();
         let other = dir.join("other.bin");
         fs::write(&other, b"a-totally-different-keyfile").unwrap();
-        assert!(matches!(resolve_dek(&paths, &DekProvider::Keyfile(other)),
-            Err(PersistenceError::Keyfile { .. })));
+        assert!(matches!(
+            resolve_dek(&paths, &DekProvider::Keyfile(other)),
+            Err(PersistenceError::Keyfile { .. })
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -573,7 +655,10 @@ mod tests {
         // Initialized as keyfile → opening with a passphrase provider must error
         // (checked before any KDF work, so this is fast).
         let p = DekProvider::Passphrase(Zeroizing::new("a-sixteen-char-pp!".to_string()));
-        assert!(matches!(resolve_dek(&paths, &p), Err(PersistenceError::ProviderMismatch { .. })));
+        assert!(matches!(
+            resolve_dek(&paths, &p),
+            Err(PersistenceError::ProviderMismatch { .. })
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -592,13 +677,20 @@ mod tests {
 
         // Boot with a keyfile provider → migrate.
         let dek = resolve_dek(&paths, &DekProvider::Keyfile(keyfile_in(&dir))).unwrap();
-        assert!(!paths.dek.exists(), "raw dek must be removed after migration");
+        assert!(
+            !paths.dek.exists(),
+            "raw dek must be removed after migration"
+        );
         assert!(!paths.mode.exists());
         assert!(paths.dek_meta.exists());
         // Master key still decrypts under the new DEK and is the SAME key.
         let (key2, new) = load_or_init_master(&paths, &dek).unwrap();
         assert!(!new);
-        assert_eq!(key2.id.to_hex(), orig_id, "migration must preserve the master key");
+        assert_eq!(
+            key2.id.to_hex(),
+            orig_id,
+            "migration must preserve the master key"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -617,12 +709,24 @@ mod tests {
         rekey_master_dek(&paths, &provider).unwrap();
 
         // The on-disk wrapping changed (fresh DEK ⇒ new wrapped_dek + new master ct)...
-        assert_ne!(wrapped_before, fs::read(&paths.dek_meta).unwrap(), "dek.meta must change");
-        assert_ne!(master_before, fs::read(&paths.master_key).unwrap(), "master.bbkey must re-encrypt");
+        assert_ne!(
+            wrapped_before,
+            fs::read(&paths.dek_meta).unwrap(),
+            "dek.meta must change"
+        );
+        assert_ne!(
+            master_before,
+            fs::read(&paths.master_key).unwrap(),
+            "master.bbkey must re-encrypt"
+        );
         // ...but the master key itself is intact and still loads under the new DEK.
         let dek2 = resolve_dek(&paths, &provider).unwrap();
         let (after, _) = load_or_init_master(&paths, &dek2).unwrap();
-        assert_eq!(after.id.to_hex(), orig_id, "the master key must be unchanged");
+        assert_eq!(
+            after.id.to_hex(),
+            orig_id,
+            "the master key must be unchanged"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -630,12 +734,17 @@ mod tests {
     fn passphrase_provider_roundtrips() {
         let dir = unique_dir("pp");
         let paths = DataPaths::under(&dir);
-        let pp = || DekProvider::Passphrase(Zeroizing::new("correct-horse-battery-staple".to_string()));
+        let pp =
+            || DekProvider::Passphrase(Zeroizing::new("correct-horse-battery-staple".to_string()));
         let dek1 = resolve_dek(&paths, &pp()).unwrap();
         assert!(!paths.dek.exists());
         assert!(paths.dek_meta.exists());
         let dek2 = resolve_dek(&paths, &pp()).unwrap();
-        assert_eq!(dek1.as_slice(), dek2.as_slice(), "same passphrase must derive the same DEK");
+        assert_eq!(
+            dek1.as_slice(),
+            dek2.as_slice(),
+            "same passphrase must derive the same DEK"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

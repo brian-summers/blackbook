@@ -77,7 +77,8 @@ pub enum ArchiveError {
 pub fn build_archive(enc_key: &[u8], archive: &AuditArchive) -> Result<Vec<u8>, ArchiveError> {
     let json = serde_json::to_vec(archive).map_err(|e| ArchiveError::Json(e.to_string()))?;
     let mut gz = GzEncoder::new(Vec::new(), Compression::best());
-    gz.write_all(&json).map_err(|e| ArchiveError::Gzip(e.to_string()))?;
+    gz.write_all(&json)
+        .map_err(|e| ArchiveError::Gzip(e.to_string()))?;
     let compressed = gz.finish().map_err(|e| ArchiveError::Gzip(e.to_string()))?;
     let sealed = aead_seal(&compressed, enc_key).map_err(|_| ArchiveError::Crypto)?;
     let mut out = Vec::with_capacity(ARCHIVE_MAGIC.len() + sealed.len());
@@ -89,11 +90,14 @@ pub fn build_archive(enc_key: &[u8], archive: &AuditArchive) -> Result<Vec<u8>, 
 /// Decrypt + decompress an archive blob back to its payload (does NOT verify the
 /// hash chain — call [`verify_archive`] for that).
 pub fn open_archive(enc_key: &[u8], blob: &[u8]) -> Result<AuditArchive, ArchiveError> {
-    let body = blob.strip_prefix(ARCHIVE_MAGIC).ok_or(ArchiveError::BadMagic)?;
+    let body = blob
+        .strip_prefix(ARCHIVE_MAGIC)
+        .ok_or(ArchiveError::BadMagic)?;
     let compressed = aead_open(body, enc_key).map_err(|_| ArchiveError::Crypto)?;
     let mut gz = GzDecoder::new(&compressed[..]);
     let mut json = Vec::new();
-    gz.read_to_end(&mut json).map_err(|e| ArchiveError::Gzip(e.to_string()))?;
+    gz.read_to_end(&mut json)
+        .map_err(|e| ArchiveError::Gzip(e.to_string()))?;
     serde_json::from_slice(&json).map_err(|e| ArchiveError::Json(e.to_string()))
 }
 
@@ -117,9 +121,13 @@ pub struct ArchiveVerification {
 /// HMAC key (same one the live chain uses).
 pub fn verify_archive(mac_key: &[u8], archive: &AuditArchive) -> ArchiveVerification {
     let bail = |verified: usize, id: i64, why: &str| ArchiveVerification {
-        ok: false, count: archive.count, verified,
-        first_id: archive.first_id, last_id: archive.last_id,
-        first_bad_id: Some(id), reason: Some(why.to_string()),
+        ok: false,
+        count: archive.count,
+        verified,
+        first_id: archive.first_id,
+        last_id: archive.last_id,
+        first_bad_id: Some(id),
+        reason: Some(why.to_string()),
     };
     let mut prev = match hex32(&archive.genesis_prev) {
         Some(p) => p,
@@ -127,11 +135,21 @@ pub fn verify_archive(mac_key: &[u8], archive: &AuditArchive) -> ArchiveVerifica
     };
     for (i, r) in archive.rows.iter().enumerate() {
         if r.prev_hash != hex::encode(prev) {
-            return bail(i, r.id, "prev_hash does not chain to the preceding row (drop/reorder?)");
+            return bail(
+                i,
+                r.id,
+                "prev_hash does not chain to the preceding row (drop/reorder?)",
+            );
         }
         let computed = compute_audit_hash(
-            mac_key, &prev, r.ts_micros,
-            r.client_id.as_deref(), &r.action, r.resource.as_deref(), &r.status, r.message.as_deref(),
+            mac_key,
+            &prev,
+            r.ts_micros,
+            r.client_id.as_deref(),
+            &r.action,
+            r.resource.as_deref(),
+            &r.status,
+            r.message.as_deref(),
         );
         if hex::encode(computed) != r.row_hash {
             return bail(i, r.id, "row_hash mismatch (row contents were altered?)");
@@ -139,12 +157,20 @@ pub fn verify_archive(mac_key: &[u8], archive: &AuditArchive) -> ArchiveVerifica
         prev = computed;
     }
     if hex::encode(prev) != archive.final_row_hash {
-        return bail(archive.rows.len(), archive.last_id, "final chain value does not match final_row_hash");
+        return bail(
+            archive.rows.len(),
+            archive.last_id,
+            "final chain value does not match final_row_hash",
+        );
     }
     ArchiveVerification {
-        ok: true, count: archive.count, verified: archive.rows.len(),
-        first_id: archive.first_id, last_id: archive.last_id,
-        first_bad_id: None, reason: None,
+        ok: true,
+        count: archive.count,
+        verified: archive.rows.len(),
+        first_id: archive.first_id,
+        last_id: archive.last_id,
+        first_bad_id: None,
+        reason: None,
     }
 }
 
@@ -163,23 +189,58 @@ mod tests {
         let mut rows = Vec::new();
         let mut prev = [0u8; 32];
         let specs = [
-            (1i64, 100i64, Some("c1"), "store", "ok", Some("api-key"), None),
-            (2, 200, Some("c1"), "read", "ok", Some("api-key"), Some("served")),
-            (3, 300, None, "audit.verify", "ok", None, Some("verified 2 rows")),
+            (
+                1i64,
+                100i64,
+                Some("c1"),
+                "store",
+                "ok",
+                Some("api-key"),
+                None,
+            ),
+            (
+                2,
+                200,
+                Some("c1"),
+                "read",
+                "ok",
+                Some("api-key"),
+                Some("served"),
+            ),
+            (
+                3,
+                300,
+                None,
+                "audit.verify",
+                "ok",
+                None,
+                Some("verified 2 rows"),
+            ),
         ];
         for (id, ts, cid, action, status, res, msg) in specs {
             let h = compute_audit_hash(mac, &prev, ts, cid, action, res, status, msg);
             rows.push(ArchivedRow {
-                id, ts_micros: ts, client_id: cid.map(String::from), action: action.into(),
-                status: status.into(), resource: res.map(String::from), message: msg.map(String::from),
-                prev_hash: hex::encode(prev), row_hash: hex::encode(h),
+                id,
+                ts_micros: ts,
+                client_id: cid.map(String::from),
+                action: action.into(),
+                status: status.into(),
+                resource: res.map(String::from),
+                message: msg.map(String::from),
+                prev_hash: hex::encode(prev),
+                row_hash: hex::encode(h),
             });
             prev = h;
         }
         AuditArchive {
-            v: ARCHIVE_VERSION, created_at: "now".into(), count: rows.len(),
-            first_id: 1, last_id: 3, genesis_prev: hex::encode([0u8; 32]),
-            final_row_hash: hex::encode(prev), rows,
+            v: ARCHIVE_VERSION,
+            created_at: "now".into(),
+            count: rows.len(),
+            first_id: 1,
+            last_id: 3,
+            genesis_prev: hex::encode([0u8; 32]),
+            final_row_hash: hex::encode(prev),
+            rows,
         }
     }
 
@@ -190,7 +251,10 @@ mod tests {
         let archive = make_chain(mac);
         let blob = build_archive(enc, &archive).unwrap();
         // Encrypted + compressed; the plaintext resource name must not leak.
-        assert!(!blob.windows(7).any(|w| w == b"api-key"), "archive must not contain plaintext");
+        assert!(
+            !blob.windows(7).any(|w| w == b"api-key"),
+            "archive must not contain plaintext"
+        );
         let reopened = open_archive(enc, &blob).unwrap();
         let v = verify_archive(mac, &reopened);
         assert!(v.ok, "valid archive must verify: {v:?}");
@@ -201,7 +265,10 @@ mod tests {
     fn wrong_key_fails_to_open() {
         let enc = &[9u8; 32];
         let blob = build_archive(enc, &make_chain(&[1u8; 32])).unwrap();
-        assert!(matches!(open_archive(&[3u8; 32], &blob), Err(ArchiveError::Crypto)));
+        assert!(matches!(
+            open_archive(&[3u8; 32], &blob),
+            Err(ArchiveError::Crypto)
+        ));
     }
 
     #[test]
@@ -210,7 +277,10 @@ mod tests {
         let mut archive = make_chain(mac);
         archive.rows[1].resource = Some("rotated-the-content".into()); // alter a row
         let v = verify_archive(mac, &archive);
-        assert!(!v.ok && v.first_bad_id == Some(2), "altered row must be flagged: {v:?}");
+        assert!(
+            !v.ok && v.first_bad_id == Some(2),
+            "altered row must be flagged: {v:?}"
+        );
     }
 
     #[test]

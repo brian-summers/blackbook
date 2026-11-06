@@ -18,10 +18,10 @@
 //!   4. Server vouches each peer to the other (control frame), then pipes
 //!      binary frames straight through until either side closes.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use serde::{Deserialize, Serialize};
 
 use crate::blackbook_core::Id;
 
@@ -79,7 +79,9 @@ pub struct TunnelHub {
 const OFFER_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl TunnelHub {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Register an offer; returns the new tunnel id.
     pub async fn offer(&self, offerer_name: &str, offerer_fp: &str, target_name: &str) -> String {
@@ -87,16 +89,19 @@ impl TunnelHub {
         let mut map = self.inner.lock().await;
         // Opportunistic sweep of stale, never-completed offers.
         map.retain(|_, t| t.answerer_name.is_some() || t.created.elapsed() < OFFER_TTL);
-        map.insert(id.clone(), Tunnel {
-            offerer_name: offerer_name.to_string(),
-            offerer_fp: offerer_fp.to_string(),
-            target_name: target_name.to_string(),
-            answerer_name: None,
-            answerer_fp: None,
-            to_offerer: None,
-            to_answerer: None,
-            created: std::time::Instant::now(),
-        });
+        map.insert(
+            id.clone(),
+            Tunnel {
+                offerer_name: offerer_name.to_string(),
+                offerer_fp: offerer_fp.to_string(),
+                target_name: target_name.to_string(),
+                answerer_name: None,
+                answerer_fp: None,
+                to_offerer: None,
+                to_answerer: None,
+                created: std::time::Instant::now(),
+            },
+        );
         id
     }
 
@@ -110,9 +115,14 @@ impl TunnelHub {
                 id: id.clone(),
                 offerer: t.offerer_name.clone(),
                 target: t.target_name.clone(),
-                state: if t.to_offerer.is_some() && t.to_answerer.is_some() { "connected" }
-                       else if t.answerer_name.is_some() { "joining" }
-                       else { "offered" }.to_string(),
+                state: if t.to_offerer.is_some() && t.to_answerer.is_some() {
+                    "connected"
+                } else if t.answerer_name.is_some() {
+                    "joining"
+                } else {
+                    "offered"
+                }
+                .to_string(),
             })
             .collect()
     }

@@ -40,7 +40,10 @@ pub fn set_active_profile(name: String) {
 /// The active profile name (or `"default"` if `set_active_profile` was never
 /// called — e.g. very early errors).
 pub fn active_profile() -> String {
-    ACTIVE_PROFILE.get().cloned().unwrap_or_else(|| "default".to_string())
+    ACTIVE_PROFILE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "default".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -91,21 +94,29 @@ fn http_error_detail(e: &reqwest::Error) -> String {
         // rustls errors reach us wrapped in nested io::Errors (tokio-rustls's,
         // then hyper-util's).
         let mut inner: &(dyn std::error::Error + 'static) = c;
-        while let Some(next) = inner.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()) {
+        while let Some(next) = inner
+            .downcast_ref::<std::io::Error>()
+            .and_then(|io| io.get_ref())
+        {
             inner = next;
         }
-        no_common_tls |= matches!(inner.downcast_ref::<rustls::Error>(),
+        no_common_tls |= matches!(
+            inner.downcast_ref::<rustls::Error>(),
             Some(rustls::Error::PeerIncompatible(_))
-            | Some(rustls::Error::AlertReceived(
-                rustls::AlertDescription::HandshakeFailure
-                | rustls::AlertDescription::ProtocolVersion
-                | rustls::AlertDescription::InsufficientSecurity)));
+                | Some(rustls::Error::AlertReceived(
+                    rustls::AlertDescription::HandshakeFailure
+                        | rustls::AlertDescription::ProtocolVersion
+                        | rustls::AlertDescription::InsufficientSecurity
+                ))
+        );
         cause = c.source();
     }
     if no_common_tls {
-        out.push_str(" (bbk connects only with TLS 1.3 and the post-quantum X25519MLKEM768 key \
+        out.push_str(
+            " (bbk connects only with TLS 1.3 and the post-quantum X25519MLKEM768 key \
                       exchange; the server, or a proxy in front of it, must offer both, which \
-                      takes OpenSSL 3.5 or later)");
+                      takes OpenSSL 3.5 or later)",
+        );
     }
     out
 }
@@ -159,9 +170,15 @@ impl std::fmt::Debug for Session {
 /// life of the process. Certificates are public and left as-is.
 impl Drop for Session {
     fn drop(&mut self) {
-        if let Some(t) = self.token.as_mut() { t.zeroize(); }
-        if let Some(k) = self.key_pem.as_mut() { k.zeroize(); }
-        if let Some(c) = self.cmk.as_mut() { c.zeroize(); }
+        if let Some(t) = self.token.as_mut() {
+            t.zeroize();
+        }
+        if let Some(k) = self.key_pem.as_mut() {
+            k.zeroize();
+        }
+        if let Some(c) = self.cmk.as_mut() {
+            c.zeroize();
+        }
     }
 }
 
@@ -177,7 +194,9 @@ impl Session {
 
     /// `~/.bbk/profiles/<profile>.json`.
     pub fn path_for(profile: &str) -> Result<PathBuf> {
-        Ok(Self::bbk_dir()?.join("profiles").join(format!("{profile}.json")))
+        Ok(Self::bbk_dir()?
+            .join("profiles")
+            .join(format!("{profile}.json")))
     }
 
     /// Legacy single-session path, read as the `default` profile if no
@@ -194,16 +213,24 @@ impl Session {
     /// Read the persisted active-profile pointer, if any.
     pub fn read_active_pointer() -> Result<Option<String>> {
         let path = Self::active_pointer_path()?;
-        if !path.exists() { return Ok(None); }
+        if !path.exists() {
+            return Ok(None);
+        }
         let s = fs::read_to_string(&path)?;
         let s = s.trim();
-        Ok(if s.is_empty() { None } else { Some(s.to_string()) })
+        Ok(if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        })
     }
 
     /// Persist the active-profile pointer.
     pub fn write_active_pointer(name: &str) -> Result<()> {
         let path = Self::active_pointer_path()?;
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(&path, name)?;
         Ok(())
     }
@@ -222,13 +249,19 @@ impl Session {
         let path = Self::domain_pointer_path(profile).ok()?;
         let s = fs::read_to_string(&path).ok()?;
         let s = s.trim();
-        if s.is_empty() { None } else { Some(s.to_string()) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
+        }
     }
 
     /// Persist a profile's default domain.
     pub fn write_domain_pref(profile: &str, domain: &str) -> Result<()> {
         let path = Self::domain_pointer_path(profile)?;
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(&path, domain)?;
         Ok(())
     }
@@ -236,7 +269,12 @@ impl Session {
     /// Remove a profile's default-domain preference (revert to `default`).
     pub fn clear_domain_pref(profile: &str) -> Result<bool> {
         let path = Self::domain_pointer_path(profile)?;
-        if path.exists() { fs::remove_file(&path)?; Ok(true) } else { Ok(false) }
+        if path.exists() {
+            fs::remove_file(&path)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Names of all saved profiles (files in `~/.bbk/profiles`), plus the
@@ -279,7 +317,8 @@ impl Session {
         let path = Self::path_for(profile)?;
         if path.exists() {
             let bytes = fs::read(&path).map_err(|e| ClientError::SessionIo {
-                path: path.display().to_string(), detail: e.to_string(),
+                path: path.display().to_string(),
+                detail: e.to_string(),
             })?;
             return Self::from_profile_bytes(profile, &bytes);
         }
@@ -287,7 +326,8 @@ impl Session {
             let legacy = Self::legacy_path()?;
             if legacy.exists() {
                 let bytes = fs::read(&legacy).map_err(|e| ClientError::SessionIo {
-                    path: legacy.display().to_string(), detail: e.to_string(),
+                    path: legacy.display().to_string(),
+                    detail: e.to_string(),
                 })?;
                 return Self::from_profile_bytes(profile, &bytes);
             }
@@ -312,11 +352,17 @@ impl Session {
                 // 2) passphrase (env var or interactive prompt). Refresh the
                 //    agent so subsequent commands in the TTL don't re-prompt.
                 let pass = crate::credstore::resolve_passphrase(
-                    None, &format!("Passphrase for profile '{profile}': "), false)?;
+                    None,
+                    &format!("Passphrase for profile '{profile}': "),
+                    false,
+                )?;
                 let kek = env.derive_kek(&pass)?;
                 let inner = env.open_with_kek(kek.as_slice())?;
                 let _ = crate::credstore::agent_store(
-                    profile, kek.as_slice(), crate::credstore::DEFAULT_AGENT_TTL_SECS);
+                    profile,
+                    kek.as_slice(),
+                    crate::credstore::DEFAULT_AGENT_TTL_SECS,
+                );
                 return Ok(serde_json::from_slice(&inner)?);
             }
         }
@@ -328,7 +374,9 @@ impl Session {
     /// one yet, returning whether a new one was minted. Called at login so
     /// every encrypted profile carries a rotation-stable CMK.
     pub fn ensure_cmk(&mut self) -> bool {
-        if self.cmk.is_some() { return false; }
+        if self.cmk.is_some() {
+            return false;
+        }
         use base64::Engine as _;
         use rand::RngCore;
         let mut k = [0u8; 32];
@@ -341,8 +389,11 @@ impl Session {
     pub fn cmk_bytes(&self) -> Option<[u8; 32]> {
         use base64::Engine as _;
         let raw = base64::engine::general_purpose::STANDARD
-            .decode(self.cmk.as_ref()?).ok()?;
-        if raw.len() != 32 { return None; }
+            .decode(self.cmk.as_ref()?)
+            .ok()?;
+        if raw.len() != 32 {
+            return None;
+        }
         let mut out = [0u8; 32];
         out.copy_from_slice(&raw);
         Some(out)
@@ -359,11 +410,16 @@ impl Session {
         let env = crate::credstore::seal_profile(passphrase, &inner)?;
         let kek = env.derive_kek(passphrase)?;
         let path = Self::path_for(profile)?;
-        if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         fs::write(&path, serde_json::to_vec_pretty(&env)?)?;
         Self::harden(&path)?;
         let _ = crate::credstore::agent_store(
-            profile, kek.as_slice(), crate::credstore::DEFAULT_AGENT_TTL_SECS);
+            profile,
+            kek.as_slice(),
+            crate::credstore::DEFAULT_AGENT_TTL_SECS,
+        );
         Self::write_active_pointer(profile)?;
         Ok(path)
     }
@@ -384,7 +440,9 @@ impl Session {
             fs::set_permissions(path, perms)?;
         }
         #[cfg(not(unix))]
-        { let _ = path; }
+        {
+            let _ = path;
+        }
         Ok(())
     }
 
@@ -397,10 +455,16 @@ impl Session {
     pub fn clear_named(profile: &str) -> Result<bool> {
         let mut removed = false;
         let path = Self::path_for(profile)?;
-        if path.exists() { fs::remove_file(&path)?; removed = true; }
+        if path.exists() {
+            fs::remove_file(&path)?;
+            removed = true;
+        }
         if profile == "default" {
             let legacy = Self::legacy_path()?;
-            if legacy.exists() { fs::remove_file(&legacy)?; removed = true; }
+            if legacy.exists() {
+                fs::remove_file(&legacy)?;
+                removed = true;
+            }
         }
         Ok(removed)
     }
@@ -412,45 +476,69 @@ impl Session {
 
 #[derive(Debug, Deserialize)]
 pub struct Whoami {
-    pub id: String, pub name: String, pub role: String, pub auth_method: String,
-    #[serde(default)] pub user_domain: Option<String>,
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub auth_method: String,
+    #[serde(default)]
+    pub user_domain: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct StoreResponse {
-    pub resource_id: String, pub resource_name: String,
-    pub created_at: String, pub encryption_method: String, pub status: String,
+    pub resource_id: String,
+    pub resource_name: String,
+    pub created_at: String,
+    pub encryption_method: String,
+    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct RetrieveResponse {
-    pub resource_id: String, pub resource_name: String, pub data: String,
-    pub created_at: String, pub updated_at: String,
+    pub resource_id: String,
+    pub resource_name: String,
+    pub data: String,
+    pub created_at: String,
+    pub updated_at: String,
     /// True for client-side ("external") secrets: `data` is empty and
     /// `envelope` carries the base64 opaque blob to decrypt locally.
-    #[serde(default)] pub external: bool,
-    #[serde(default)] pub envelope: Option<String>,
+    #[serde(default)]
+    pub external: bool,
+    #[serde(default)]
+    pub envelope: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DeleteResponse { pub deleted: bool, pub resource_id: String, pub deleted_at: String }
+pub struct DeleteResponse {
+    pub deleted: bool,
+    pub resource_id: String,
+    pub deleted_at: String,
+}
 
 /// Resource policy flags as returned in list views. Mirrors
 /// `auth::ResourceFlags`; all optional so older servers still deserialize.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ResourceFlagsView {
-    #[serde(default)] pub mfa_required: bool,
-    #[serde(default)] pub delete_on_read: bool,
-    #[serde(default)] pub max_reads: Option<i64>,
-    #[serde(default)] pub rotate_on_read: bool,
-    #[serde(default)] pub preserve_on_cleanup: bool,
-    #[serde(default)] pub no_overwrite: bool,
+    #[serde(default)]
+    pub mfa_required: bool,
+    #[serde(default)]
+    pub delete_on_read: bool,
+    #[serde(default)]
+    pub max_reads: Option<i64>,
+    #[serde(default)]
+    pub rotate_on_read: bool,
+    #[serde(default)]
+    pub preserve_on_cleanup: bool,
+    #[serde(default)]
+    pub no_overwrite: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ResourceSummary {
-    pub resource_id: String, pub resource_name: String,
-    pub created_at: String, pub updated_at: String,
+    pub resource_id: String,
+    pub resource_name: String,
+    pub created_at: String,
+    pub updated_at: String,
     /// Populated when the secret was tombstoned by `max_reads` exhaustion;
     /// its crypto material is gone but the name slot is still occupied.
     #[serde(default)]
@@ -470,39 +558,58 @@ pub struct ResourceSummary {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct ListResources { pub resources: Vec<ResourceSummary>, pub count: usize }
+pub struct ListResources {
+    pub resources: Vec<ResourceSummary>,
+    pub count: usize,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CleanupResponse {
     pub deleted: usize,
-    #[serde(default)] pub secrets_deleted: usize,
-    #[serde(default)] pub files_deleted: usize,
+    #[serde(default)]
+    pub secrets_deleted: usize,
+    #[serde(default)]
+    pub files_deleted: usize,
     pub preserved: i64,
     pub names: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Health { pub status: String, pub database: String, pub version: String, pub uptime: u64 }
+pub struct Health {
+    pub status: String,
+    pub database: String,
+    pub version: String,
+    pub uptime: u64,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct NewClient {
-    pub id: String, pub name: String, pub role: String,
+    pub id: String,
+    pub name: String,
+    pub role: String,
     pub token: String,
-    pub cert_pem: String, pub key_pem: String,
+    pub cert_pem: String,
+    pub key_pem: String,
     pub expires_at: String,
-    #[serde(default)] pub user_domain: String,
+    #[serde(default)]
+    pub user_domain: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ClientSummary {
-    pub id: String, pub name: String, pub role: String,
+    pub id: String,
+    pub name: String,
+    pub role: String,
     pub created_at: String,
     pub expires_at: Option<String>,
     pub revoked_at: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ClientList { pub clients: Vec<ClientSummary>, pub count: usize }
+pub struct ClientList {
+    pub clients: Vec<ClientSummary>,
+    pub count: usize,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AclSummary {
@@ -517,24 +624,37 @@ pub struct AclSummary {
     pub not_before: Option<String>,
     pub max_uses: Option<i32>,
     pub use_count: i32,
-    #[serde(default)] pub rate_max: Option<i32>,
-    #[serde(default)] pub rate_period_secs: Option<i32>,
-    #[serde(default)] pub schedule: Option<String>,
+    #[serde(default)]
+    pub rate_max: Option<i32>,
+    #[serde(default)]
+    pub rate_period_secs: Option<i32>,
+    #[serde(default)]
+    pub schedule: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AclList { pub entries: Vec<AclSummary>, pub count: usize }
+pub struct AclList {
+    pub entries: Vec<AclSummary>,
+    pub count: usize,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AuditEntry {
-    pub id: i64, pub ts: String,
-    pub client_id: Option<String>, pub client_name: Option<String>,
-    pub action: String, pub resource: Option<String>,
-    pub status: String, pub message: Option<String>,
+    pub id: i64,
+    pub ts: String,
+    pub client_id: Option<String>,
+    pub client_name: Option<String>,
+    pub action: String,
+    pub resource: Option<String>,
+    pub status: String,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AuditList { pub entries: Vec<AuditEntry>, pub count: usize }
+pub struct AuditList {
+    pub entries: Vec<AuditEntry>,
+    pub count: usize,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct FileSummary {
@@ -562,10 +682,16 @@ pub struct FileSummary {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct FileList { pub files: Vec<FileSummary>, pub count: usize }
+pub struct FileList {
+    pub files: Vec<FileSummary>,
+    pub count: usize,
+}
 
 #[derive(Debug, Deserialize)]
-pub struct ApiError { pub error: String, pub message: String }
+pub struct ApiError {
+    pub error: String,
+    pub message: String,
+}
 
 // ---------------------------------------------------------------------------
 // HTTP client
@@ -677,7 +803,8 @@ pub struct AccessGrantSummary {
     pub pattern: String,
     pub max_uses: Option<i32>,
     pub use_count: i32,
-    #[serde(default)] pub not_before: Option<String>,
+    #[serde(default)]
+    pub not_before: Option<String>,
     pub expires_at: String,
     pub created_at: String,
     pub revoked: bool,
@@ -692,7 +819,7 @@ pub struct AccessGrantList {
 /// Options for creating an advance-approval grant.
 #[derive(Debug, Default)]
 pub struct GrantAddOpts {
-    pub resource_kind: String,      // "secret" | "file"
+    pub resource_kind: String, // "secret" | "file"
     pub max_uses: Option<i32>,
     pub ttl_hours: Option<i64>,
     pub expires_at: Option<String>, // RFC3339
@@ -723,13 +850,17 @@ pub struct GrantOpts {
 
 #[derive(Debug, Deserialize)]
 pub struct DomainSummary {
-    pub id: String, pub name: String,
+    pub id: String,
+    pub name: String,
     pub description: Option<String>,
     pub created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DomainList { pub domains: Vec<DomainSummary>, pub count: usize }
+pub struct DomainList {
+    pub domains: Vec<DomainSummary>,
+    pub count: usize,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct MemberSummary {
@@ -739,17 +870,28 @@ pub struct MemberSummary {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct MemberList { pub members: Vec<MemberSummary>, pub count: usize }
+pub struct MemberList {
+    pub members: Vec<MemberSummary>,
+    pub count: usize,
+}
 
 impl BlackbookClient {
     pub fn from_session(session: &Session) -> Result<Self> {
         // `login` refuses a bundle without the CA, so only a legacy profile can
         // lack one. Refuse it too rather than connect without authenticating
         // the server.
-        let ca_pem = session.ca_pem.as_deref().ok_or_else(|| ClientError::TlsConfig(
-            "this profile has no pinned Blackbook CA; run `bbk login` again with a full \
-             credential bundle".into()))?;
-        let tls = tls_config(ca_pem, session.cert_pem.as_deref(), session.key_pem.as_deref())?;
+        let ca_pem = session.ca_pem.as_deref().ok_or_else(|| {
+            ClientError::TlsConfig(
+                "this profile has no pinned Blackbook CA; run `bbk login` again with a full \
+             credential bundle"
+                    .into(),
+            )
+        })?;
+        let tls = tls_config(
+            ca_pem,
+            session.cert_pem.as_deref(),
+            session.key_pem.as_deref(),
+        )?;
         let http = reqwest::ClientBuilder::new()
             .timeout(std::time::Duration::from_secs(60))
             .use_preconfigured_tls(tls)
@@ -765,27 +907,45 @@ impl BlackbookClient {
     }
 
     pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
-        self.domain = domain.into(); self
+        self.domain = domain.into();
+        self
     }
     /// The domain this client is scoped to (`default` if unset).
-    pub fn domain(&self) -> &str { &self.domain }
-    pub fn server_url(&self) -> &str { &self.server }
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+    pub fn server_url(&self) -> &str {
+        &self.server
+    }
     pub fn with_mfa(mut self, code: impl Into<String>) -> Self {
-        self.mfa = Some(code.into()); self
+        self.mfa = Some(code.into());
+        self
     }
 
     /// Offer a tunnel to `target`; returns the new tunnel id.
     pub async fn tunnel_offer(&self, target: &str) -> Result<String> {
         let body = serde_json::json!({ "target": target });
-        let resp = self.req(reqwest::Method::POST, "/api/v1/tunnels").json(&body).send().await?;
+        let resp = self
+            .req(reqwest::Method::POST, "/api/v1/tunnels")
+            .json(&body)
+            .send()
+            .await?;
         let v: serde_json::Value = self.handle(resp).await?;
-        v.get("tunnel_id").and_then(|x| x.as_str()).map(|s| s.to_string())
-            .ok_or_else(|| ClientError::Api { status: 500, message: "no tunnel_id in response".into() })
+        v.get("tunnel_id")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| ClientError::Api {
+                status: 500,
+                message: "no tunnel_id in response".into(),
+            })
     }
 
     /// List tunnels this client offered or is the target of.
     pub async fn tunnel_list(&self) -> Result<serde_json::Value> {
-        let resp = self.req(reqwest::Method::GET, "/api/v1/tunnels").send().await?;
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/tunnels")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
@@ -797,55 +957,100 @@ impl BlackbookClient {
         use reqwest_websocket::RequestBuilderExt as _;
         let url = format!("{}/api/v1/tunnels/{}/ws", self.server, tunnel_id);
         let mut rb = self.http.request(reqwest::Method::GET, &url);
-        if let Some(t) = &self.token { rb = rb.bearer_auth(t); }
-        let resp = rb.upgrade().send().await
+        if let Some(t) = &self.token {
+            rb = rb.bearer_auth(t);
+        }
+        let resp = rb
+            .upgrade()
+            .send()
+            .await
             .map_err(|e| ClientError::TlsConfig(format!("tunnel ws connect: {e}")))?;
-        resp.into_websocket().await
+        resp.into_websocket()
+            .await
             .map_err(|e| ClientError::TlsConfig(format!("tunnel ws upgrade: {e}")))
     }
 
     async fn handle<T: serde::de::DeserializeOwned>(&self, resp: reqwest::Response) -> Result<T> {
         let status = resp.status();
-        if status.is_success() { return Ok(resp.json::<T>().await?); }
+        if status.is_success() {
+            return Ok(resp.json::<T>().await?);
+        }
         let body = resp.text().await.unwrap_or_default();
         let message = serde_json::from_str::<ApiError>(&body)
-            .map(|e| if e.error.is_empty() { e.message } else { format!("{} [{}]", e.message, e.error) })
+            .map(|e| {
+                if e.error.is_empty() {
+                    e.message
+                } else {
+                    format!("{} [{}]", e.message, e.error)
+                }
+            })
             .unwrap_or(body);
-        Err(ClientError::Api { status: status.as_u16(), message })
+        Err(ClientError::Api {
+            status: status.as_u16(),
+            message,
+        })
     }
 
     /// Full download result, including the Phase 4 resident key component.
     async fn handle_download(&self, resp: reqwest::Response) -> Result<FileDownload> {
         let status = resp.status();
-        let ct = resp.headers().get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let ext_meta = if resp.headers().get("X-Blackbook-External").is_some() {
-            resp.headers().get("X-Blackbook-External-Meta")
-                .and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+            resp.headers()
+                .get("X-Blackbook-External-Meta")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
                 .or(Some(String::new()))
-        } else { None };
-        let key_component = resp.headers().get("X-Blackbook-Key-Component")
-            .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        } else {
+            None
+        };
+        let key_component = resp
+            .headers()
+            .get("X-Blackbook-Key-Component")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let resident = resp.headers().get("X-Blackbook-Resident").is_some();
         if status.is_success() {
             return Ok(FileDownload {
                 bytes: resp.bytes().await?.to_vec(),
-                content_type: ct, external_meta: ext_meta, key_component, resident,
+                content_type: ct,
+                external_meta: ext_meta,
+                key_component,
+                resident,
             });
         }
         let body = resp.text().await.unwrap_or_default();
         let message = serde_json::from_str::<ApiError>(&body)
-            .map(|e| if e.error.is_empty() { e.message } else { format!("{} [{}]", e.message, e.error) })
+            .map(|e| {
+                if e.error.is_empty() {
+                    e.message
+                } else {
+                    format!("{} [{}]", e.message, e.error)
+                }
+            })
             .unwrap_or(body);
-        Err(ClientError::Api { status: status.as_u16(), message })
+        Err(ClientError::Api {
+            status: status.as_u16(),
+            message,
+        })
     }
 
-    fn url(&self, path: &str) -> String { format!("{}{}", self.server, path) }
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.server, path)
+    }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         let mut rb = self.http.request(method, self.url(path));
-        if let Some(t) = &self.token { rb = rb.bearer_auth(t); }
-        if let Some(c) = &self.mfa { rb = rb.header("X-Blackbook-MFA", c); }
+        if let Some(t) = &self.token {
+            rb = rb.bearer_auth(t);
+        }
+        if let Some(c) = &self.mfa {
+            rb = rb.header("X-Blackbook-MFA", c);
+        }
         rb
     }
 
@@ -855,10 +1060,20 @@ impl BlackbookClient {
             self.req(method, path)
         } else {
             let sep = if path.contains('?') { '&' } else { '?' };
-            let url = format!("{}{}{}domain={}", self.server, path, sep, urlencoding_simple(&self.domain));
+            let url = format!(
+                "{}{}{}domain={}",
+                self.server,
+                path,
+                sep,
+                urlencoding_simple(&self.domain)
+            );
             let mut rb = self.http.request(method, url);
-            if let Some(t) = &self.token { rb = rb.bearer_auth(t); }
-            if let Some(c) = &self.mfa { rb = rb.header("X-Blackbook-MFA", c); }
+            if let Some(t) = &self.token {
+                rb = rb.bearer_auth(t);
+            }
+            if let Some(c) = &self.mfa {
+                rb = rb.header("X-Blackbook-MFA", c);
+            }
             rb
         }
     }
@@ -869,34 +1084,45 @@ impl BlackbookClient {
     }
 
     pub async fn whoami(&self) -> Result<Whoami> {
-        let resp = self.req(reqwest::Method::GET, "/api/v1/whoami").send().await?;
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/whoami")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn store(
-        &self, name: &str, data: &str,
+        &self,
+        name: &str,
+        data: &str,
         description: Option<&str>,
         flags: Option<&ResourceFlagsRequest>,
         policy: Option<&AccessPolicyRequest>,
         overwrite: bool,
     ) -> Result<StoreResponse> {
-        self.store_inner(name, data, description, flags, policy, overwrite, None).await
+        self.store_inner(name, data, description, flags, policy, overwrite, None)
+            .await
     }
 
     /// Store a client-side ("external") secret: `envelope_b64` is the opaque
     /// blob the server keeps but can't open. `data` is empty/ignored.
     pub async fn store_external(
-        &self, name: &str, envelope_b64: &str,
+        &self,
+        name: &str,
+        envelope_b64: &str,
         flags: Option<&ResourceFlagsRequest>,
         policy: Option<&AccessPolicyRequest>,
         overwrite: bool,
     ) -> Result<StoreResponse> {
-        self.store_inner(name, "", None, flags, policy, overwrite, Some(envelope_b64)).await
+        self.store_inner(name, "", None, flags, policy, overwrite, Some(envelope_b64))
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn store_inner(
-        &self, name: &str, data: &str,
+        &self,
+        name: &str,
+        data: &str,
         description: Option<&str>,
         flags: Option<&ResourceFlagsRequest>,
         policy: Option<&AccessPolicyRequest>,
@@ -912,17 +1138,25 @@ impl BlackbookClient {
             "overwrite": overwrite,
             "external": external,
         });
-        let resp = self.req_in_domain(reqwest::Method::POST, "/api/v1/store").json(&body).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::POST, "/api/v1/store")
+            .json(&body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     /// Retrieve, optionally presenting an approved access-request id via
     /// the `X-Blackbook-Request-Id` header.
     pub async fn retrieve_with_request(
-        &self, id_or_name: &str, request_id: Option<&str>,
+        &self,
+        id_or_name: &str,
+        request_id: Option<&str>,
     ) -> Result<RetrieveResponse> {
         let body = serde_json::json!({"resource_id": id_or_name});
-        let mut rb = self.req_in_domain(reqwest::Method::POST, "/api/v1/retrieve").json(&body);
+        let mut rb = self
+            .req_in_domain(reqwest::Method::POST, "/api/v1/retrieve")
+            .json(&body);
         if let Some(rid) = request_id {
             rb = rb.header("X-Blackbook-Request-Id", rid);
         }
@@ -939,7 +1173,10 @@ impl BlackbookClient {
 
     /// List access requests visible to the caller (theirs + ones they sign).
     pub async fn list_access_requests(&self) -> Result<AccessRequestList> {
-        let resp = self.req(reqwest::Method::GET, "/api/v1/access-requests").send().await?;
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/access-requests")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
@@ -953,7 +1190,10 @@ impl BlackbookClient {
 
     /// Create an advance-approval grant (caller is the signatory).
     pub async fn create_access_grant(
-        &self, grantee: &str, pattern: &str, opts: &GrantAddOpts,
+        &self,
+        grantee: &str,
+        pattern: &str,
+        opts: &GrantAddOpts,
     ) -> Result<serde_json::Value> {
         let body = serde_json::json!({
             "grantee": grantee,
@@ -964,13 +1204,20 @@ impl BlackbookClient {
             "expires_at": opts.expires_at,
             "not_before": opts.not_before,
         });
-        let resp = self.req_in_domain(reqwest::Method::POST, "/api/v1/access-grants").json(&body).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::POST, "/api/v1/access-grants")
+            .json(&body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     /// List advance grants the caller created or benefits from.
     pub async fn list_access_grants(&self) -> Result<AccessGrantList> {
-        let resp = self.req(reqwest::Method::GET, "/api/v1/access-grants").send().await?;
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/access-grants")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
@@ -982,13 +1229,20 @@ impl BlackbookClient {
     }
 
     pub async fn mfa_enroll(&self) -> Result<MfaEnrollResponse> {
-        let resp = self.req(reqwest::Method::POST, "/api/v1/mfa/enroll").send().await?;
+        let resp = self
+            .req(reqwest::Method::POST, "/api/v1/mfa/enroll")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn mfa_verify(&self, code: &str) -> Result<serde_json::Value> {
         let body = serde_json::json!({"code": code});
-        let resp = self.req(reqwest::Method::POST, "/api/v1/mfa/verify").json(&body).send().await?;
+        let resp = self
+            .req(reqwest::Method::POST, "/api/v1/mfa/verify")
+            .json(&body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
@@ -996,44 +1250,91 @@ impl BlackbookClient {
     /// the count deleted, the count of preserve_on_cleanup rows that were
     /// kept, and the names of every row that was removed.
     pub async fn cleanup(&self) -> Result<CleanupResponse> {
-        let resp = self.req_in_domain(reqwest::Method::POST, "/api/v1/cleanup").send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::POST, "/api/v1/cleanup")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn delete(&self, id_or_name: &str) -> Result<DeleteResponse> {
         let body = serde_json::json!({"resource_id": id_or_name, "confirm": true});
-        let resp = self.req_in_domain(reqwest::Method::POST, "/api/v1/delete").json(&body).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::POST, "/api/v1/delete")
+            .json(&body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn list(&self) -> Result<ListResources> {
-        let resp = self.req_in_domain(reqwest::Method::GET, "/api/v1/list").send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::GET, "/api/v1/list")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     // Files
 
-    pub async fn file_put(&self, name: &str, body: Vec<u8>, opts: &FilePutOpts<'_>) -> Result<FileSummary> {
+    pub async fn file_put(
+        &self,
+        name: &str,
+        body: Vec<u8>,
+        opts: &FilePutOpts<'_>,
+    ) -> Result<FileSummary> {
         let url = format!("/api/v1/files/{}", urlencoding_simple(name));
         // Flags + K-of-N ride as query params (the body is the raw file).
         let mut qs: Vec<(String, String)> = Vec::new();
-        if self.domain != "default" { qs.push(("domain".into(), self.domain.clone())); }
-        if opts.mfa_required { qs.push(("mfa_required".into(), "true".into())); }
-        if opts.delete_on_read { qs.push(("delete_on_read".into(), "true".into())); }
-        if let Some(n) = opts.max_reads { qs.push(("max_reads".into(), n.to_string())); }
-        if opts.rotate_on_read { qs.push(("rotate_on_read".into(), "true".into())); }
-        if opts.preserve_on_cleanup { qs.push(("preserve_on_cleanup".into(), "true".into())); }
-        if opts.no_overwrite { qs.push(("no_overwrite".into(), "true".into())); }
-        if opts.overwrite { qs.push(("overwrite".into(), "true".into())); }
-        if let Some(k) = opts.quorum { qs.push(("quorum".into(), k.to_string())); }
-        if !opts.signatories.is_empty() { qs.push(("signatories".into(), opts.signatories.join(","))); }
-        if opts.external { qs.push(("external".into(), "true".into())); }
-        if let Some(m) = &opts.external_meta { qs.push(("meta".into(), m.clone())); }
-        if opts.resident { qs.push(("resident".into(), "true".into())); }
-        if let Some(kc) = &opts.key_component { qs.push(("key_component".into(), kc.clone())); }
-        if opts.server_copy { qs.push(("server_copy".into(), "true".into())); }
+        if self.domain != "default" {
+            qs.push(("domain".into(), self.domain.clone()));
+        }
+        if opts.mfa_required {
+            qs.push(("mfa_required".into(), "true".into()));
+        }
+        if opts.delete_on_read {
+            qs.push(("delete_on_read".into(), "true".into()));
+        }
+        if let Some(n) = opts.max_reads {
+            qs.push(("max_reads".into(), n.to_string()));
+        }
+        if opts.rotate_on_read {
+            qs.push(("rotate_on_read".into(), "true".into()));
+        }
+        if opts.preserve_on_cleanup {
+            qs.push(("preserve_on_cleanup".into(), "true".into()));
+        }
+        if opts.no_overwrite {
+            qs.push(("no_overwrite".into(), "true".into()));
+        }
+        if opts.overwrite {
+            qs.push(("overwrite".into(), "true".into()));
+        }
+        if let Some(k) = opts.quorum {
+            qs.push(("quorum".into(), k.to_string()));
+        }
+        if !opts.signatories.is_empty() {
+            qs.push(("signatories".into(), opts.signatories.join(",")));
+        }
+        if opts.external {
+            qs.push(("external".into(), "true".into()));
+        }
+        if let Some(m) = &opts.external_meta {
+            qs.push(("meta".into(), m.clone()));
+        }
+        if opts.resident {
+            qs.push(("resident".into(), "true".into()));
+        }
+        if let Some(kc) = &opts.key_component {
+            qs.push(("key_component".into(), kc.clone()));
+        }
+        if opts.server_copy {
+            qs.push(("server_copy".into(), "true".into()));
+        }
         let mut rb = self.req(reqwest::Method::PUT, &url).query(&qs).body(body);
-        if let Some(m) = opts.mime { rb = rb.header(reqwest::header::CONTENT_TYPE, m); }
+        if let Some(m) = opts.mime {
+            rb = rb.header(reqwest::header::CONTENT_TYPE, m);
+        }
         let resp = rb.send().await?;
         self.handle(resp).await
     }
@@ -1041,7 +1342,9 @@ impl BlackbookClient {
     /// Download a file (optionally presenting an approved K-of-N request id),
     /// returning the full [`FileDownload`] including the resident key component.
     pub async fn file_get_download(
-        &self, name: &str, request_id: Option<&str>,
+        &self,
+        name: &str,
+        request_id: Option<&str>,
     ) -> Result<FileDownload> {
         let url = format!("/api/v1/files/{}", urlencoding_simple(name));
         let mut rb = self.req_in_domain(reqwest::Method::GET, &url);
@@ -1054,38 +1357,67 @@ impl BlackbookClient {
 
     pub async fn file_delete(&self, name: &str) -> Result<serde_json::Value> {
         let url = format!("/api/v1/files/{}", urlencoding_simple(name));
-        let resp = self.req_in_domain(reqwest::Method::DELETE, &url).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::DELETE, &url)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn file_list(&self) -> Result<FileList> {
-        let resp = self.req_in_domain(reqwest::Method::GET, "/api/v1/files").send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::GET, "/api/v1/files")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn file_rotate(&self, name: &str) -> Result<serde_json::Value> {
         let url = format!("/api/v1/files/{}/rotate", urlencoding_simple(name));
-        let resp = self.req_in_domain(reqwest::Method::POST, &url).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::POST, &url)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     // Domains
 
-    pub async fn create_domain(&self, name: &str, description: Option<&str>) -> Result<serde_json::Value> {
+    pub async fn create_domain(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<serde_json::Value> {
         let body = serde_json::json!({"name": name, "description": description});
-        let resp = self.req(reqwest::Method::POST, "/api/v1/domains").json(&body).send().await?;
+        let resp = self
+            .req(reqwest::Method::POST, "/api/v1/domains")
+            .json(&body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn list_domains(&self) -> Result<DomainList> {
-        let resp = self.req(reqwest::Method::GET, "/api/v1/domains").send().await?;
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/domains")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
-    pub async fn add_domain_member(&self, domain: &str, client_name: &str, role: &str) -> Result<serde_json::Value> {
+    pub async fn add_domain_member(
+        &self,
+        domain: &str,
+        client_name: &str,
+        role: &str,
+    ) -> Result<serde_json::Value> {
         let body = serde_json::json!({"client_name": client_name, "role": role});
         let url = format!("/api/v1/domains/{}/members", urlencoding_simple(domain));
-        let resp = self.req(reqwest::Method::POST, &url).json(&body).send().await?;
+        let resp = self
+            .req(reqwest::Method::POST, &url)
+            .json(&body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
@@ -1095,29 +1427,57 @@ impl BlackbookClient {
         self.handle(resp).await
     }
 
-    pub async fn remove_domain_member(&self, domain: &str, client_name: &str) -> Result<serde_json::Value> {
-        let url = format!("/api/v1/domains/{}/members/{}", urlencoding_simple(domain), urlencoding_simple(client_name));
+    pub async fn remove_domain_member(
+        &self,
+        domain: &str,
+        client_name: &str,
+    ) -> Result<serde_json::Value> {
+        let url = format!(
+            "/api/v1/domains/{}/members/{}",
+            urlencoding_simple(domain),
+            urlencoding_simple(client_name)
+        );
         let resp = self.req(reqwest::Method::DELETE, &url).send().await?;
         self.handle(resp).await
     }
 
     // Clients / ACL / Audit
 
-    pub async fn create_client(&self, name: &str, role: &str, ttl_days: Option<i64>) -> Result<NewClient> {
+    pub async fn create_client(
+        &self,
+        name: &str,
+        role: &str,
+        ttl_days: Option<i64>,
+    ) -> Result<NewClient> {
         let body = serde_json::json!({"name": name, "role": role, "ttl_days": ttl_days});
-        let resp = self.req(reqwest::Method::POST, "/api/v1/clients").json(&body).send().await?;
+        let resp = self
+            .req(reqwest::Method::POST, "/api/v1/clients")
+            .json(&body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
-    pub async fn rotate_my_or_client(&self, name: &str, ttl_days: Option<i64>) -> Result<NewClient> {
+    pub async fn rotate_my_or_client(
+        &self,
+        name: &str,
+        ttl_days: Option<i64>,
+    ) -> Result<NewClient> {
         let url = format!("/api/v1/clients/{}/rotate", urlencoding_simple(name));
         let body = serde_json::json!({"ttl_days": ttl_days});
-        let resp = self.req(reqwest::Method::POST, &url).json(&body).send().await?;
+        let resp = self
+            .req(reqwest::Method::POST, &url)
+            .json(&body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn list_clients(&self) -> Result<ClientList> {
-        let resp = self.req(reqwest::Method::GET, "/api/v1/clients").send().await?;
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/clients")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
@@ -1127,7 +1487,12 @@ impl BlackbookClient {
         self.handle(resp).await
     }
 
-    pub async fn grant_acl(&self, pattern: &str, actions: &[&str], opts: GrantOpts) -> Result<serde_json::Value> {
+    pub async fn grant_acl(
+        &self,
+        pattern: &str,
+        actions: &[&str],
+        opts: GrantOpts,
+    ) -> Result<serde_json::Value> {
         let actions: Vec<String> = actions.iter().map(|s| (*s).to_string()).collect();
         let body = serde_json::json!({
             "client_name":     opts.client_name,
@@ -1142,7 +1507,11 @@ impl BlackbookClient {
             "rate_period_secs": opts.rate_period_secs,
             "schedule":        opts.schedule,
         });
-        let resp = self.req(reqwest::Method::POST, "/api/v1/acl").json(&body).send().await?;
+        let resp = self
+            .req(reqwest::Method::POST, "/api/v1/acl")
+            .json(&body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
@@ -1167,29 +1536,50 @@ impl BlackbookClient {
     /// raw JSON value: `{ok: true, verified_through: N}` or
     /// `{ok: false, verified_through: N, first_bad_id: M, reason: "…"}`.
     pub async fn audit_verify(&self) -> Result<serde_json::Value> {
-        let resp = self.req(reqwest::Method::GET, "/api/v1/audit/verify").send().await?;
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/audit/verify")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     /// Archive old audit rows to a compressed, encrypted, chain-verifiable file
     /// on the server's data volume. One of `keep_last`/`before` is required.
-    pub async fn audit_archive(&self, keep_last: Option<i64>, before: Option<&str>, prune: bool)
-        -> Result<serde_json::Value> {
+    pub async fn audit_archive(
+        &self,
+        keep_last: Option<i64>,
+        before: Option<&str>,
+        prune: bool,
+    ) -> Result<serde_json::Value> {
         let mut qs: Vec<(String, String)> = vec![("prune".into(), prune.to_string())];
-        if let Some(k) = keep_last { qs.push(("keep_last".into(), k.to_string())); }
-        if let Some(b) = before { qs.push(("before".into(), b.to_string())); }
-        let resp = self.req(reqwest::Method::POST, "/api/v1/audit/archive").query(&qs).send().await?;
+        if let Some(k) = keep_last {
+            qs.push(("keep_last".into(), k.to_string()));
+        }
+        if let Some(b) = before {
+            qs.push(("before".into(), b.to_string()));
+        }
+        let resp = self
+            .req(reqwest::Method::POST, "/api/v1/audit/archive")
+            .query(&qs)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn audit_archive_verify(&self, file: &str) -> Result<serde_json::Value> {
-        let url = format!("/api/v1/audit/archive/verify?file={}", urlencoding_simple(file));
+        let url = format!(
+            "/api/v1/audit/archive/verify?file={}",
+            urlencoding_simple(file)
+        );
         let resp = self.req(reqwest::Method::GET, &url).send().await?;
         self.handle(resp).await
     }
 
     pub async fn audit_archives(&self) -> Result<serde_json::Value> {
-        let resp = self.req(reqwest::Method::GET, "/api/v1/audit/archives").send().await?;
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/audit/archives")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
@@ -1197,51 +1587,83 @@ impl BlackbookClient {
 
     /// Create a managed key; `import_b64` imports existing material (BYOK).
     pub async fn key_create(
-        &self, name: &str, key_type: &str, mfa_required: bool, import_b64: Option<&str>,
+        &self,
+        name: &str,
+        key_type: &str,
+        mfa_required: bool,
+        import_b64: Option<&str>,
     ) -> Result<KeySummary> {
         let body = serde_json::json!({
             "name": name, "key_type": key_type, "mfa_required": mfa_required,
             "import_material": import_b64,
         });
-        let resp = self.req_in_domain(reqwest::Method::POST, "/api/v1/keys").json(&body).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::POST, "/api/v1/keys")
+            .json(&body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn key_list(&self) -> Result<KeyList> {
-        let resp = self.req_in_domain(reqwest::Method::GET, "/api/v1/keys").send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::GET, "/api/v1/keys")
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn key_show(&self, name: &str) -> Result<KeySummary> {
         let url = format!("/api/v1/keys/{}", urlencoding_simple(name));
-        let resp = self.req_in_domain(reqwest::Method::GET, &url).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::GET, &url)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn key_jwks(&self, name: &str) -> Result<serde_json::Value> {
         let url = format!("/api/v1/keys/{}/jwks", urlencoding_simple(name));
-        let resp = self.req_in_domain(reqwest::Method::GET, &url).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::GET, &url)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn key_rotate(&self, name: &str) -> Result<KeySummary> {
         let url = format!("/api/v1/keys/{}/rotate", urlencoding_simple(name));
-        let resp = self.req_in_domain(reqwest::Method::POST, &url).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::POST, &url)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     pub async fn key_delete(&self, name: &str) -> Result<serde_json::Value> {
         let url = format!("/api/v1/keys/{}", urlencoding_simple(name));
-        let resp = self.req_in_domain(reqwest::Method::DELETE, &url).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::DELETE, &url)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 
     /// Run an operation on a managed key: `op` is `encrypt`, `decrypt`,
     /// `datakey`, `sign`, `hmac`, `verify`, `token` or `token/verify`, and
     /// `body` is that endpoint's JSON request (binary fields base64).
-    pub async fn key_op(&self, name: &str, op: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+    pub async fn key_op(
+        &self,
+        name: &str,
+        op: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let url = format!("/api/v1/keys/{}/{op}", urlencoding_simple(name));
-        let resp = self.req_in_domain(reqwest::Method::POST, &url).json(body).send().await?;
+        let resp = self
+            .req_in_domain(reqwest::Method::POST, &url)
+            .json(body)
+            .send()
+            .await?;
         self.handle(resp).await
     }
 }
@@ -1272,7 +1694,10 @@ pub struct KeySummary {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct KeyList { pub keys: Vec<KeySummary>, pub count: usize }
+pub struct KeyList {
+    pub keys: Vec<KeySummary>,
+    pub count: usize,
+}
 
 /// The TLS policy for every connection to a Blackbook server, REST calls and
 /// the tunnel WebSocket alike:
@@ -1285,23 +1710,32 @@ pub struct KeyList { pub keys: Vec<KeySummary>, pub count: usize }
 ///   CA. No public roots are trusted.
 /// - The profile's mTLS client identity, if it has one. The private key's DER
 ///   copy is wiped as soon as aws-lc has loaded it.
-fn tls_config(ca_pem: &str, cert_pem: Option<&str>, key_pem: Option<&str>) -> Result<rustls::ClientConfig> {
+fn tls_config(
+    ca_pem: &str,
+    cert_pem: Option<&str>,
+    key_pem: Option<&str>,
+) -> Result<rustls::ClientConfig> {
     use rustls::crypto::aws_lc_rs;
     use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
     use rustls::sign::{CertifiedKey, SingleCertAndKey};
     use std::sync::Arc;
 
-    let bad = |what: &str, e: &dyn std::fmt::Display| ClientError::TlsConfig(format!("{what}: {e}"));
+    let bad =
+        |what: &str, e: &dyn std::fmt::Display| ClientError::TlsConfig(format!("{what}: {e}"));
 
     let mut provider = aws_lc_rs::default_provider();
     provider.kx_groups = vec![aws_lc_rs::kx_group::X25519MLKEM768];
 
     let mut roots = rustls::RootCertStore::empty();
     for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
-        roots.add(cert.map_err(|e| bad("ca cert", &e))?).map_err(|e| bad("ca cert", &e))?;
+        roots
+            .add(cert.map_err(|e| bad("ca cert", &e))?)
+            .map_err(|e| bad("ca cert", &e))?;
     }
     if roots.is_empty() {
-        return Err(ClientError::TlsConfig("ca cert: no certificate in the profile's CA PEM".into()));
+        return Err(ClientError::TlsConfig(
+            "ca cert: no certificate in the profile's CA PEM".into(),
+        ));
     }
 
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -1313,12 +1747,14 @@ fn tls_config(ca_pem: &str, cert_pem: Option<&str>, key_pem: Option<&str>) -> Re
             let chain = CertificateDer::pem_slice_iter(cert.as_bytes())
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|e| bad("client cert", &e))?;
-            let mut key = PrivateKeyDer::from_pem_slice(key.as_bytes())
-                .map_err(|e| bad("client key", &e))?;
+            let mut key =
+                PrivateKeyDer::from_pem_slice(key.as_bytes()).map_err(|e| bad("client key", &e))?;
             let signer = aws_lc_rs::sign::any_supported_type(&key);
             key.zeroize();
             let identity = CertifiedKey::new(chain, signer.map_err(|e| bad("client key", &e))?);
-            identity.keys_match().map_err(|e| bad("client identity", &e))?;
+            identity
+                .keys_match()
+                .map_err(|e| bad("client identity", &e))?;
             builder.with_client_cert_resolver(Arc::new(SingleCertAndKey::from(identity)))
         }
         _ => builder.with_no_client_auth(),
@@ -1347,17 +1783,26 @@ fn redirect_loopback(server: &str, alias: Option<&str>) -> String {
     let Some(alias) = alias.map(str::trim).filter(|a| !a.is_empty()) else {
         return server.to_string();
     };
-    let Ok(mut url) = reqwest::Url::parse(server) else { return server.to_string() };
+    let Ok(mut url) = reqwest::Url::parse(server) else {
+        return server.to_string();
+    };
     let loopback = match url.host_str() {
         Some("localhost") => true,
-        Some(host) => host.trim_start_matches('[').trim_end_matches(']')
-            .parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()),
+        Some(host) => host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
         None => false,
     };
     if !loopback {
         return server.to_string();
     }
-    let alias_url = if alias.contains("://") { alias.to_string() } else { format!("https://{alias}") };
+    let alias_url = if alias.contains("://") {
+        alias.to_string()
+    } else {
+        format!("https://{alias}")
+    };
     let target = match reqwest::Url::parse(&alias_url) {
         Ok(t) if t.host_str().is_some() => t,
         _ => {
@@ -1405,15 +1850,23 @@ mod tests {
         let provider = Arc::new(provider);
         let leaf = issue_server_cert(ca, &["localhost".into()]).unwrap();
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).unwrap()).unwrap();
+        roots
+            .add(CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).unwrap())
+            .unwrap();
         let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(roots), provider.clone()).build().unwrap();
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
         let config = rustls::ServerConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions().unwrap()
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_client_cert_verifier(verifier)
             .with_single_cert(
                 vec![CertificateDer::from_pem_slice(leaf.cert_pem.as_bytes()).unwrap()],
-                PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).unwrap())
+                PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).unwrap(),
+            )
             .unwrap();
         rustls::ServerConnection::new(Arc::new(config)).unwrap()
     }
@@ -1424,18 +1877,29 @@ mod tests {
     }
 
     /// Run the handshake in memory; the first side to fail returns its error.
-    fn handshake(c: &mut rustls::ClientConnection, s: &mut rustls::ServerConnection) -> Result<(), rustls::Error> {
+    fn handshake(
+        c: &mut rustls::ClientConnection,
+        s: &mut rustls::ServerConnection,
+    ) -> Result<(), rustls::Error> {
         let mut buf = Vec::new();
         for _ in 0..10 {
-            if !c.is_handshaking() && !s.is_handshaking() { return Ok(()); }
+            if !c.is_handshaking() && !s.is_handshaking() {
+                return Ok(());
+            }
             buf.clear();
             c.write_tls(&mut buf).unwrap();
             let mut rd = buf.as_slice();
-            while !rd.is_empty() { s.read_tls(&mut rd).unwrap(); s.process_new_packets()?; }
+            while !rd.is_empty() {
+                s.read_tls(&mut rd).unwrap();
+                s.process_new_packets()?;
+            }
             buf.clear();
             s.write_tls(&mut buf).unwrap();
             let mut rd = buf.as_slice();
-            while !rd.is_empty() { c.read_tls(&mut rd).unwrap(); c.process_new_packets()?; }
+            while !rd.is_empty() {
+                c.read_tls(&mut rd).unwrap();
+                c.process_new_packets()?;
+            }
         }
         panic!("handshake did not finish");
     }
@@ -1444,18 +1908,32 @@ mod tests {
     fn tls_negotiates_hybrid_pq_with_client_identity() {
         let ca = Ca::generate().unwrap();
         let alice = issue_client_cert(&ca, "alice", 1).unwrap();
-        let (mut c, mut s) = (client(&ca.cert_pem, &alice), server(&ca, aws_lc_rs::ALL_KX_GROUPS.to_vec()));
+        let (mut c, mut s) = (
+            client(&ca.cert_pem, &alice),
+            server(&ca, aws_lc_rs::ALL_KX_GROUPS.to_vec()),
+        );
         handshake(&mut c, &mut s).unwrap();
-        assert_eq!(c.negotiated_key_exchange_group().map(|g| g.name()), Some(rustls::NamedGroup::X25519MLKEM768));
+        assert_eq!(
+            c.negotiated_key_exchange_group().map(|g| g.name()),
+            Some(rustls::NamedGroup::X25519MLKEM768)
+        );
         assert_eq!(c.protocol_version(), Some(rustls::ProtocolVersion::TLSv1_3));
-        assert_eq!(s.peer_certificates().map(<[_]>::len), Some(1), "client cert presented");
+        assert_eq!(
+            s.peer_certificates().map(<[_]>::len),
+            Some(1),
+            "client cert presented"
+        );
     }
 
     #[test]
     fn tls_refuses_classical_only_server() {
         let ca = Ca::generate().unwrap();
         let alice = issue_client_cert(&ca, "alice", 1).unwrap();
-        let classical = vec![aws_lc_rs::kx_group::X25519, aws_lc_rs::kx_group::SECP256R1, aws_lc_rs::kx_group::SECP384R1];
+        let classical = vec![
+            aws_lc_rs::kx_group::X25519,
+            aws_lc_rs::kx_group::SECP256R1,
+            aws_lc_rs::kx_group::SECP384R1,
+        ];
         let (mut c, mut s) = (client(&ca.cert_pem, &alice), server(&ca, classical));
         assert!(handshake(&mut c, &mut s).is_err());
     }
@@ -1466,7 +1944,10 @@ mod tests {
     async fn classical_only_server_error_explains_why() {
         let ca = Ca::generate().unwrap();
         let alice = issue_client_cert(&ca, "alice", 1).unwrap();
-        let mut s = server(&ca, vec![aws_lc_rs::kx_group::X25519, aws_lc_rs::kx_group::SECP256R1]);
+        let mut s = server(
+            &ca,
+            vec![aws_lc_rs::kx_group::X25519, aws_lc_rs::kx_group::SECP256R1],
+        );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let srv = std::thread::spawn(move || {
@@ -1474,38 +1955,73 @@ mod tests {
             assert!(s.complete_io(&mut sock).is_err());
         });
         let session = Session {
-            server: format!("https://localhost:{port}"), token: Some("t".into()),
-            cert_pem: Some(alice.cert_pem.clone()), key_pem: Some(alice.key_pem.clone()),
-            ca_pem: Some(ca.cert_pem.clone()), cmk: None,
+            server: format!("https://localhost:{port}"),
+            token: Some("t".into()),
+            cert_pem: Some(alice.cert_pem.clone()),
+            key_pem: Some(alice.key_pem.clone()),
+            ca_pem: Some(ca.cert_pem.clone()),
+            cmk: None,
         };
-        let err = BlackbookClient::from_session(&session).unwrap().health().await.unwrap_err().to_string();
+        let err = BlackbookClient::from_session(&session)
+            .unwrap()
+            .health()
+            .await
+            .unwrap_err()
+            .to_string();
         srv.join().unwrap();
-        assert!(err.contains("HandshakeFailure") && err.contains("X25519MLKEM768"), "{err}");
+        assert!(
+            err.contains("HandshakeFailure") && err.contains("X25519MLKEM768"),
+            "{err}"
+        );
     }
 
     #[test]
     fn tls_refuses_server_from_another_ca() {
         let (ca, other) = (Ca::generate().unwrap(), Ca::generate().unwrap());
         let alice = issue_client_cert(&ca, "alice", 1).unwrap();
-        let (mut c, mut s) = (client(&other.cert_pem, &alice), server(&ca, aws_lc_rs::ALL_KX_GROUPS.to_vec()));
+        let (mut c, mut s) = (
+            client(&other.cert_pem, &alice),
+            server(&ca, aws_lc_rs::ALL_KX_GROUPS.to_vec()),
+        );
         let err = handshake(&mut c, &mut s).unwrap_err();
-        assert!(matches!(err, rustls::Error::InvalidCertificate(_)), "{err:?}");
+        assert!(
+            matches!(err, rustls::Error::InvalidCertificate(_)),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn tls_config_policy_and_bad_material() {
         let ca = Ca::generate().unwrap();
-        let (alice, bob) = (issue_client_cert(&ca, "alice", 1).unwrap(), issue_client_cert(&ca, "bob", 1).unwrap());
+        let (alice, bob) = (
+            issue_client_cert(&ca, "alice", 1).unwrap(),
+            issue_client_cert(&ca, "bob", 1).unwrap(),
+        );
         let cfg = tls_config(&ca.cert_pem, None, None).unwrap();
-        let groups: Vec<_> = cfg.crypto_provider().kx_groups.iter().map(|g| g.name()).collect();
+        let groups: Vec<_> = cfg
+            .crypto_provider()
+            .kx_groups
+            .iter()
+            .map(|g| g.name())
+            .collect();
         assert_eq!(groups, [rustls::NamedGroup::X25519MLKEM768]);
         assert_eq!(cfg.alpn_protocols, [b"http/1.1".to_vec()]);
         assert!(!cfg.client_auth_cert_resolver.has_certs());
-        assert!(tls_config(&ca.cert_pem, Some(&alice.cert_pem), Some(&alice.key_pem)).unwrap()
-            .client_auth_cert_resolver.has_certs());
+        assert!(
+            tls_config(&ca.cert_pem, Some(&alice.cert_pem), Some(&alice.key_pem))
+                .unwrap()
+                .client_auth_cert_resolver
+                .has_certs()
+        );
         assert!(tls_config("not a pem", None, None).is_err(), "no CA");
-        assert!(tls_config(&ca.cert_pem, Some(&alice.cert_pem), Some(&bob.key_pem)).is_err(), "key mismatch");
-        assert!(tls_config(&ca.cert_pem, Some(&alice.cert_pem), Some("junk")).is_err(), "bad key");
+        assert!(
+            tls_config(&ca.cert_pem, Some(&alice.cert_pem), Some(&bob.key_pem)).is_err(),
+            "key mismatch"
+        );
+        assert!(
+            tls_config(&ca.cert_pem, Some(&alice.cert_pem), Some("junk")).is_err(),
+            "bad key"
+        );
     }
 
     #[test]
@@ -1513,9 +2029,12 @@ mod tests {
         let ca = Ca::generate().unwrap();
         let alice = issue_client_cert(&ca, "alice", 1).unwrap();
         let mut session = Session {
-            server: "https://127.0.0.1:8443".into(), token: Some("t".into()),
-            cert_pem: Some(alice.cert_pem.clone()), key_pem: Some(alice.key_pem.clone()),
-            ca_pem: None, cmk: None,
+            server: "https://127.0.0.1:8443".into(),
+            token: Some("t".into()),
+            cert_pem: Some(alice.cert_pem.clone()),
+            key_pem: Some(alice.key_pem.clone()),
+            ca_pem: None,
+            cmk: None,
         };
         assert!(BlackbookClient::from_session(&session).is_err());
         session.ca_pem = Some(ca.cert_pem.clone());
@@ -1526,22 +2045,53 @@ mod tests {
     fn loopback_redirect() {
         let alias = Some("blackbook-app:8443");
         // Unset or empty alias: unchanged (minus a trailing slash).
-        assert_eq!(redirect_loopback("https://127.0.0.1:8443/", None), "https://127.0.0.1:8443");
-        assert_eq!(redirect_loopback("https://127.0.0.1:8443", Some(" ")), "https://127.0.0.1:8443");
+        assert_eq!(
+            redirect_loopback("https://127.0.0.1:8443/", None),
+            "https://127.0.0.1:8443"
+        );
+        assert_eq!(
+            redirect_loopback("https://127.0.0.1:8443", Some(" ")),
+            "https://127.0.0.1:8443"
+        );
         // Every loopback spelling is redirected.
-        for s in ["https://127.0.0.1:8443", "https://127.0.0.2:8443", "https://localhost:8443", "https://[::1]:8443"] {
-            assert_eq!(redirect_loopback(s, alias), "https://blackbook-app:8443", "{s}");
+        for s in [
+            "https://127.0.0.1:8443",
+            "https://127.0.0.2:8443",
+            "https://localhost:8443",
+            "https://[::1]:8443",
+        ] {
+            assert_eq!(
+                redirect_loopback(s, alias),
+                "https://blackbook-app:8443",
+                "{s}"
+            );
         }
         // Anything else is left alone.
-        for s in ["https://vault.example.com:8443", "https://10.0.0.5:8443", "https://blackbook-app:8443"] {
+        for s in [
+            "https://vault.example.com:8443",
+            "https://10.0.0.5:8443",
+            "https://blackbook-app:8443",
+        ] {
             assert_eq!(redirect_loopback(s, alias), s);
         }
         // No port in the alias keeps the profile's; a path prefix survives;
         // a full URL works as the alias too.
-        assert_eq!(redirect_loopback("https://localhost:9443", Some("bb")), "https://bb:9443");
-        assert_eq!(redirect_loopback("https://127.0.0.1:8443/bb", alias), "https://blackbook-app:8443/bb");
-        assert_eq!(redirect_loopback("https://127.0.0.1:8443", Some("https://bb:1234")), "https://bb:1234");
+        assert_eq!(
+            redirect_loopback("https://localhost:9443", Some("bb")),
+            "https://bb:9443"
+        );
+        assert_eq!(
+            redirect_loopback("https://127.0.0.1:8443/bb", alias),
+            "https://blackbook-app:8443/bb"
+        );
+        assert_eq!(
+            redirect_loopback("https://127.0.0.1:8443", Some("https://bb:1234")),
+            "https://bb:1234"
+        );
         // A malformed alias is ignored rather than breaking the connection.
-        assert_eq!(redirect_loopback("https://127.0.0.1:8443", Some("bad host:x")), "https://127.0.0.1:8443");
+        assert_eq!(
+            redirect_loopback("https://127.0.0.1:8443", Some("bad host:x")),
+            "https://127.0.0.1:8443"
+        );
     }
 }
