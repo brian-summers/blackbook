@@ -125,3 +125,11 @@ useless_format = "allow"
 useless_vec = "allow"
 while_let_loop = "allow"
 
+
+# Optimise dependencies (not blackbook itself) in debug and test builds. The
+# KDFs (Argon2id, scrypt, PBKDF2) are slow on purpose, and unoptimised they
+# made the test suite take 4-6 minutes instead of about 5 seconds. That was
+# long enough for GitHub to drop an SSH push while the pre-push hook ran.
+# Debug assertions and overflow checks stay on; only code generation changes.
+[profile.dev.package."*"]
+opt-level = 2
