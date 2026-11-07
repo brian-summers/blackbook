@@ -223,10 +223,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.manifest.outputs.digest }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $GITHUB_REF_NAME already exists; leaving it as is"
-            exit 0
-          fi
           {
             echo "## Container image"
             echo
@@ -243,6 +239,29 @@ jobs:
             echo "gh attestation verify oci://$IMAGE:$VERSION --repo $GITHUB_REPOSITORY"
             echo '```'
           } > "$RUNNER_TEMP/notes.md"
-          flags=(--verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes)
-          if [ "$PRERELEASE" = true ]; then flags+=(--prerelease); fi
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${flags[@]}"
+          # The release's flag follows the tag, as the image tags do: a
+          # prerelease never moves latest, and a release always does.
+          if [ "$PRERELEASE" = true ]; then
+            state=(--prerelease)
+          else
+            state=(--prerelease=false --latest)
+          fi
+
+          if ! existing=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null); then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${state[@]}" \
+              --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes
+            exit 0
+          fi
+
+          # The release was created by hand, usually by publishing it in the
+          # web UI, which creates the tag too. Keep its notes, put the image
+          # section above them (once, so a re-run doesn't repeat it), set the
+          # flag, and publish it if it's still a draft: approving the release
+          # environment was the decision to publish.
+          state+=(--draft=false)
+          if ! grep -q '^## Container image' <<< "$existing"; then
+            { cat "$RUNNER_TEMP/notes.md"; echo; printf '%s\n' "$existing"; } > "$RUNNER_TEMP/merged.md"
+            state+=(--notes-file "$RUNNER_TEMP/merged.md")
+          fi
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" "${state[@]}"
+          echo "::notice::release $GITHUB_REF_NAME already existed, so it was updated instead of created"

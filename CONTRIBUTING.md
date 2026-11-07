@@ -144,6 +144,10 @@ Only repository admins can create, move or delete `v*` tags.
    git push origin v0.4.0
    ```
 
+   Push the tag rather than publishing a release in the web UI. Publishing
+   there creates a plain, unsigned tag, and the workflow then works from
+   that release instead of writing its own.
+
 The workflow refuses a tag that doesn't match `Cargo.toml` or isn't on `main`.
 It then:
 1. runs the full CI suite on the tagged commit;
@@ -155,9 +159,14 @@ It then:
    that's configured. The tags are `X.Y.Z`, `vX.Y.Z`, `X.Y`, `X` (from 1.0
    on) and `latest`. It also attaches an SBOM and a signed build-provenance
    attestation;
-5. creates the GitHub release.
+5. creates the GitHub release, with the pull commands, the digest and the
+   attestation check above GitHub's generated notes. If the release already
+   exists, it adds that section to the existing notes, and publishes the
+   release if it's a draft.
 
-A tag like `v0.4.0-rc.1` publishes a prerelease. It doesn't move `latest`.
+A tag like `v0.4.0-rc.1` publishes a prerelease: it doesn't move `latest`,
+and the GitHub release is marked *Pre-release*. Any other tag moves `latest`
+on both registries and marks the release *Latest*.
 
 Repository settings this relies on (configured for brian-summers/blackbook; a
 fork needs its own):
