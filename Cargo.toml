@@ -28,7 +28,7 @@ tokio = { version = "1.35", features = ["full"] }
 # the CLI's HTTPS client below.
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "postgres", "chrono", "json"] }
 zeroize = "1.6"
-scrypt = "0.11.0"
+scrypt = "0.12.0"
 # Argon2id for the password paths only (credential-bundle unlock + explicit
 # external passphrase). Deliberately separate from the server's per-message
 # scrypt, which keys off high-entropy material and must stay fast.
