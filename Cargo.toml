@@ -85,7 +85,7 @@ base32 = "0.4"
 # side upgrades the existing mTLS reqwest client to a WebSocket via
 # reqwest-websocket, so the tunnel reuses the same cert + pinned CA as the REST
 # API (no separate TLS config needed).
-hkdf = "0.12"
+hkdf = "0.13"
 # Real HMAC (RFC 2104) over SHA-2/SHA-3 for the user-facing crypto toolkit:
 # keyed hashes, managed `hmac` keys, and HS256 tokens. Already in the tree via
 # hkdf/pbkdf2; listed directly because crypto_ops uses it.
