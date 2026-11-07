@@ -174,9 +174,11 @@ jobs:
           flavor: latest=false
           # 1.2.3 and 1.2 for a release (no 1 while the major version is 0),
           # latest for the newest non-prerelease. A prerelease gets only its
-          # own version tag.
+          # own version tag. v1.2.3 too: the releases published before this
+          # workflow used v-prefixed tags, and existing pins still refer to them.
           tags: |
             type=semver,pattern={{version}}
+            type=semver,pattern={{version}},prefix=v
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}},enable=${{ !startsWith(github.ref_name, 'v0.') }}
             type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease == 'false' }}

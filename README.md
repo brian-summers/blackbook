@@ -200,7 +200,7 @@ curl -fsSL https://raw.githubusercontent.com/brian-summers/blackbook/main/script
 foreach ($f in 'bbk.ps1', 'bbk.cmd') { Invoke-WebRequest "https://raw.githubusercontent.com/brian-summers/blackbook/main/scripts/$f" -OutFile "$HOME\bin\$f" }
 ```
 
-With no local server, the first run pulls `briansummers/blackbook:latest` from Docker Hub. The image is built for `linux/amd64`; Docker Desktop on Apple silicon runs it under emulation.
+With no local server, the first run pulls `briansummers/blackbook:latest` from Docker Hub. From v0.4.0 the image is built for `linux/amd64` and `linux/arm64`, so Apple silicon and ARM servers run it natively.
 
 ### What it does for you
 
