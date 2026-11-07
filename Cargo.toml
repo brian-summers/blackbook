@@ -91,7 +91,7 @@ hkdf = "0.12"
 # hkdf/pbkdf2; listed directly because crypto_ops uses it.
 hmac = "0.12"
 actix-ws = "0.3"
-reqwest-websocket = "0.4"
+reqwest-websocket = "0.6"
 # gzip for audit-log archives: old rows are exported to a compressed, encrypted,
 # hash-chain-verifiable file on the data volume so the live chain stays bounded.
 flate2 = "1"
