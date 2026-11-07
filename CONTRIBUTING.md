@@ -94,7 +94,14 @@ merge only when:
 - the branch is up to date with `main`.
 
 Merges are squash or rebase, so history stays linear. Force-pushing `main` and
-deleting it are blocked for everyone.
+deleting it are blocked.
+
+These rules have no bypass, so they bind admins too, and the merge button
+offers no way around a red check. CodeQL usually finishes a few minutes after
+**CI result**, and the PR can't merge until it does; `gh pr merge --auto`
+waits for it. If GitHub itself breaks a required check, an admin can add a
+bypass to the `main` ruleset temporarily (*Settings → Rules*), and should
+remove it again afterwards.
 
 ```bash
 git switch -c my-change
