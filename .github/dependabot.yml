@@ -18,6 +18,13 @@ updates:
     groups:
       cargo-minor-and-patch:
         update-types: [minor, patch]
+      # Breaking updates. Dependabot opened pre-1.0 bumps such as hkdf 0.12 ->
+      # 0.13 as major, one PR per crate, and each failed CI on its own: the
+      # RustCrypto crates (aes-gcm, hkdf, sha3, scrypt, pbkdf2...) share trait
+      # crates and only build when they move together. One PR collects every
+      # major bump; it stays red until the migration is done on its branch.
+      cargo-major:
+        update-types: [major]
     open-pull-requests-limit: 10
 
   - package-ecosystem: github-actions
