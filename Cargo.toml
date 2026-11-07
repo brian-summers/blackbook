@@ -78,7 +78,7 @@ time = "0.3"
 mime_guess = "2"
 # TOTP — RFC 6238. Pinned to SHA1 in code so it works with stock authenticator
 # apps; the secret bytes themselves are encrypted at rest under the master.
-totp-rs = { version = "5", features = ["otpauth"] }
+totp-rs = { version = "6", features = ["otpauth"] }
 base32 = "0.4"
 # Tunnel feature: HKDF-SHA256 to derive directional session keys from the
 # X25519 shared secret; actix-ws for the relay's WebSocket endpoints. The client
