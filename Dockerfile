@@ -45,7 +45,7 @@ LABEL org.opencontainers.image.title="Blackbook" \
 # statically and the app talks to Postgres through sqlx, so libssl and the
 # Postgres client tools would only add attack surface (and CVEs to patch).
 # hadolint ignore=DL3008
-RUN apt-get update \
+RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
