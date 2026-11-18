@@ -7,7 +7,7 @@
 # Stage 1: build. The Rust version matches rust-toolchain.toml (CI checks), and
 # the builder and runtime are both Debian trixie, so the binary links against
 # the glibc the runtime has.
-FROM rust:1.99.1-trixie@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07 AS builder
+FROM rust:1.100.0-trixie@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31 AS builder
 
 # A failure anywhere in a pipeline fails the step.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -16,22 +16,29 @@ WORKDIR /build
 
 # Build the dependencies on their own first: this layer depends only on
 # Cargo.toml and Cargo.lock, so a change to src/ doesn't recompile the ~400
-# crates under it. The placeholder main.rs and everything built from it are
-# deleted before the real sources arrive. Deleting the fingerprint is what
-# makes cargo rebuild the crate, since COPY keeps the sources' (older) mtimes.
+# crates under it. The placeholder uses none of them, so cargo's
+# unused_dependencies lint warns about each one here; that's expected.
+#
+# The placeholder main.rs and everything built from it are removed before the
+# real sources arrive. Removing its fingerprint is what makes cargo rebuild
+# the crate, since COPY keeps the sources' (older) mtimes. `cargo clean -p`
+# finds the files wherever this cargo keeps them: deleting paths by hand broke
+# when Rust 1.100 moved them from target/release/{deps,.fingerprint} to
+# target/release/build/blackbook/.
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src \
     && echo 'fn main() {}' > src/main.rs \
     && cargo build --release --locked \
-    && rm -rf src target/release/bbk target/release/bbk.d \
-              target/release/deps/bbk-* target/release/.fingerprint/blackbook-*
+    && cargo clean --release --locked -p blackbook \
+    && rm -rf src
 
 # Only the sources: nothing else in the build context (credential bundles,
 # secrets/, .env) can reach a layer, whatever .dockerignore says. The version
 # check fails the build if the placeholder binary survived (it prints nothing).
 COPY src ./src
 RUN cargo build --release --locked \
-    && ./target/release/bbk --version | grep -q '^bbk '
+    && { ./target/release/bbk --version | grep -q '^bbk ' \
+         || { echo "error: target/release/bbk is the placeholder: cargo didn't rebuild it from src/" >&2; exit 1; }; }
 
 # Stage 2: runtime.
 FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
