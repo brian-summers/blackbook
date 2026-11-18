@@ -25,6 +25,14 @@ ignore = [
     # in h2 0.4, which actix-http 3 doesn't use. Remedy: serve HTTP/1.1 only, or
     # move to an actix-http release on h2 0.4.
     { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via actix-http; no 0.3 fix; see comment" },
+    # chrono (direct, and through sqlx's chrono feature for the TIMESTAMP
+    # columns) is listed as unmaintained (chronotope/chrono#1768). No known
+    # vulnerability, and no release that clears it. Remedy: move to `time`,
+    # already a direct dependency, which sqlx 0.8 also maps. The audit chain
+    # hashes timestamps as integer microseconds, so old rows still verify, but
+    # the RFC 3339 strings the API returns and the TIMESTAMP round trip must
+    # not change: migrate with tests that pin both. Look again before v0.5.0.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, no fix; migrate to time, see comment" },
 ]
 
 [licenses]
