@@ -20,6 +20,7 @@ use crate::blackbook_core::{
     aead_open, aead_seal, decrypt_aes_gcm, encrypt_aes_gcm, AclAction, BlackbookKey, Id,
 };
 use crate::keys_api;
+use crate::share_api;
 use crate::tls::SharedCa;
 use sqlx::types::Json as SqlxJson;
 
@@ -52,6 +53,11 @@ pub struct StoreRequest {
     /// the client.
     #[serde(default)]
     pub external: Option<String>,
+    /// For an external envelope sealed under the client's master key: the id
+    /// of its data key ([`crate::share_crypto::key_id`]), which names it in
+    /// key shares. Ignored for any other value.
+    #[serde(default)]
+    pub key_id: Option<String>,
 }
 
 /// K-of-N approval policy attached to a resource.
@@ -89,6 +95,10 @@ pub struct StoreResponse {
     pub created_at: String,
     pub encryption_method: String,
     pub status: String,
+    /// Key-share requests the storing client should fulfil now: clients that
+    /// held the item's previous key and are asked for the new one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub share_requests: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -110,6 +120,10 @@ pub struct RetrieveResponse {
     pub external: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub envelope: Option<String>,
+    /// For an envelope sealed under a client master key: its data key's id,
+    /// so a client holding a shared key can tell whether it's the right one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -303,6 +317,10 @@ pub struct FileSummary {
     pub threshold_k: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signatory_count: Option<usize>,
+    /// On upload: key-share requests the uploading client should fulfil now
+    /// (see [`StoreResponse::share_requests`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub share_requests: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +536,10 @@ pub struct FilePolicyQuery {
     /// Keep an encrypted backup copy of the client ciphertext server-side.
     #[serde(default)]
     pub server_copy: Option<bool>,
+    /// For an external file whose meta is sealed under the client's master
+    /// key: its data key's id (see [`StoreRequest::key_id`]).
+    #[serde(default)]
+    pub key_id: Option<String>,
 }
 
 impl FilePolicyQuery {
@@ -951,13 +973,22 @@ pub async fn store_data(
     } else {
         "AES-256-GCM (2-layer)"
     };
+    // Key sharing (share_api.rs): the client that sealed an external secret
+    // is the only one holding its data key, and the key's id names it in
+    // shares. Only an envelope sealed under the client's CMK gets an id.
+    let sealed_by: Option<&str> = is_external.then_some(client.id.as_str());
+    let key_id = match share_api::stored_key_id(external_blob.as_deref(), req.key_id.as_deref()) {
+        Ok(k) => k,
+        Err(msg) => return Ok(err(StatusCode::BAD_REQUEST, "validation_error", msg)),
+    };
 
     let now = chrono::Utc::now();
-    let response = if let Some((existing_id, _)) = existed {
+    let mut response = if let Some((existing_id, _)) = existed {
         sqlx::query(
             "UPDATE blackbook_secrets
              SET data_layer1 = $1, data_layer2 = $2, wrapped_key = $3,
-                 is_external = $4, external_envelope = $5, encryption_method = $6, updated_at = $7
+                 is_external = $4, external_envelope = $5, encryption_method = $6, updated_at = $7,
+                 sealed_by = $9, key_id = $10
              WHERE resource_id = $8",
         )
         .bind(&layer1)
@@ -968,6 +999,8 @@ pub async fn store_data(
         .bind(enc_method)
         .bind(now)
         .bind(&existing_id)
+        .bind(sealed_by)
+        .bind(&key_id)
         .execute(&state.db)
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -977,6 +1010,7 @@ pub async fn store_data(
             created_at: now.to_rfc3339(),
             encryption_method: enc_method.into(),
             status: "updated".into(),
+            share_requests: Vec::new(),
         }
     } else {
         let new_id = Id::new(32).to_hex();
@@ -1035,8 +1069,9 @@ pub async fn store_data(
             "INSERT INTO blackbook_secrets
              (resource_id, resource_name_enc, name_id, data_layer1, data_layer2, wrapped_key,
               is_external, external_envelope,
-              created_at, updated_at, encryption_method, domain_id, flags, access_policy)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+              created_at, updated_at, encryption_method, domain_id, flags, access_policy,
+              sealed_by, key_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(&new_id)
         .bind(&resource_name_enc)
@@ -1052,6 +1087,8 @@ pub async fn store_data(
         .bind(&domain_id)
         .bind(flags_value)
         .bind(policy_value)
+        .bind(sealed_by)
+        .bind(&key_id)
         .execute(&state.db)
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -1061,8 +1098,19 @@ pub async fn store_data(
             created_at: now.to_rfc3339(),
             encryption_method: enc_method.into(),
             status: "stored".into(),
+            share_requests: Vec::new(),
         }
     };
+    // A new value has a new data key: drop shares of the old one, and ask
+    // the clients that held it for the new one.
+    response.share_requests = share_api::after_store(
+        &state,
+        share_api::ItemKind::Secret,
+        &response.resource_id,
+        &client.id,
+    )
+    .await
+    .map_err(actix_web::error::ErrorInternalServerError)?;
     acl_record_use(&state.db, &decision).await;
     audit(
         &state.db,
@@ -1206,6 +1254,40 @@ pub async fn retrieve_data(
                 ts.format("%Y-%m-%dT%H:%M:%SZ")
             ),
         ));
+    }
+
+    // An external secret sealed under someone else's CMK: a reader that says
+    // which key it holds (share_api::HELD_KEY_HEADER) and doesn't hold the
+    // current one is told so here, before any gate runs or the read counts.
+    // Clients that don't send the header get the envelope as before.
+    let mut served_key_id: Option<String> = None;
+    if is_external {
+        let (sealed_by, key_id): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT sealed_by, key_id FROM blackbook_secrets WHERE resource_id = $1",
+        )
+        .bind(&res_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+        let held = http_req
+            .headers()
+            .get(share_api::HELD_KEY_HEADER)
+            .and_then(|v| v.to_str().ok());
+        if let (Some(sealer), Some(kid), Some(held)) = (&sealed_by, &key_id, held) {
+            if *sealer != client.id && held != kid {
+                return share_api::key_needed(
+                    &state,
+                    share_api::ItemKind::Secret,
+                    &res_id,
+                    &res_name,
+                    &client,
+                    sealer,
+                    kid,
+                )
+                .await;
+            }
+        }
+        served_key_id = key_id;
     }
 
     // Fast soft-reject if the stale snapshot already shows the limit reached
@@ -1447,6 +1529,7 @@ pub async fn retrieve_data(
         updated_at: updated,
         external: is_external,
         envelope: envelope_out,
+        key_id: served_key_id,
     }))
 }
 
@@ -2070,9 +2153,20 @@ pub async fn upload_file(
         .map_err(|e| actix_web::error::ErrorInternalServerError(e.to_string()))?;
     let ciphertext_size = ciphertext.len() as i64;
 
+    // Key sharing (share_api.rs), as for secrets: who sealed a client-side
+    // file, and the id of its data key when that's sealed under the CMK.
+    let sealed_by: Option<&str> = (is_external || is_resident).then_some(client.id.as_str());
+    let key_id = match share_api::stored_key_id(
+        external_meta.as_deref().filter(|_| is_external),
+        pol.key_id.as_deref(),
+    ) {
+        Ok(k) => k,
+        Err(msg) => return Ok(err(StatusCode::BAD_REQUEST, "validation_error", msg)),
+    };
+
     // Update DB. Replace-or-insert with old-blob cleanup.
     let now = chrono::Utc::now();
-    let response = if let Some((page_id, old_content_id, _)) = existing {
+    let mut response = if let Some((page_id, old_content_id, _)) = existing {
         let mut tx = state
             .db
             .begin()
@@ -2100,7 +2194,7 @@ pub async fn upload_file(
                  plaintext_size_enc = $4, mime_type_enc = $5,
                  is_external = $6, external_meta = $7,
                  external_kind = $8, server_key_component = $9, has_server_copy = $10,
-                 updated_at = $11
+                 updated_at = $11, sealed_by = $13, key_id = $14
              WHERE id = $12",
         )
         .bind(&new_content_id)
@@ -2115,6 +2209,8 @@ pub async fn upload_file(
         .bind(want_server_copy)
         .bind(now)
         .bind(&page_id)
+        .bind(sealed_by)
+        .bind(&key_id)
         .execute(&mut *tx)
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -2200,8 +2296,9 @@ pub async fn upload_file(
                 (id, name_enc, name_id, owner_id, content_id, wrapped_dek,
                  plaintext_hash_id, plaintext_size_enc, mime_type_enc, domain_id,
                  is_external, external_meta, external_kind, server_key_component,
-                 has_server_copy, flags, access_policy)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+                 has_server_copy, flags, access_policy, sealed_by, key_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                     $18, $19)",
         )
         .bind(&page_id)
         .bind(&name_enc)
@@ -2220,6 +2317,8 @@ pub async fn upload_file(
         .bind(want_server_copy)
         .bind(SqlxJson(&flags))
         .bind(policy_value)
+        .bind(sealed_by)
+        .bind(&key_id)
         .execute(&mut *tx)
         .await
         .map_err(actix_web::error::ErrorInternalServerError)?;
@@ -2238,6 +2337,11 @@ pub async fn upload_file(
             ..Default::default()
         }
     };
+    // As for secrets: a new upload has a new data key.
+    response.share_requests =
+        share_api::after_store(&state, share_api::ItemKind::File, &response.id, &client.id)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
 
     acl_record_use(&state.db, &decision).await;
     audit(
@@ -2396,6 +2500,37 @@ pub async fn download_file(
                 ts.format("%Y-%m-%dT%H:%M:%SZ")
             ),
         ));
+    }
+    // As in retrieve_data: an external file sealed under someone else's CMK,
+    // and a reader that holds an older key or none, is answered here, before
+    // any gate runs or the read counts.
+    let mut served_key_id: Option<String> = None;
+    if is_external && external_kind == 1 {
+        let (sealed_by, key_id): (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT sealed_by, key_id FROM blackbook_pages WHERE id = $1")
+                .bind(&page_id)
+                .fetch_one(&state.db)
+                .await
+                .map_err(actix_web::error::ErrorInternalServerError)?;
+        let held = http_req
+            .headers()
+            .get(share_api::HELD_KEY_HEADER)
+            .and_then(|v| v.to_str().ok());
+        if let (Some(sealer), Some(kid), Some(held)) = (&sealed_by, &key_id, held) {
+            if *sealer != client.id && held != kid {
+                return share_api::key_needed(
+                    &state,
+                    share_api::ItemKind::File,
+                    &page_id,
+                    &name,
+                    &client,
+                    sealer,
+                    kid,
+                )
+                .await;
+            }
+        }
+        served_key_id = key_id;
     }
     // Fast soft-reject (not the enforcement point — the atomic claim below is).
     if let Some(max) = flags.max_reads {
@@ -2777,6 +2912,9 @@ pub async fn download_file(
             .encode(external_meta.as_deref().unwrap_or_default());
         resp.insert_header(("X-Blackbook-External", "1"));
         resp.insert_header(("X-Blackbook-External-Meta", meta_b64));
+        if let Some(kid) = &served_key_id {
+            resp.insert_header(("X-Blackbook-Key-Id", kid.as_str()));
+        }
     }
     Ok(resp.body(served))
 }
@@ -3010,6 +3148,7 @@ pub async fn list_files(
             exhausted_at: exhausted_str,
             threshold_k,
             signatory_count,
+            share_requests: Vec::new(),
         });
     }
     audit(
@@ -3555,7 +3694,25 @@ pub async fn grant_acl(
         )),
     )
     .await;
-    Ok(HttpResponse::Created().json(serde_json::json!({"id": id})))
+    // A read rule over external items: the clients it covers need the items'
+    // keys, which only each item's sealer holds. Ask the sealers.
+    let sharing = if mask & auth::action_bit(AclAction::Read) != 0 {
+        Some(
+            share_api::after_grant(
+                &state,
+                &caller,
+                &domain_id,
+                &req.resource_pattern,
+                client_id.as_deref(),
+                group_domain_id.as_deref(),
+            )
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?,
+        )
+    } else {
+        None
+    };
+    Ok(HttpResponse::Created().json(serde_json::json!({"id": id, "sharing": sharing})))
 }
 
 fn parse_rfc3339_opt(
@@ -6142,6 +6299,23 @@ pub async fn run_server(
             )
             .route("/api/v1/audit/archives", web::get().to(audit_archive_list))
             // Tunnels — client↔client E2E relay
+            // Key sharing for external items (share_api.rs)
+            .route(
+                "/api/v1/share/identity",
+                web::put().to(share_api::publish_identity),
+            )
+            .route(
+                "/api/v1/share/request",
+                web::post().to(share_api::request_key),
+            )
+            .route("/api/v1/share/pickup", web::get().to(share_api::pickup))
+            .route("/api/v1/share/ack", web::post().to(share_api::ack))
+            .route(
+                "/api/v1/share/requests",
+                web::get().to(share_api::list_requests),
+            )
+            .route("/api/v1/share/deliver", web::post().to(share_api::deliver))
+            .route("/api/v1/share/reject", web::post().to(share_api::reject))
             .route("/api/v1/tunnels", web::post().to(offer_tunnel))
             .route("/api/v1/tunnels", web::get().to(list_tunnels))
             .route("/api/v1/tunnels/{id}/ws", web::get().to(tunnel_ws))

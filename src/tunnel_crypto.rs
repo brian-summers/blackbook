@@ -144,7 +144,7 @@ fn pem_to_der(pem: &str) -> CryptoResult<Vec<u8>> {
 // --- ECDSA P-256 sign/verify over the client cert keypair (via openssl) ------
 
 /// Sign `msg` with the client's certificate private key (PEM, ECDSA P-256).
-fn ecdsa_sign(key_pem: &str, msg: &[u8]) -> CryptoResult<Vec<u8>> {
+pub(crate) fn ecdsa_sign(key_pem: &str, msg: &[u8]) -> CryptoResult<Vec<u8>> {
     use openssl::hash::MessageDigest;
     use openssl::pkey::PKey;
     use openssl::sign::Signer;
@@ -161,7 +161,7 @@ fn ecdsa_sign(key_pem: &str, msg: &[u8]) -> CryptoResult<Vec<u8>> {
 }
 
 /// Verify an ECDSA P-256 signature against the public key inside `cert_pem`.
-fn ecdsa_verify(cert_pem: &str, msg: &[u8], sig: &[u8]) -> CryptoResult<bool> {
+pub(crate) fn ecdsa_verify(cert_pem: &str, msg: &[u8], sig: &[u8]) -> CryptoResult<bool> {
     use openssl::hash::MessageDigest;
     use openssl::sign::Verifier;
     use openssl::x509::X509;

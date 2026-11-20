@@ -48,6 +48,15 @@ refuse() {
 }
 # same NAME WANT CMD...: CMD prints exactly WANT.
 same() { local name=$1 want=$2 out; shift 2; if out=$("$@" 2>&1) && [ "$out" = "$want" ]; then ok "$name"; else bad "$name" "$out"; fi; }
+# reads NAME WANT CMD...: CMD succeeds and prints exactly WANT on stdout. Notes
+# on stderr don't count (a first read of a shared key reports receiving it).
+reads() {
+    local name=$1 want=$2 out err; shift 2; err=$(mktemp)
+    if out=$("$@" 2>"$err") && [ "$out" = "$want" ]; then ok "$name"; else bad "$name" "$out$(cat "$err")"; fi
+    rm -f "$err"
+}
+# says NAME WHAT CMD...: CMD succeeds, and its output matches the regex WHAT.
+says() { local name=$1 what=$2 out; shift 2; if out=$("$@" 2>&1) && [[ $out =~ $what ]]; then ok "$name"; else bad "$name" "$out"; fi; }
 # status NAME WANT PATH [CURL-ARGS...]: the HTTP status is one of WANT (a
 # regex). curl runs in a container on the stack's network and offers only
 # classical key exchange, standing in for any non-bbk TLS client.
@@ -184,6 +193,56 @@ for _ in $(seq 20); do
 done
 got=$(dock run --rm --network "container:$PROJECT-alice" "$BUSYBOX" sh -c 'wget -qO- http://127.0.0.1:18500/blob | sha256sum' 2>/dev/null | cut -d' ' -f1) || true
 if [ -n "$want" ] && [ "$got" = "$want" ]; then ok "1 MiB through the tunnel, unchanged"; else bad "tunnel transfer (want ${want:-nothing}, got ${got:-nothing})"; fi
+
+echo "== sharing the key of an item encrypted client-side"
+SHARED="shared-value-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+CHANGED="changed-value-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+expect "admin adds bob to e2e" bbk admin domain add-member e2e bob
+expect "admin lets alice store shared-* in e2e" \
+    bbk admin acl grant -D e2e alice 'shared-*' --create --read --update
+expect "alice seals shared-token under her own client master key" \
+    bbk alice put -D e2e shared-token "$SHARED" --external-key
+expect "alice seals shared-once, deleted on its first read" \
+    bbk alice put -D e2e shared-once "$SHARED" --external-key --delete-on-read
+expect "alice seals shared-phrase with a passphrase" \
+    bbk alice put -D e2e shared-phrase "$SHARED" --external-passphrase "$PASSPHRASE"
+refuse "bob, a member without a read rule, can't read shared-token" '\[forbidden\]' \
+    bbk bob get -D e2e shared-token
+if out=$(bbk admin acl grant -D e2e bob 'shared-*' --read 2>&1) &&
+    [[ $out =~ "2 key requests are waiting on alice" ]] && [[ $out =~ "one is sealed with a passphrase" ]]; then
+    ok "granting bob read asks alice for two keys, and reports the passphrase item"
+else bad "granting bob read asks alice for two keys, and reports the passphrase item" "$out"; fi
+refuse "bob can't read shared-token before alice sends its key" 'Asked alice for it' \
+    bbk bob get -D e2e shared-token
+refuse "nor shared-once, and trying doesn't use up its one read" 'Asked alice for it' \
+    bbk bob get -D e2e shared-once
+refuse "the server can't read it either: admin passes the ACL, but has no key" 'Asked alice for it' \
+    bbk admin get -D e2e shared-token
+says "alice sees bob's requests" 'e2e/shared-token → bob' bbk alice share ls
+refuse "share sync sends nothing from a script without --yes" 'pass --yes' bbk alice share sync
+says "alice sends the keys bob asked for" "shared the key to 'shared-once' to bob" \
+    bbk alice share sync --yes --to bob
+reads "bob reads shared-token with the key alice sent" "$SHARED" bbk bob get -D e2e shared-token
+reads "and again, from his own key store" "$SHARED" bbk bob get -D e2e shared-token
+reads "bob reads shared-once" "$SHARED" bbk bob get -D e2e shared-once
+refuse "and that read used it up" 'not_found' bbk bob get -D e2e shared-once
+reads "bob reads shared-phrase with the passphrase alice told him" "$SHARED" \
+    bbk bob get -D e2e shared-phrase --external-passphrase "$PASSPHRASE"
+says "a new value from alice sends its new key to bob, who held the old one" \
+    "shared the key to 'shared-token' to bob" \
+    bbk alice put -D e2e shared-token "$CHANGED" --external-key --overwrite
+reads "bob reads the new value" "$CHANGED" bbk bob get -D e2e shared-token
+BOB_FP=$(bbk bob share whoami 2>/dev/null | sed 's/^bob: //')
+expect "alice pins a fingerprint for bob that isn't his" bbk alice share trust bob "$(printf '0%.0s' $(seq 64))"
+says "then her next value isn't sent to the identity she doesn't trust" 'has changed' \
+    bbk alice put -D e2e shared-token "$SHARED" --external-key --overwrite
+refuse "so bob can't read it" 'Asked alice for it' bbk bob get -D e2e shared-token
+expect "alice trusts bob's real fingerprint, checked with him" bbk alice share trust bob "$BOB_FP"
+says "and sends the key" "shared the key to 'shared-token' to bob" bbk alice share sync --yes --to bob
+reads "bob reads it" "$SHARED" bbk bob get -D e2e shared-token
+expect "admin removes bob from e2e" bbk admin domain rm-member e2e bob
+refuse "bob, no longer a member, can't read it: holding the key isn't enough" '\[not_member\]' \
+    bbk bob get -D e2e shared-token
 
 echo "== audit and persistence"
 expect "audit log hash chain verifies" bbk admin audit --verify

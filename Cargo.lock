@@ -533,6 +533,7 @@ dependencies = [
  "aes-gcm",
  "aes-kw",
  "argon2",
+ "aws-lc-rs",
  "base32 0.4.0",
  "base64 0.22.1",
  "chrono",

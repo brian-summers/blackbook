@@ -75,6 +75,56 @@ pub enum ClientError {
 
     #[error("{0}")]
     Cred(#[from] crate::credstore::CredError),
+    /// The item is encrypted client-side by another client (`sealer`), and
+    /// this client doesn't hold its current key (see `share_api::key_needed`).
+    /// Nothing was read: the server answers this before any gate runs.
+    #[error("{message} [key_needed]")]
+    KeyNeeded {
+        message: String,
+        key_id: String,
+        sealer: String,
+        share_ready: bool,
+    },
+}
+
+/// The body of a `key_needed` 409.
+#[derive(Debug, Deserialize)]
+struct KeyNeededBody {
+    error: String,
+    message: String,
+    key_id: String,
+    sealer: String,
+    share_ready: bool,
+}
+
+/// An error response as a [`ClientError`]: `KeyNeeded` for a `key_needed`
+/// 409, otherwise `Api` with the server's message and code.
+fn api_error(status: reqwest::StatusCode, body: String) -> ClientError {
+    if status == reqwest::StatusCode::CONFLICT {
+        if let Ok(k) = serde_json::from_str::<KeyNeededBody>(&body) {
+            if k.error == "key_needed" {
+                return ClientError::KeyNeeded {
+                    message: k.message,
+                    key_id: k.key_id,
+                    sealer: k.sealer,
+                    share_ready: k.share_ready,
+                };
+            }
+        }
+    }
+    let message = serde_json::from_str::<ApiError>(&body)
+        .map(|e| {
+            if e.error.is_empty() {
+                e.message
+            } else {
+                format!("{} [{}]", e.message, e.error)
+            }
+        })
+        .unwrap_or(body);
+    ClientError::Api {
+        status: status.as_u16(),
+        message,
+    }
 }
 
 /// A reqwest error with its causes. reqwest's own message for a failed
@@ -184,7 +234,7 @@ impl Drop for Session {
 
 impl Session {
     /// `~/.bbk`.
-    fn bbk_dir() -> Result<PathBuf> {
+    pub(crate) fn bbk_dir() -> Result<PathBuf> {
         let home = dirs::home_dir().ok_or_else(|| ClientError::SessionIo {
             path: "~/.bbk".into(),
             detail: "could not resolve home directory".into(),
@@ -431,7 +481,7 @@ impl Session {
     // `session.json` files are still *read* for back-compat.
 
     /// Best-effort `0600` on POSIX; no-op elsewhere.
-    fn harden(path: &std::path::Path) -> Result<()> {
+    pub(crate) fn harden(path: &std::path::Path) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -491,6 +541,9 @@ pub struct StoreResponse {
     pub created_at: String,
     pub encryption_method: String,
     pub status: String,
+    /// Key-share requests to fulfil now: clients that held the previous key.
+    #[serde(default)]
+    pub share_requests: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -506,6 +559,9 @@ pub struct RetrieveResponse {
     pub external: bool,
     #[serde(default)]
     pub envelope: Option<String>,
+    /// The id of the envelope's data key, when it's sealed under a CMK.
+    #[serde(default)]
+    pub key_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -679,6 +735,9 @@ pub struct FileSummary {
     pub threshold_k: Option<i64>,
     #[serde(default)]
     pub signatory_count: Option<usize>,
+    /// On upload: key-share requests to fulfil now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub share_requests: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -757,6 +816,8 @@ pub struct FilePutOpts<'a> {
     pub resident: bool,
     pub key_component: Option<String>,
     pub server_copy: bool,
+    /// For an external file sealed under the CMK: its data key's id.
+    pub key_id: Option<String>,
 }
 
 /// Full result of a file download. `bytes` is the body (client ciphertext for
@@ -769,6 +830,8 @@ pub struct FileDownload {
     pub external_meta: Option<String>,
     pub key_component: Option<String>,
     pub resident: bool,
+    /// For an external file sealed under a CMK: its data key's id.
+    pub key_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -976,19 +1039,7 @@ impl BlackbookClient {
             return Ok(resp.json::<T>().await?);
         }
         let body = resp.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<ApiError>(&body)
-            .map(|e| {
-                if e.error.is_empty() {
-                    e.message
-                } else {
-                    format!("{} [{}]", e.message, e.error)
-                }
-            })
-            .unwrap_or(body);
-        Err(ClientError::Api {
-            status: status.as_u16(),
-            message,
-        })
+        Err(api_error(status, body))
     }
 
     /// Full download result, including the Phase 4 resident key component.
@@ -1014,6 +1065,11 @@ impl BlackbookClient {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let resident = resp.headers().get("X-Blackbook-Resident").is_some();
+        let key_id = resp
+            .headers()
+            .get("X-Blackbook-Key-Id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         if status.is_success() {
             return Ok(FileDownload {
                 bytes: resp.bytes().await?.to_vec(),
@@ -1021,22 +1077,11 @@ impl BlackbookClient {
                 external_meta: ext_meta,
                 key_component,
                 resident,
+                key_id,
             });
         }
         let body = resp.text().await.unwrap_or_default();
-        let message = serde_json::from_str::<ApiError>(&body)
-            .map(|e| {
-                if e.error.is_empty() {
-                    e.message
-                } else {
-                    format!("{} [{}]", e.message, e.error)
-                }
-            })
-            .unwrap_or(body);
-        Err(ClientError::Api {
-            status: status.as_u16(),
-            message,
-        })
+        Err(api_error(status, body))
     }
 
     fn url(&self, path: &str) -> String {
@@ -1100,22 +1145,43 @@ impl BlackbookClient {
         policy: Option<&AccessPolicyRequest>,
         overwrite: bool,
     ) -> Result<StoreResponse> {
-        self.store_inner(name, data, description, flags, policy, overwrite, None)
-            .await
+        self.store_inner(
+            name,
+            data,
+            description,
+            flags,
+            policy,
+            overwrite,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Store a client-side ("external") secret: `envelope_b64` is the opaque
     /// blob the server keeps but can't open. `data` is empty/ignored.
+    /// `key_id` is the id of the envelope's data key when it's sealed under
+    /// the CMK, so the key can be shared.
     pub async fn store_external(
         &self,
         name: &str,
         envelope_b64: &str,
+        key_id: Option<&str>,
         flags: Option<&ResourceFlagsRequest>,
         policy: Option<&AccessPolicyRequest>,
         overwrite: bool,
     ) -> Result<StoreResponse> {
-        self.store_inner(name, "", None, flags, policy, overwrite, Some(envelope_b64))
-            .await
+        self.store_inner(
+            name,
+            "",
+            None,
+            flags,
+            policy,
+            overwrite,
+            Some(envelope_b64),
+            key_id,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1128,6 +1194,7 @@ impl BlackbookClient {
         policy: Option<&AccessPolicyRequest>,
         overwrite: bool,
         external: Option<&str>,
+        key_id: Option<&str>,
     ) -> Result<StoreResponse> {
         let body = serde_json::json!({
             "resource_name": name,
@@ -1137,6 +1204,7 @@ impl BlackbookClient {
             "access_policy": policy,
             "overwrite": overwrite,
             "external": external,
+            "key_id": key_id,
         });
         let resp = self
             .req_in_domain(reqwest::Method::POST, "/api/v1/store")
@@ -1153,6 +1221,18 @@ impl BlackbookClient {
         id_or_name: &str,
         request_id: Option<&str>,
     ) -> Result<RetrieveResponse> {
+        self.retrieve_holding(id_or_name, request_id, None).await
+    }
+
+    /// [`Self::retrieve_with_request`], naming the key id this client holds
+    /// for the secret (`"none"` for none), so the server can answer
+    /// `KeyNeeded` before the read counts if it's the wrong one.
+    pub async fn retrieve_holding(
+        &self,
+        id_or_name: &str,
+        request_id: Option<&str>,
+        held_key: Option<&str>,
+    ) -> Result<RetrieveResponse> {
         let body = serde_json::json!({"resource_id": id_or_name});
         let mut rb = self
             .req_in_domain(reqwest::Method::POST, "/api/v1/retrieve")
@@ -1160,8 +1240,120 @@ impl BlackbookClient {
         if let Some(rid) = request_id {
             rb = rb.header("X-Blackbook-Request-Id", rid);
         }
+        if let Some(k) = held_key {
+            rb = rb.header(crate::share_api::HELD_KEY_HEADER, k);
+        }
         let resp = rb.send().await?;
         self.handle(resp).await
+    }
+
+    // --- key sharing (share_api.rs) ------------------------------------------
+
+    /// Publishes this client's share identity, signed with its certificate.
+    pub async fn share_publish_identity(
+        &self,
+        identity: &crate::share_crypto::ShareIdentity,
+        cert_pem: &str,
+        cert_sig_b64: &str,
+    ) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "identity": identity,
+            "cert_pem": cert_pem,
+            "cert_sig": cert_sig_b64,
+        });
+        let resp = self
+            .req(reqwest::Method::PUT, "/api/v1/share/identity")
+            .json(&body)
+            .send()
+            .await?;
+        self.handle(resp).await
+    }
+
+    /// Asks the sealer of an item in this client's domain for its key.
+    /// Returns the sealer's name.
+    pub async fn share_request(&self, kind: &str, name: &str) -> Result<String> {
+        let resp = self
+            .req_in_domain(reqwest::Method::POST, "/api/v1/share/request")
+            .json(&serde_json::json!({"kind": kind, "name": name}))
+            .send()
+            .await?;
+        let v: serde_json::Value = self.handle(resp).await?;
+        Ok(v["sealer"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// The share waiting for this client for an item's current key, if any.
+    pub async fn share_pickup(
+        &self,
+        kind: &str,
+        name: &str,
+    ) -> Result<Option<crate::share_api::PickupResponse>> {
+        let resp = self
+            .req_in_domain(reqwest::Method::GET, "/api/v1/share/pickup")
+            .query(&[("kind", kind), ("name", name)])
+            .send()
+            .await?;
+        match self.handle(resp).await {
+            Ok(p) => Ok(Some(p)),
+            Err(ClientError::Api {
+                status: 404,
+                message,
+            }) if message.ends_with("[no_share]") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Confirms a share's key is stored, so the server deletes the share.
+    pub async fn share_ack(&self, share_id: &str) -> Result<()> {
+        let resp = self
+            .req(reqwest::Method::POST, "/api/v1/share/ack")
+            .json(&serde_json::json!({"share_id": share_id}))
+            .send()
+            .await?;
+        let _: serde_json::Value = self.handle(resp).await?;
+        Ok(())
+    }
+
+    /// The requests waiting on this client, for items it sealed.
+    pub async fn share_requests(&self) -> Result<Vec<crate::share_api::RequestView>> {
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/share/requests")
+            .send()
+            .await?;
+        #[derive(Deserialize)]
+        struct List {
+            requests: Vec<crate::share_api::RequestView>,
+        }
+        let l: List = self.handle(resp).await?;
+        Ok(l.requests)
+    }
+
+    pub async fn share_deliver(
+        &self,
+        request_id: &str,
+        key_id: &str,
+        share_b64: &str,
+    ) -> Result<()> {
+        let resp = self
+            .req(reqwest::Method::POST, "/api/v1/share/deliver")
+            .json(&serde_json::json!({
+                "request_id": request_id,
+                "key_id": key_id,
+                "share": share_b64,
+            }))
+            .send()
+            .await?;
+        let _: serde_json::Value = self.handle(resp).await?;
+        Ok(())
+    }
+
+    pub async fn share_reject(&self, request_id: &str) -> Result<()> {
+        let resp = self
+            .req(reqwest::Method::POST, "/api/v1/share/reject")
+            .json(&serde_json::json!({"request_id": request_id}))
+            .send()
+            .await?;
+        let _: serde_json::Value = self.handle(resp).await?;
+        Ok(())
     }
 
     /// Approve someone else's pending access request.
@@ -1331,6 +1523,9 @@ impl BlackbookClient {
         if opts.server_copy {
             qs.push(("server_copy".into(), "true".into()));
         }
+        if let Some(k) = &opts.key_id {
+            qs.push(("key_id".into(), k.clone()));
+        }
         let mut rb = self.req(reqwest::Method::PUT, &url).query(&qs).body(body);
         if let Some(m) = opts.mime {
             rb = rb.header(reqwest::header::CONTENT_TYPE, m);
@@ -1341,15 +1536,22 @@ impl BlackbookClient {
 
     /// Download a file (optionally presenting an approved K-of-N request id),
     /// returning the full [`FileDownload`] including the resident key component.
-    pub async fn file_get_download(
+    /// `held_key` names the key id this client holds for the file (`"none"`
+    /// for none), so the server can answer `KeyNeeded` before the read counts
+    /// if it's the wrong one; `None` sends no header.
+    pub async fn file_get_holding(
         &self,
         name: &str,
         request_id: Option<&str>,
+        held_key: Option<&str>,
     ) -> Result<FileDownload> {
         let url = format!("/api/v1/files/{}", urlencoding_simple(name));
         let mut rb = self.req_in_domain(reqwest::Method::GET, &url);
         if let Some(rid) = request_id {
             rb = rb.header("X-Blackbook-Request-Id", rid);
+        }
+        if let Some(k) = held_key {
+            rb = rb.header(crate::share_api::HELD_KEY_HEADER, k);
         }
         let resp = rb.send().await?;
         self.handle_download(resp).await
