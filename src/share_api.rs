@@ -604,7 +604,7 @@ pub struct GrantSharing {
     /// Recipient and item pairs where the recipient already holds the key.
     pub already: usize,
     /// Items sealed with a passphrase: readers need the passphrase.
-    pub passphrase: usize,
+    pub passphrase_sealed: usize,
     /// Resident files, whose ciphertext is only on the sealer's disk.
     pub resident: usize,
     /// Items sealed before key sharing existed. Their sealer stores them again
@@ -653,7 +653,7 @@ pub(crate) async fn after_grant(
         }
         match item.seal {
             Seal::Passphrase => {
-                out.passphrase += 1;
+                out.passphrase_sealed += 1;
                 continue;
             }
             Seal::Resident => {
@@ -1404,11 +1404,13 @@ pub async fn reject(
 mod tests {
     use super::*;
 
-    fn v2(mode: u8, salt: &[u8], wrapped: &[u8], ct: &[u8]) -> Vec<u8> {
+    // `field` fills the length-prefixed slot where a passphrase envelope keeps
+    // its KDF salt; these tests only exercise the layout.
+    fn v2(mode: u8, field: &[u8], wrapped: &[u8], ct: &[u8]) -> Vec<u8> {
         let mut out = vec![2, mode];
         out.extend_from_slice(&[0u8; 12]);
-        out.push(salt.len() as u8);
-        out.extend_from_slice(salt);
+        out.push(field.len() as u8);
+        out.extend_from_slice(field);
         out.extend_from_slice(&(wrapped.len() as u32).to_be_bytes());
         out.extend_from_slice(wrapped);
         out.extend_from_slice(ct);

@@ -546,10 +546,10 @@ pub async fn after_grant(bb: &BlackbookClient, session: &Session, sharing: &serd
             if w.requests == 1 { "it" } else { "them" }
         );
     }
-    if s.passphrase > 0 {
+    if s.passphrase_sealed > 0 {
         eprintln!(
             "external items: {} sealed with a passphrase; readers need that passphrase from its owner",
-            n(s.passphrase, "one is", "are")
+            n(s.passphrase_sealed, "one is", "are")
         );
     }
     if s.resident > 0 {
