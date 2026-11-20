@@ -21,6 +21,9 @@ mod net_ratelimit;
 pub mod persistence;
 mod presentation;
 mod server;
+mod share_api;
+mod share_cli;
+mod share_crypto;
 pub mod tls;
 mod tunnel_client;
 mod tunnel_crypto;
@@ -330,6 +333,11 @@ enum Commands {
     /// to each other by their existing client certificates).
     #[command(subcommand)]
     Tunnel(TunnelCmd),
+
+    /// Share the keys of external (client-side encrypted) items you sealed
+    /// with clients granted read on them, and check who you share with.
+    #[command(subcommand)]
+    Share(share_cli::ShareCmd),
 
     /// Manage API clients (admin only).
     #[command(subcommand)]
@@ -746,8 +754,8 @@ impl Database {
         // sees nothing but opaque ids, ciphertext, timestamps, and the
         // low-entropy action/status enums.
         //
-        // The migrations ledger is kept for future numbered migrations via
-        // `migrate_once(version, name, sql)`; on a fresh DB it stays empty.
+        // The migrations ledger records numbered migrations applied with
+        // `migrate_once(version, name, sql)` (see the end of this function).
         // ------------------------------------------------------------------
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS blackbook_schema_migrations (
@@ -833,6 +841,12 @@ impl Database {
                 updated_at        TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 deleted_at        TIMESTAMP,
                 encryption_method VARCHAR(100),
+                -- External secrets: the client that sealed the envelope (the
+                -- only one holding its data key) and the key's id, a hash of
+                -- the key that names it in key shares (share_api.rs). Added
+                -- by migration 1 on databases created before key sharing.
+                sealed_by         TEXT REFERENCES blackbook_clients(id) ON DELETE SET NULL,
+                key_id            CHAR(64),
                 UNIQUE (domain_id, name_id)
             )"#,
         )
@@ -967,6 +981,10 @@ impl Database {
                 exhausted_at       TIMESTAMP,
                 created_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                -- As on blackbook_secrets: who sealed an external file, and
+                -- the id of its data key.
+                sealed_by          TEXT REFERENCES blackbook_clients(id) ON DELETE SET NULL,
+                key_id             CHAR(64),
                 UNIQUE (domain_id, name_id)
             )"#,
         ).execute(&self.pool).await?;
@@ -1072,6 +1090,104 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Key sharing for external items (share_api.rs, share_crypto.rs).
+        // Databases created before it lack the sealer and key id columns.
+        self.migrate_once(
+            1,
+            "external key sharing: sealed_by and key_id",
+            "ALTER TABLE blackbook_secrets ADD COLUMN IF NOT EXISTS sealed_by TEXT
+                 REFERENCES blackbook_clients(id) ON DELETE SET NULL;
+             ALTER TABLE blackbook_secrets ADD COLUMN IF NOT EXISTS key_id CHAR(64);
+             ALTER TABLE blackbook_pages ADD COLUMN IF NOT EXISTS sealed_by TEXT
+                 REFERENCES blackbook_clients(id) ON DELETE SET NULL;
+             ALTER TABLE blackbook_pages ADD COLUMN IF NOT EXISTS key_id CHAR(64)",
+        )
+        .await?;
+        // A client's share identity: the public keys others encrypt key
+        // shares to, signed by the certificate it was published with. Public
+        // by design, so stored in the clear.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS blackbook_share_identities (
+                client_id   TEXT PRIMARY KEY REFERENCES blackbook_clients(id) ON DELETE CASCADE,
+                identity    JSONB NOT NULL,
+                cert_pem    TEXT NOT NULL,
+                cert_sig    BYTEA NOT NULL,
+                fingerprint CHAR(64) NOT NULL,
+                updated_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // The three sharing tables refer to their item by foreign key, a
+        // secret or a file, so deleting the item deletes its sharing state
+        // too, and an item later created under the same name starts with
+        // none. `item_key` ("secret:<id>" or "file:<id>") is the one column
+        // the uniqueness constraints can use across both kinds.
+        //
+        // A request: `recipient` wants the item's current key. It's addressed
+        // to whoever sealed the item now (its `sealed_by`), who fulfils it
+        // with `bbk share sync`.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS blackbook_share_requests (
+                id           TEXT PRIMARY KEY,
+                secret_id    TEXT REFERENCES blackbook_secrets(resource_id) ON DELETE CASCADE,
+                page_id      TEXT REFERENCES blackbook_pages(id) ON DELETE CASCADE,
+                item_key     TEXT NOT NULL,
+                recipient_id TEXT NOT NULL REFERENCES blackbook_clients(id) ON DELETE CASCADE,
+                created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at   TIMESTAMP NOT NULL,
+                CHECK ((secret_id IS NULL) <> (page_id IS NULL)),
+                UNIQUE (recipient_id, item_key)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // A share waiting for its recipient: the item's data key encrypted to
+        // the recipient's identity by the sealer, opaque to the server and
+        // additionally sealed under the metadata key at rest. Deleted once the
+        // recipient confirms it has stored the key.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS blackbook_key_shares (
+                id           TEXT PRIMARY KEY,
+                secret_id    TEXT REFERENCES blackbook_secrets(resource_id) ON DELETE CASCADE,
+                page_id      TEXT REFERENCES blackbook_pages(id) ON DELETE CASCADE,
+                item_key     TEXT NOT NULL,
+                key_id       CHAR(64) NOT NULL,
+                sender_id    TEXT NOT NULL REFERENCES blackbook_clients(id) ON DELETE CASCADE,
+                recipient_id TEXT NOT NULL REFERENCES blackbook_clients(id) ON DELETE CASCADE,
+                share_enc    BYTEA NOT NULL,
+                created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                expires_at   TIMESTAMP NOT NULL,
+                CHECK ((secret_id IS NULL) <> (page_id IS NULL)),
+                UNIQUE (recipient_id, item_key)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        // Who has received which key of an item. When the sealer stores a
+        // new value (a new key), these clients are asked again automatically.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS blackbook_share_holders (
+                secret_id    TEXT REFERENCES blackbook_secrets(resource_id) ON DELETE CASCADE,
+                page_id      TEXT REFERENCES blackbook_pages(id) ON DELETE CASCADE,
+                item_key     TEXT NOT NULL,
+                recipient_id TEXT NOT NULL REFERENCES blackbook_clients(id) ON DELETE CASCADE,
+                key_id       CHAR(64) NOT NULL,
+                received_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CHECK ((secret_id IS NULL) <> (page_id IS NULL)),
+                UNIQUE (recipient_id, item_key)
+            )"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_blackbook_share_requests_item ON blackbook_share_requests(item_key)",
+            "CREATE INDEX IF NOT EXISTS idx_blackbook_key_shares_item ON blackbook_key_shares(item_key)",
+            "CREATE INDEX IF NOT EXISTS idx_blackbook_share_holders_item ON blackbook_share_holders(item_key)",
+        ] {
+            sqlx::query(idx).execute(&self.pool).await?;
+        }
+
         log::info!("Database schema initialized successfully");
         Ok(())
     }
@@ -1079,10 +1195,7 @@ impl Database {
     /// Run `sql` exactly once and record it in `blackbook_schema_migrations`.
     /// Idempotent across restarts: if `version` is already recorded, the SQL
     /// is skipped. The migration row is inserted only after `sql` succeeds,
-    /// so a failed migration can be retried on the next boot. No callers
-    /// today — the schema is encrypted-from-day-1 and needs no migrations —
-    /// but kept for future numbered migrations.
-    #[allow(dead_code)]
+    /// so a failed migration can be retried on the next boot.
     async fn migrate_once(&self, version: i32, name: &str, sql: &str) -> Result<()> {
         let already: Option<(i32,)> =
             sqlx::query_as("SELECT version FROM blackbook_schema_migrations WHERE version = $1")
@@ -1369,12 +1482,16 @@ fn ext_key_for_spec(
     }
 }
 
-/// Seal `plaintext`, returning `(meta_header, ciphertext)`. `meta_header` is
-/// the v2 envelope encoded with an *empty* ciphertext field; because ct is the
-/// trailing field, `meta_header ++ ciphertext` is the full envelope. Secrets
-/// store the concatenation; files store `meta_header` in the row and
-/// `ciphertext` as the on-disk blob.
-fn external_seal_parts(key: &ExtKey, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+/// Seal `plaintext`, returning `(meta_header, ciphertext, key_id)`.
+/// `meta_header` is the v2 envelope encoded with an *empty* ciphertext field;
+/// because ct is the trailing field, `meta_header ++ ciphertext` is the full
+/// envelope. Secrets store the concatenation; files store `meta_header` in the
+/// row and `ciphertext` as the on-disk blob. `key_id` names the data key for
+/// key sharing, and is set only for the CMK, the one key that can be shared.
+fn external_seal_parts(
+    key: &ExtKey,
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>, Option<String>)> {
     use rand::RngCore;
     let mut dek = Zeroizing::new([0u8; 32]);
     rand::thread_rng().fill_bytes(dek.as_mut_slice());
@@ -1393,14 +1510,16 @@ fn external_seal_parts(key: &ExtKey, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u
     let ciphertext = blackbook_core::aead_seal(plaintext, dek.as_slice())
         .map_err(|e| AppError::Crypto(format!("seal: {e}")))?;
     let meta = ext_encode_v2(mode, &salt, m, t, p, &wrapped_dek, &[]);
-    Ok((meta, ciphertext))
+    let key_id = matches!(key, ExtKey::Cmk(_)).then(|| share_crypto::key_id(dek.as_slice()));
+    Ok((meta, ciphertext, key_id))
 }
 
-/// Seal `plaintext` into a single full envelope (secrets path).
-fn external_seal(key: &ExtKey, plaintext: &[u8]) -> Result<Vec<u8>> {
-    let (mut meta, mut ct) = external_seal_parts(key, plaintext)?;
+/// Seal `plaintext` into a single full envelope (secrets path), with the key
+/// id as in [`external_seal_parts`].
+fn external_seal(key: &ExtKey, plaintext: &[u8]) -> Result<(Vec<u8>, Option<String>)> {
+    let (mut meta, mut ct, key_id) = external_seal_parts(key, plaintext)?;
     meta.append(&mut ct);
-    Ok(meta)
+    Ok((meta, key_id))
 }
 
 /// `0x02 | mode | m(4) t(4) p(4) | salt_len(1) | salt | wdek_len(4) | wdek | ct`.
@@ -1560,6 +1679,58 @@ fn external_open(
     blackbook_core::aead_open(&env.ciphertext, &dek).map_err(|_| {
         AppError::Crypto("decryption failed (wrong key/passphrase or corrupt data)".into())
     })
+}
+
+/// Open an external item: with the data key another client shared for it,
+/// if this client holds the one the server names (`key_id`), and otherwise
+/// with this profile's own key or the passphrase, as [`external_open`] does.
+fn open_external_item(
+    env: &ExtEnvelope,
+    session: &client::Session,
+    kind: share_api::ItemKind,
+    domain: &str,
+    name: &str,
+    key_id: Option<&str>,
+    explicit_pass: Option<String>,
+) -> Result<Vec<u8>> {
+    let Some(dek) = share_cli::received_key(session, kind, domain, name, key_id) else {
+        return external_open(env, session, explicit_pass);
+    };
+    blackbook_core::aead_open(&env.ciphertext, dek.as_slice()).map_err(|_| {
+        AppError::Crypto(format!(
+            "the key shared with you for '{name}' doesn't open it (corrupt data, or the item changed)"
+        ))
+    })
+}
+
+/// Runs a read of an item whose key may come from another client: sends the
+/// held-key header, and after a `KeyNeeded` answer collects the waiting share
+/// and reads again, or asks the sealer and fails. The read's own result is
+/// returned as is, so a caller can still act on, say, a 412 for approval.
+async fn read_with_shared_key<T, F, Fut>(
+    bb: &client::BlackbookClient,
+    session: &client::Session,
+    kind: share_api::ItemKind,
+    name: &str,
+    read: F,
+) -> Result<client::Result<T>>
+where
+    F: Fn(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = client::Result<T>>,
+{
+    let held = || share_cli::held_key(session, kind, bb.domain(), name);
+    match read(held()).await {
+        Err(client::ClientError::KeyNeeded { share_ready, .. }) => {
+            match share_cli::on_key_needed(bb, session, kind, name, share_ready).await? {
+                share_cli::KeyOutcome::Received => Ok(read(held()).await),
+                share_cli::KeyOutcome::Requested { sealer } => Err(AppError::Client(format!(
+                    "'{name}' is encrypted client-side by {sealer}, and you don't have its key yet. \
+                     Asked {sealer} for it: once they run `bbk share sync`, read it again."
+                ))),
+            }
+        }
+        other => Ok(other),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1953,6 +2124,9 @@ async fn cmd_login(
             "Carried the existing client master key forward — external data stays decryptable."
         );
     }
+    // Publish this profile's share identity now, so that the owners of
+    // external items can share their keys with it before it first asks.
+    share_cli::publish_after_login(&bb, &session, &profile).await;
     // Default this profile to the identity's private user domain, so commands
     // land in the user's own namespace without needing -D. Only set it if the
     // user hasn't already chosen a default via `domain use` (explicit wins).
@@ -2494,11 +2668,18 @@ async fn cmd_put(
             ExtKey::Cmk(_) => " [external-key/managed]",
             ExtKey::Passphrase(_) => " [external-key/passphrase]",
         };
-        let envelope = external_seal(&key, value.as_bytes())?;
+        let (envelope, key_id) = external_seal(&key, value.as_bytes())?;
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&envelope);
-        bb.store_external(&name, &b64, flags.as_ref(), policy.as_ref(), overwrite)
-            .await?
+        bb.store_external(
+            &name,
+            &b64,
+            key_id.as_deref(),
+            flags.as_ref(),
+            policy.as_ref(),
+            overwrite,
+        )
+        .await?
     } else {
         bb.store(
             &name,
@@ -2515,6 +2696,8 @@ async fn cmd_put(
         "{} {} ({}){}",
         resp.status, resp.resource_name, resp.resource_id, tag
     );
+    // The new value has a new key: send it to the clients that held the old one.
+    share_cli::deliver_now(&bb, &session, &resp.share_requests).await;
     Ok(())
 }
 
@@ -2550,15 +2733,20 @@ async fn cmd_get(
 ) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, domain, mfa)?;
+    let kind = share_api::ItemKind::Secret;
+    let (bb_ref, rid) = (&bb, request_id.as_deref());
+    let read = |held: Option<String>| {
+        let name = name.as_str();
+        async move { bb_ref.retrieve_holding(name, rid, held.as_deref()).await }
+    };
     let resp = if !wait {
-        bb.retrieve_with_request(&name, request_id.as_deref())
-            .await?
+        read_with_shared_key(&bb, &session, kind, &name, read).await??
     } else {
         // Block until the K-of-N request is approved (single call for automation).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout);
         let mut announced = false;
         loop {
-            match bb.retrieve_with_request(&name, request_id.as_deref()).await {
+            match read_with_shared_key(&bb, &session, kind, &name, read).await? {
                 Ok(r) => break r,
                 Err(client::ClientError::Api {
                     status: 412,
@@ -2603,7 +2791,15 @@ async fn cmd_get(
             .decode(&envelope_b64)
             .map_err(|_| AppError::Crypto("envelope is not valid base64".into()))?;
         let env = ext_decode(&envelope)?;
-        let plain = external_open(&env, &session, external_passphrase)?;
+        let plain = open_external_item(
+            &env,
+            &session,
+            kind,
+            bb.domain(),
+            &name,
+            resp.key_id.as_deref(),
+            external_passphrase,
+        )?;
         use std::io::Write;
         std::io::stdout().write_all(&plain)?;
         return Ok(());
@@ -2661,7 +2857,13 @@ async fn cmd_rekey(
 ) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, domain, mfa)?;
-    let resp = bb.retrieve_with_request(&name, None).await?;
+    let kind = share_api::ItemKind::Secret;
+    let bb_ref = &bb;
+    let read = |held: Option<String>| {
+        let name = name.as_str();
+        async move { bb_ref.retrieve_holding(name, None, held.as_deref()).await }
+    };
+    let resp = read_with_shared_key(&bb, &session, kind, &name, read).await??;
     if !resp.external {
         return Err(AppError::Config(format!(
             "'{name}' is a normal (server-side) secret, not client-side — there is no external key to change.")));
@@ -2675,14 +2877,31 @@ async fn cmd_rekey(
         .map_err(|_| AppError::Crypto("envelope is not valid base64".into()))?;
     let env = ext_decode(&envelope)?;
     // Decrypt with the *current* key.
-    let plain = external_open(&env, &session, old_external_passphrase)?;
+    let plain = open_external_item(
+        &env,
+        &session,
+        kind,
+        bb.domain(),
+        &name,
+        resp.key_id.as_deref(),
+        old_external_passphrase,
+    )?;
     // Re-seal under the *new* key and store back.
     let new_key = rekey_target_key(&session, external_key, external_passphrase)?;
-    let new_env = external_seal(&new_key, &plain)?;
+    let (new_env, key_id) = external_seal(&new_key, &plain)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&new_env);
-    bb.store_external(&name, &b64, None, None, /* overwrite = */ true)
+    let stored = bb
+        .store_external(
+            &name,
+            &b64,
+            key_id.as_deref(),
+            None,
+            None,
+            /* overwrite = */ true,
+        )
         .await?;
     println!("✓ rekeyed secret '{name}' → {}.", ext_key_label(&new_key));
+    share_cli::deliver_now(&bb, &session, &stored.share_requests).await;
     Ok(())
 }
 
@@ -3243,6 +3462,8 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     resident: true,
                     key_component: Some(kc_b64),
                     server_copy,
+                    // Resident files aren't shared through the server.
+                    key_id: None,
                 };
                 match bb.file_put(&name, upload_body, &opts).await {
                     Ok(resp) => {
@@ -3283,20 +3504,21 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 // Data-in-server: either external-key (encrypt locally, server
                 // stores the opaque envelope) or normal (server-side encryption).
                 let mut file_ext_label = "";
-                let (upload_body, external_meta) = if let Some(spec) = spec.as_ref() {
+                let (upload_body, external_meta, key_id) = if let Some(spec) = spec.as_ref() {
                     let key = ext_key_for_spec(spec, &session, ext.passphrase.clone())?;
                     file_ext_label = match key {
                         ExtKey::Cmk(_) => " [external-key/managed]",
                         ExtKey::Passphrase(_) => " [external-key/passphrase]",
                     };
-                    let (meta, ct) = external_seal_parts(&key, &body)?;
+                    let (meta, ct, key_id) = external_seal_parts(&key, &body)?;
                     use base64::Engine as _;
                     (
                         ct,
                         Some(base64::engine::general_purpose::STANDARD.encode(&meta)),
+                        key_id,
                     )
                 } else {
-                    (body, None)
+                    (body, None, None)
                 };
                 let opts = client::FilePutOpts {
                     mime: mime.as_deref(),
@@ -3314,6 +3536,7 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     resident: false,
                     key_component: None,
                     server_copy: false,
+                    key_id,
                 };
                 let resp = bb.file_put(&name, upload_body, &opts).await?;
                 println!(
@@ -3323,6 +3546,7 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     &resp.content_hash[..16],
                     file_ext_label
                 );
+                share_cli::deliver_now(&bb, &session, &resp.share_requests).await;
             }
         }
         FileCmd::Get {
@@ -3333,12 +3557,18 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
             wait_timeout,
             external_passphrase,
         } => {
+            let kind = share_api::ItemKind::File;
+            let (bb_ref, rid) = (&bb, request_id.as_deref());
+            let read = |held: Option<String>| {
+                let name = name.as_str();
+                async move { bb_ref.file_get_holding(name, rid, held.as_deref()).await }
+            };
             let dl = if wait {
                 let deadline =
                     std::time::Instant::now() + std::time::Duration::from_secs(wait_timeout);
                 let mut announced = false;
                 loop {
-                    match bb.file_get_download(&name, request_id.as_deref()).await {
+                    match read_with_shared_key(&bb, &session, kind, &name, read).await? {
                         Ok(b) => break b,
                         Err(client::ClientError::Api {
                             status: 412,
@@ -3360,7 +3590,7 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     }
                 }
             } else {
-                bb.file_get_download(&name, request_id.as_deref()).await?
+                read_with_shared_key(&bb, &session, kind, &name, read).await??
             };
             let bytes = if dl.resident {
                 // Resident file: the server returned only its key-component half.
@@ -3392,7 +3622,15 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     .map_err(|_| AppError::Crypto("external meta is not valid base64".into()))?;
                 envelope.extend_from_slice(&dl.bytes);
                 let env = ext_decode(&envelope)?;
-                external_open(&env, &session, external_passphrase)?
+                open_external_item(
+                    &env,
+                    &session,
+                    kind,
+                    bb.domain(),
+                    &name,
+                    dl.key_id.as_deref(),
+                    external_passphrase,
+                )?
             } else {
                 dl.bytes
             };
@@ -3490,7 +3728,13 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                 );
             } else {
                 // External-key file: fetch, decrypt, re-seal, re-upload the envelope.
-                let dl = bb.file_get_download(&name, None).await?;
+                let kind = share_api::ItemKind::File;
+                let bb_ref = &bb;
+                let read = |held: Option<String>| {
+                    let name = name.as_str();
+                    async move { bb_ref.file_get_holding(name, None, held.as_deref()).await }
+                };
+                let dl = read_with_shared_key(&bb, &session, kind, &name, read).await??;
                 if dl.resident {
                     return Err(AppError::Config(format!(
                         "'{name}' is resident but this machine has no local stash for it — rekey must run where the stash lives.")));
@@ -3503,8 +3747,16 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     .map_err(|_| AppError::Crypto("external meta is not valid base64".into()))?;
                 envelope.extend_from_slice(&dl.bytes);
                 let env = ext_decode(&envelope)?;
-                let plain = external_open(&env, &session, old_external_passphrase)?;
-                let (meta, ct) = external_seal_parts(&new_key, &plain)?;
+                let plain = open_external_item(
+                    &env,
+                    &session,
+                    kind,
+                    bb.domain(),
+                    &name,
+                    dl.key_id.as_deref(),
+                    old_external_passphrase,
+                )?;
+                let (meta, ct, key_id) = external_seal_parts(&new_key, &plain)?;
                 let opts = client::FilePutOpts {
                     mime: dl.content_type.as_deref(),
                     mfa_required: false,
@@ -3521,12 +3773,14 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     resident: false,
                     key_component: None,
                     server_copy: false,
+                    key_id,
                 };
-                bb.file_put(&name, ct, &opts).await?;
+                let resp = bb.file_put(&name, ct, &opts).await?;
                 println!(
                     "✓ rekeyed external-key file '{name}' → {}.",
                     ext_key_label(&new_key)
                 );
+                share_cli::deliver_now(&bb, &session, &resp.share_requests).await;
             }
         }
     }
@@ -3769,7 +4023,7 @@ async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
                 rate_period_secs,
                 schedule: schedule.clone(),
             };
-            bb.grant_acl(&pattern, &actions, opts).await?;
+            let granted = bb.grant_acl(&pattern, &actions, opts).await?;
             let extra = [
                 rate.as_ref().map(|r| format!("rate={r}")),
                 schedule.as_ref().map(|s| format!("schedule='{s}'")),
@@ -3788,6 +4042,11 @@ async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
                     format!(" [{extra}]")
                 }
             );
+            // A read rule over external items: report what the server found,
+            // and send the keys of the items this client sealed itself.
+            if let Some(sharing) = granted.get("sharing").filter(|v| !v.is_null()) {
+                share_cli::after_grant(&bb, &session, sharing).await;
+            }
         }
         AclCmd::Ls => {
             let list = bb.list_acl().await?;
@@ -4570,6 +4829,7 @@ async fn main() -> Result<()> {
             crypto_cli::cmd_crypto(cmd, effective_domain.clone(), cli.mfa.clone()).await?
         }
         Commands::Tunnel(cmd) => cmd_tunnel(cmd).await?,
+        Commands::Share(cmd) => share_cli::cmd_share(cmd).await?,
         Commands::Client(cmd) => cmd_client(cmd).await?,
         Commands::Acl(cmd) => cmd_acl(cmd, effective_domain.clone()).await?,
         Commands::Domain(cmd) => cmd_domain(cmd).await?,

@@ -389,6 +389,16 @@ bbk get my-secret                          # decrypted locally, on your machine
 
 There's a lot of flexibility here (managed keys vs. your own passphrase; keeping file ciphertext on the server or resident on your own disk). If you just want "the server can never read this," `--external` is the one to remember. The full model is in [Client-side encryption](https://brian-summers.github.io/blackbook/security/architecture/#client-side-external-encryption-advanced).
 
+**Share it, and the server still can't read it.** The key to an external item never leaves the machine that sealed it, so a read rule on its own doesn't let anyone else open it. When someone is granted read on it, the owner is asked for the key. The owner runs `bbk share sync`, which encrypts the key to the reader alone and passes it through the server, which can't open it. The reader collects it on their next read and keeps it in their own encrypted key store:
+
+```powershell
+bbk -P admin acl grant -D team bob 'db-*' --read   # alice's external db-* items: their keys are requested
+bbk -P alice share sync                            # alice sends the keys bob may have
+bbk -P bob get -D team db-password                 # bob collects the key once, then reads normally
+```
+
+When alice stores a new value, its new key goes to everyone who held the old one, without another `share sync`. Items sealed with `--external-passphrase` are the exception: readers need the passphrase, which alice gives them herself. Details are in [Sharing an external item's key](https://brian-summers.github.io/blackbook/security/architecture/#sharing-an-external-items-key).
+
 <!-- --8<-- [end:protection] -->
 
 ---
@@ -557,7 +567,7 @@ Three flags are **global** — valid on any subcommand, before or after it:
 | `domain use [NAME] [--clear]` | Set/show/clear your default domain (self-service, no admin needed). |
 | `domain ls` / `members NAME` | List domains / a domain's members. |
 | `domain add-member D C [-r role]` / `rm-member D C` | **Admin or domain-admin.** Manage a domain's members. |
-| `acl grant SUBJECT PATTERN [action flags] [bounds]` | **Admin or domain-admin.** Grant permission. `@name` = group. |
+| `acl grant SUBJECT PATTERN [action flags] [bounds]` | **Admin or domain-admin.** Grant permission. `@name` = group. A read rule over external items asks their owners for the keys, and reports what it found. |
 | `acl ls` / `acl revoke ID` | List / revoke permission rules. |
 | `mfa enroll` / `mfa verify CODE` | Set up two-factor for yourself. |
 | `approve REQUEST_ID` | Approve someone's K-of-N request. |
@@ -567,6 +577,8 @@ Three flags are **global** — valid on any subcommand, before or after it:
 | `cleanup` | **Admin.** Purge self-destructed (tombstoned) secrets and files in the current domain. |
 | `web [-b ADDR]` | Launch the local web console (default `127.0.0.1:8088`). |
 | `tunnel forward PEER ...` / `tunnel accept ...` / `tunnel ls` | Open / accept / list end-to-end-encrypted tunnels. |
+| `share sync [--to CLIENT] [-y] [--dry-run]` / `share ls` / `share reject ID` | Send the keys of external items you sealed to the clients who may read them and asked / list those requests / decline one. `sync` asks first unless `-y`. |
+| `share whoami` / `share trust CLIENT FINGERPRINT` | Show your share-identity fingerprint / accept a client's new one after checking it with them. |
 | `key create NAME [-t TYPE] [-M] [--import PATH]` | Create a managed key (`aes256-gcm`, `ed25519`, or `hmac`) in the current domain, or import your own. |
 | `key ls` / `key show NAME` / `key jwks NAME` | List keys / show versions and public key / print an Ed25519 key's JWK Set. |
 | `key rotate NAME` / `key rm NAME` | Add a new key version (old ones keep working) / destroy a key and every version. |
@@ -613,6 +625,32 @@ Normally the server encrypts your data (and can therefore serve it back). With *
 
 `--external` is the shorthand for "managed key, and (for files) resident data." Reading still requires passing every permission gate *and* holding the client-side key — both factors, neither sufficient alone. (`--rotate-on-read` is refused for external items, since the server can't re-key what it can't read.)
 
+#### Sharing an external item's key
+
+An item sealed under a CMK can be read only with that CMK, which never leaves the sealer's profile. To let a client with a read rule open it, the sealer re-wraps the item's data key to that client. The server routes the result but can't open it.
+
+- **Share identities.** Each profile has its own key pair for receiving keys: X25519 and ML-KEM-768 for encryption, and Ed25519 for signing what it sends. The private keys live in the profile's local key store (`~/.bbk/share/<profile>.json`), which is sealed under a subkey of the CMK. It also holds the keys received from others. The public half is published signed with the client's certificate key, and the server checks that signature before storing it.
+- **What the server records.** Each external item records the client that sealed it (`sealed_by`) and its key's id: SHA3-256 of a label and the data key, which names the key without revealing it.
+- **Asking.** Granting a read rule over external items creates a request to each item's sealer, for each client the rule covers. A read also says which key the reader holds. If it's not the current one, the server answers `key_needed` before any gate runs or the read counts, so a reader without the key can't use up a `--delete-on-read` or `--max-reads` item. The reader's client then collects a waiting share, or asks the sealer for one.
+- **Sending.** `bbk share sync` lists the requests and asks before sending. For each request it unwraps the data key with the CMK and encrypts it to the recipient.
+  - The encryption is a hybrid KEM: X25519 and ML-KEM-768, combined with SHA3-256 over both shared secrets, both ciphertexts and the recipient's keys. The result stays secret if either holds.
+  - The key itself is sealed with AES-256-GCM. Its associated data covers the domain, the item's kind and name, the key id, and both clients' names and identity fingerprints.
+  - The whole share is signed with the sealer's Ed25519 key.
+- **Receiving.** The recipient checks the signature against the sealer's pinned identity. It then opens the share and checks that the key matches the key id. It stores the key under its own CMK and confirms receipt, and the server deletes the share.
+- **New values.** Every `put`, `rekey` or upload makes a new data key. The server asks everyone who held the previous key for the new one, and the sealer's client sends it as part of the same command.
+- **What the server enforces.** Only an item's sealer can deliver its key, and only while it can still read the item. A recipient must be a member of the domain with a read rule for the item, both when the key is delivered and when it's collected. Collecting needs only the read rule, not the item's MFA or K-of-N gates: a key is useless without the ciphertext, and only a read that passes every gate serves that. Requests and uncollected shares expire after 30 days. Shares are sealed again under the server's metadata key at rest.
+
+What a malicious or compromised server can and can't do:
+
+- **It can't read the value or its key.** It never holds the data key, and every share is encrypted to its recipient.
+- **It can't give a reader a value of its choosing.** Shares are signed by the sealer, and the key id commits to the key.
+- **It can swap a client's identity only before first contact.** Each client pins the identity it first sees for a name, like SSH host keys, and refuses a different one later. The user then checks the new fingerprint with its owner (`bbk share whoami`) and accepts it with `bbk share trust`.
+- **It can withhold or delay keys, and serve an older version of an item** together with that version's genuinely signed share. Neither breaks confidentiality, and the owner's own reads have the same exposure.
+
+Revoking a rule or a membership stops the server from serving the ciphertext and from delivering new keys. A client that already received a key keeps it, though, so whatever it read or copied before stays readable to it. Store a new value to retire the old key.
+
+Passphrase-sealed items aren't shared: readers need the passphrase. Resident files can't be shared through the server either, since their ciphertext is only on the owner's disk.
+
 ### Managed keys and the crypto toolkit
 
 A managed key is a named row in a domain with one or more **versions**. Each version's 32 bytes of material are sealed with AES-256-GCM under a KEK derived from the master key (`file/dek-kek/v1` with the info tag `managed-keys/v1`), with the key's id and version number as associated data, so material copied between rows or versions in the database fails to decrypt rather than working silently. The key's name is column-encrypted and HMAC-indexed like every other identifier; only Ed25519 public keys are stored in the clear. Material is generated server-side (or imported once) and is never returned by any endpoint.
@@ -642,8 +680,12 @@ The server authenticates each connection's client certificate (Common Name + fin
 | `blackbook_domain_members` | (domain, client, role-in-domain) |
 | `blackbook_clients` | identities: `name_enc` + `name_id` + `token_hash` + `cert_fingerprint` + `role` + `totp_secret_enc` + `expires_at` |
 | `blackbook_acl` | permission rules: subject (client or group) + `pattern_enc` + action bits + `expires_at`/`not_before`/`max_uses`/`use_count` |
-| `blackbook_secrets` | encrypted secrets + `name_id` + `flags` + `read_count` + `access_policy` + `exhausted_at` + optional external envelope |
-| `blackbook_pages` | file metadata + `wrapped_dek` + flags + external/resident key material |
+| `blackbook_secrets` | encrypted secrets + `name_id` + `flags` + `read_count` + `access_policy` + `exhausted_at` + optional external envelope, its `sealed_by` and `key_id` |
+| `blackbook_pages` | file metadata + `wrapped_dek` + flags + external/resident key material, `sealed_by` and `key_id` |
+| `blackbook_share_identities` | each client's published share identity (public keys) + the certificate signature binding it |
+| `blackbook_share_requests` | a client asking for an external item's current key, routed to its sealer |
+| `blackbook_key_shares` | a key encrypted to its recipient, waiting to be collected (`share_enc`, sealed again at rest) |
+| `blackbook_share_holders` | who received which key of an item, so a new value's key reaches them |
 | `blackbook_contents` | references to encrypted blobs on the data volume |
 | `blackbook_access_requests` | K-of-N requests: signatories + approvers + `consumed_at` |
 | `blackbook_access_grants` | advance (pre-)approvals |
@@ -699,9 +741,13 @@ The CLI reads a few variables of its own:
 
 - **True client-side Shamir shares.** Today's K-of-N approval is server-mediated: the server enforces the policy while the data key stays whole. Splitting the key into per-signatory client-encrypted shares — so the *server itself* can't reconstruct it — is the next defense-in-depth step, and the one remaining item from the original roadmap.
 - **Post-quantum protection covers confidentiality, not yet signatures.** Traffic between the CLI and the server uses a hybrid ML-KEM key exchange, and data at rest is AES-256, which quantum computers don't meaningfully weaken. Still classical:
-    - Certificates and signatures (ECDSA P-256, Ed25519). A quantum computer could forge these once it exists, but that wouldn't decrypt traffic recorded earlier.
+    - Certificates and signatures (ECDSA P-256, Ed25519), including the signatures on key shares and share identities. A quantum computer could forge these once it exists, but that wouldn't decrypt traffic recorded earlier. Key shares themselves are encrypted with ML-KEM-768 as well as X25519.
     - The end-to-end layer inside tunnels (X25519). Both hops to the server are post-quantum TLS, so only the relaying server itself could record that layer for later decryption.
     - The server's link to PostgreSQL, because PostgreSQL 16 only negotiates P-256. PostgreSQL 18 on OpenSSL 3.5+ with `ssl_groups = 'X25519MLKEM768:X25519:prime256v1'` negotiates `X25519MLKEM768`, which Blackbook already offers first.
+- **Key sharing doesn't cover everything external.**
+    - Resident files can't be shared yet, because their ciphertext is only on the owner's disk. Sending it over an end-to-end tunnel while both clients are online is the planned next step.
+    - Identities are trusted on first use: the server could substitute one for a client nobody has exchanged keys with yet.
+    - A received key is held only in one profile's local store. If that store is lost, or another profile is used, the key is asked for again.
 - **Audit verification cost is linear** in the number of *live* rows. Archival bounds that set, but a single `audit --verify` still recomputes the whole live chain; there is no incremental/checkpointed verifier yet.
 
 <!-- --8<-- [end:limitations] -->
@@ -728,6 +774,9 @@ src/
 ├── mcp.rs             ─ MCP server for AI agents
 ├── net_ratelimit.rs   ─ per-client rate limiter (anti-DoS)
 ├── audit_archive.rs   ─ encrypted, verifiable audit-log archives
+├── share_crypto.rs    ─ key shares between clients: hybrid KEM, signatures, identities
+├── share_api.rs       ─ key-share endpoints and the hooks in store, read and grant
+├── share_cli.rs       ─ local key store, sending and receiving keys, `bbk share`
 ├── presentation.rs    ─ fingerprint rendering (display only)
 ├── webui.rs (+webui/) ─ local browser console that re-invokes the CLI
 └── tunnel_*.rs        ─ end-to-end-encrypted client-to-client tunnels
