@@ -603,8 +603,9 @@ pub struct GrantSharing {
     pub waiting: Vec<SealerRequests>,
     /// Recipient and item pairs where the recipient already holds the key.
     pub already: usize,
-    /// Items sealed with a passphrase: readers need the passphrase.
-    pub passphrase_sealed: usize,
+    /// Items sealed with a passphrase. Their readers get it from the owner,
+    /// out of band: there is no key for the server to pass on.
+    pub out_of_band: usize,
     /// Resident files, whose ciphertext is only on the sealer's disk.
     pub resident: usize,
     /// Items sealed before key sharing existed. Their sealer stores them again
@@ -653,7 +654,7 @@ pub(crate) async fn after_grant(
         }
         match item.seal {
             Seal::Passphrase => {
-                out.passphrase_sealed += 1;
+                out.out_of_band += 1;
                 continue;
             }
             Seal::Resident => {
