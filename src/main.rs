@@ -1180,6 +1180,26 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        // A rotation due: who may read the item has changed since its key
+        // (`key_id`) was made, so the sealer must re-encrypt it under a new
+        // one, which the server won't share until it has. For a passphrase-
+        // sealed item (`key_id` NULL) it's a reminder to change the
+        // passphrase. Storing the item again clears it. `granted` and
+        // `revoked` are the client ids whose access changed.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS blackbook_key_rotations (
+                item_key   TEXT PRIMARY KEY,
+                secret_id  TEXT REFERENCES blackbook_secrets(resource_id) ON DELETE CASCADE,
+                page_id    TEXT REFERENCES blackbook_pages(id) ON DELETE CASCADE,
+                key_id     CHAR(64),
+                granted    TEXT[] NOT NULL DEFAULT '{}',
+                revoked    TEXT[] NOT NULL DEFAULT '{}',
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CHECK ((secret_id IS NULL) <> (page_id IS NULL))
+            )"#,
+        )
+        .execute(&self.pool)
+        .await?;
         for idx in [
             "CREATE INDEX IF NOT EXISTS idx_blackbook_share_requests_item ON blackbook_share_requests(item_key)",
             "CREATE INDEX IF NOT EXISTS idx_blackbook_key_shares_item ON blackbook_key_shares(item_key)",
@@ -2905,6 +2925,81 @@ async fn cmd_rekey(
     Ok(())
 }
 
+/// Rotates the key of an external item this client sealed, because who may
+/// read it changed. It fetches the item with a rotation read, which the
+/// server doesn't count against the item's read limits. It opens the item
+/// with this profile's CMK and seals the same value under a new data key.
+/// Then it stores that in place of the old key, which the server allows only
+/// while the item still has it. Returns the ids of the requests the server
+/// made for the clients that held the old key, for the caller to deliver.
+async fn rotate_item(
+    session: &client::Session,
+    mfa: Option<String>,
+    r: &share_api::RotationView,
+) -> Result<Vec<String>> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let old_key = r.key_id.as_deref().ok_or_else(|| {
+        AppError::Config(format!(
+            "'{}' is sealed with a passphrase, which its owner changes by hand",
+            r.name
+        ))
+    })?;
+    let cmk = ExtKey::Cmk(session.cmk_bytes().ok_or_else(|| {
+        AppError::Config("this profile has no client master key to rotate keys with".into())
+    })?);
+    let bb = build_client(session, Some(r.domain.clone()), mfa)?;
+    // Only an envelope sealed under this profile's CMK is opened here: never
+    // a passphrase prompt in the middle of a sync.
+    let open = |envelope: &[u8]| -> Result<Zeroizing<Vec<u8>>> {
+        let env = ext_decode(envelope)?;
+        if env.version != 2 || env.mode != EXT_MODE_CMK {
+            return Err(AppError::Crypto(format!(
+                "'{}' isn't sealed under your client master key",
+                r.name
+            )));
+        }
+        Ok(Zeroizing::new(external_open(&env, session, None)?))
+    };
+    match r.kind {
+        share_api::ItemKind::Secret => {
+            let resp = bb.retrieve_rotating(&r.name, old_key).await?;
+            let envelope = b64
+                .decode(resp.envelope.as_deref().unwrap_or_default())
+                .map_err(|_| AppError::Crypto("envelope is not valid base64".into()))?;
+            let plain = open(&envelope)?;
+            let (new_env, new_key) = external_seal(&cmk, &plain)?;
+            let new_key = new_key.unwrap_or_default();
+            let stored = bb
+                .store_rotated(&r.name, &b64.encode(&new_env), &new_key, old_key)
+                .await?;
+            Ok(stored.share_requests)
+        }
+        share_api::ItemKind::File => {
+            let dl = bb.file_get_rotating(&r.name, old_key).await?;
+            let meta = dl.external_meta.as_deref().ok_or_else(|| {
+                AppError::Crypto(format!("'{}' came back without its envelope", r.name))
+            })?;
+            let mut envelope = b64
+                .decode(meta)
+                .map_err(|_| AppError::Crypto("external meta is not valid base64".into()))?;
+            envelope.extend_from_slice(&dl.bytes);
+            let plain = open(&envelope)?;
+            let (meta, ct, new_key) = external_seal_parts(&cmk, &plain)?;
+            let opts = client::FilePutOpts {
+                mime: dl.content_type.as_deref(),
+                overwrite: true,
+                external: true,
+                external_meta: Some(b64.encode(&meta)),
+                key_id: new_key,
+                rotates: Some(old_key.to_string()),
+                ..Default::default()
+            };
+            Ok(bb.file_put(&r.name, ct, &opts).await?.share_requests)
+        }
+    }
+}
+
 async fn cmd_approve(request_id: String) -> Result<()> {
     let session = client::Session::load()?;
     let bb = build_client(&session, None, None)?;
@@ -3464,6 +3559,7 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     server_copy,
                     // Resident files aren't shared through the server.
                     key_id: None,
+                    rotates: None,
                 };
                 match bb.file_put(&name, upload_body, &opts).await {
                     Ok(resp) => {
@@ -3537,6 +3633,7 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     key_component: None,
                     server_copy: false,
                     key_id,
+                    rotates: None,
                 };
                 let resp = bb.file_put(&name, upload_body, &opts).await?;
                 println!(
@@ -3774,6 +3871,7 @@ async fn cmd_file(cmd: FileCmd, domain: Option<String>, mfa: Option<String>) -> 
                     key_component: None,
                     server_copy: false,
                     key_id,
+                    rotates: None,
                 };
                 let resp = bb.file_put(&name, ct, &opts).await?;
                 println!(
@@ -3901,8 +3999,9 @@ async fn cmd_client(cmd: ClientCmd) -> Result<()> {
                     return Ok(());
                 }
             }
-            bb.revoke_client(&name).await?;
+            let v = bb.revoke_client(&name).await?;
             println!("revoked '{name}'");
+            share_cli::after_access_change(&bb, &session, v.get("sharing")).await;
         }
     }
     Ok(())
@@ -4100,8 +4199,9 @@ async fn cmd_acl(cmd: AclCmd, domain: Option<String>) -> Result<()> {
             }
         }
         AclCmd::Revoke { id } => {
-            bb.revoke_acl(&id).await?;
+            let v = bb.revoke_acl(&id).await?;
             println!("revoked acl '{id}'");
+            share_cli::after_access_change(&bb, &session, v.get("sharing")).await;
         }
     }
     Ok(())
@@ -4171,15 +4271,17 @@ async fn cmd_domain(cmd: DomainCmd) -> Result<()> {
             client: cname,
             role,
         } => {
-            bb.add_domain_member(&domain, &cname, &role).await?;
+            let v = bb.add_domain_member(&domain, &cname, &role).await?;
             println!("added '{cname}' to '{domain}' as {role}");
+            share_cli::after_access_change(&bb, &session, v.get("sharing")).await;
         }
         DomainCmd::RmMember {
             domain,
             client: cname,
         } => {
-            bb.remove_domain_member(&domain, &cname).await?;
+            let v = bb.remove_domain_member(&domain, &cname).await?;
             println!("removed '{cname}' from '{domain}'");
+            share_cli::after_access_change(&bb, &session, v.get("sharing")).await;
         }
     }
     Ok(())
@@ -4829,7 +4931,7 @@ async fn main() -> Result<()> {
             crypto_cli::cmd_crypto(cmd, effective_domain.clone(), cli.mfa.clone()).await?
         }
         Commands::Tunnel(cmd) => cmd_tunnel(cmd).await?,
-        Commands::Share(cmd) => share_cli::cmd_share(cmd).await?,
+        Commands::Share(cmd) => share_cli::cmd_share(cmd, cli.mfa.clone()).await?,
         Commands::Client(cmd) => cmd_client(cmd).await?,
         Commands::Acl(cmd) => cmd_acl(cmd, effective_domain.clone()).await?,
         Commands::Domain(cmd) => cmd_domain(cmd).await?,

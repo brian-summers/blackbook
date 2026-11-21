@@ -22,7 +22,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::blackbook_core::{aead_open, aead_open_aad, aead_seal_aad};
 use crate::client::{self, BlackbookClient, ClientError, Session};
-use crate::share_api::{ItemKind, PickupResponse, PublishedIdentity, RequestView};
+use crate::share_api::{
+    AccessChange, ItemKind, ItemName, PickupResponse, PublishedIdentity, RequestView, RotationView,
+};
 use crate::share_crypto::{self, ShareContext, ShareIdentity, ShareSecret, StoredShareSecret};
 use crate::{AppError, Result};
 
@@ -31,6 +33,26 @@ const STORE_LABEL: &[u8] = b"blackbook/share-store/v1";
 
 fn crypto_err(e: share_crypto::ShareError) -> AppError {
     AppError::Crypto(e.to_string())
+}
+
+/// `one` when `n` is 1, else `n` followed by `many`.
+fn count(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        one.to_string()
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// Names for a report: "bob", "bob and carol", "bob, carol and 2 others".
+fn people(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [a] => a.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [a, b, c] => format!("{a}, {b} and {c}"),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} others", rest.len()),
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -277,7 +299,8 @@ async fn ensure_published(
 }
 
 /// Publishes this profile's share identity, best effort: called after login so
-/// that others can share keys with this client before it first asks.
+/// that others can share keys with this client before it first asks. Then
+/// says what's waiting on this client, if anything.
 pub async fn publish_after_login(bb: &BlackbookClient, session: &Session, profile: &str) {
     let result = async {
         let mut store = KeyStore::open_named(session, profile)?;
@@ -286,6 +309,27 @@ pub async fn publish_after_login(bb: &BlackbookClient, session: &Session, profil
     .await;
     if let Err(e) = result {
         eprintln!("note: couldn't publish a share identity yet ({e}); it will be published when first needed");
+    }
+    let rotations = bb.share_rotations().await.unwrap_or_default();
+    let requests = bb.share_requests().await.unwrap_or_default();
+    let keys = rotations.iter().filter(|r| r.key_id.is_some()).count();
+    let phrases = rotations.len() - keys;
+    let mut waiting = Vec::new();
+    if keys > 0 {
+        waiting.push(count(keys, "one key to rotate", "keys to rotate"));
+    }
+    if !requests.is_empty() {
+        waiting.push(count(requests.len(), "one key request", "key requests"));
+    }
+    if phrases > 0 {
+        waiting.push(count(
+            phrases,
+            "one passphrase to change",
+            "passphrases to change",
+        ));
+    }
+    if !waiting.is_empty() {
+        eprintln!("waiting on you: {}. See `bbk share ls`", waiting.join(", "));
     }
 }
 
@@ -519,19 +563,14 @@ pub async fn deliver_now(bb: &BlackbookClient, session: &Session, ids: &[String]
     }
 }
 
-/// Prints what granting a read rule found among external items, and
-/// delivers the keys the granting client sealed itself.
+/// Prints what granting a read rule found among external items. Then, for
+/// the items the granting client sealed itself, rotates their keys and
+/// delivers the new ones.
 pub async fn after_grant(bb: &BlackbookClient, session: &Session, sharing: &serde_json::Value) {
     let Ok(s) = serde_json::from_value::<crate::share_api::GrantSharing>(sharing.clone()) else {
         return;
     };
-    let n = |count: usize, one: &str, many: &str| {
-        if count == 1 {
-            one.to_string()
-        } else {
-            format!("{count} {many}")
-        }
-    };
+    let n = count;
     if s.already > 0 {
         eprintln!(
             "external items: {} already held",
@@ -540,16 +579,39 @@ pub async fn after_grant(bb: &BlackbookClient, session: &Session, sharing: &serd
     }
     for w in &s.waiting {
         eprintln!(
-            "external items: {} waiting on {}, who runs `bbk share sync` to send {}",
+            "external items: {} waiting on {}, who runs `bbk share sync` to rotate {} and send {}",
             n(w.requests, "one key request is", "key requests are"),
             w.sealer,
-            if w.requests == 1 { "it" } else { "them" }
+            if w.requests == 1 {
+                "its key"
+            } else {
+                "their keys"
+            },
+            if w.requests == 1 {
+                "the new one"
+            } else {
+                "the new ones"
+            }
         );
     }
     if s.out_of_band > 0 {
         eprintln!(
-            "external items: {} sealed with a passphrase; readers need that passphrase from its owner",
-            n(s.out_of_band, "one is", "are")
+            "external items: {} sealed with a passphrase; {} owner changes {} (`bbk rekey NAME`) and gives the new {} to its readers",
+            n(s.out_of_band, "one is", "are"),
+            if s.out_of_band == 1 { "its" } else { "their" },
+            if s.out_of_band == 1 { "it" } else { "them" },
+            if s.out_of_band == 1 { "one" } else { "ones" }
+        );
+    }
+    if s.immutable > 0 {
+        eprintln!(
+            "external items: {} immutable, so {} shared without a new key",
+            n(s.immutable, "one is", "are"),
+            if s.immutable == 1 {
+                "its key is"
+            } else {
+                "their keys are"
+            }
         );
     }
     if s.resident > 0 {
@@ -567,7 +629,156 @@ pub async fn after_grant(bb: &BlackbookClient, session: &Session, sharing: &serd
             if s.legacy == 1 { "it" } else { "them" }
         );
     }
+    if !s.yours.is_empty() {
+        // The clients just granted are new readers: they get keys made after
+        // the grant, so the items are rotated before anything is sent.
+        let mine: Vec<ItemName> = bb
+            .share_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| s.yours.contains(&r.id))
+            .map(|r| ItemName {
+                domain: r.domain,
+                kind: r.kind,
+                name: r.name,
+            })
+            .collect();
+        rotate_now(bb, session, &mine).await;
+    }
     deliver_now(bb, session, &s.yours).await;
+}
+
+/// Prints what a change to who may read external items (a rule revoked, a
+/// membership changed, a client revoked) calls for. Then rotates the keys of
+/// the items the client that made the change sealed itself.
+pub async fn after_access_change(
+    bb: &BlackbookClient,
+    session: &Session,
+    sharing: Option<&serde_json::Value>,
+) {
+    let Some(v) = sharing.filter(|v| !v.is_null()) else {
+        return;
+    };
+    let Ok(c) = serde_json::from_value::<AccessChange>(v.clone()) else {
+        return;
+    };
+    for w in &c.waiting {
+        eprintln!(
+            "external items: {} must be rotated by {}, who runs `bbk share sync`",
+            count(w.count, "one key", "keys"),
+            w.sealer
+        );
+    }
+    for p in &c.by_hand {
+        let one = p.count == 1;
+        eprintln!(
+            "external items: {} {} sealed with a passphrase {} a new one; {} changes {} (`bbk rekey NAME`) and gives the new {} to those who still read {}",
+            count(p.count, "one item", "items"),
+            p.sealer,
+            if one { "needs" } else { "need" },
+            p.sealer,
+            if one { "it" } else { "them" },
+            if one { "one" } else { "ones" },
+            if one { "it" } else { "them" }
+        );
+    }
+    if c.immutable > 0 {
+        eprintln!(
+            "external items: {} immutable, so {} can't be rotated",
+            count(c.immutable, "one is", "are"),
+            if c.immutable == 1 {
+                "its key"
+            } else {
+                "their keys"
+            }
+        );
+    }
+    if !c.yours.is_empty() {
+        eprintln!(
+            "external items: {} you sealed {} a new key; rotating now",
+            count(c.yours.len(), "one item", "items"),
+            if c.yours.len() == 1 { "needs" } else { "need" }
+        );
+        rotate_now(bb, session, &c.yours).await;
+    }
+}
+
+/// Rotates the keys due on the named items, which this client sealed, and
+/// delivers the new keys to the clients that held the old ones. Failures are
+/// reported: `bbk share sync` finishes the job.
+async fn rotate_now(bb: &BlackbookClient, session: &Session, items: &[ItemName]) {
+    if items.is_empty() {
+        return;
+    }
+    let rotations = match bb.share_rotations().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("couldn't rotate the keys yet ({e}); run `bbk share sync` to retry");
+            return;
+        }
+    };
+    let due: Vec<&RotationView> = rotations
+        .iter()
+        .filter(|r| {
+            r.key_id.is_some()
+                && items
+                    .iter()
+                    .any(|i| i.domain == r.domain && i.kind == r.kind && i.name == r.name)
+        })
+        .collect();
+    let report = rotate(session, None, &due).await;
+    print_rotations_done(&report);
+    deliver_now(bb, session, &report.requests).await;
+}
+
+#[derive(Default)]
+struct RotateReport {
+    rotated: Vec<String>,
+    skipped: Vec<String>,
+    /// Requests for the new keys from the clients that held the old ones.
+    requests: Vec<String>,
+}
+
+/// Rotates the keys of the given items, which this client sealed.
+async fn rotate(session: &Session, mfa: Option<String>, due: &[&RotationView]) -> RotateReport {
+    let mut report = RotateReport::default();
+    for r in due {
+        let what = format!("'{}'", r.name);
+        if let Some(why) = &r.blocked {
+            report.skipped.push(format!("{what}: {why}"));
+            continue;
+        }
+        match crate::rotate_item(session, mfa.clone(), r).await {
+            Ok(ids) => {
+                report.rotated.push(what);
+                report.requests.extend(ids);
+            }
+            Err(AppError::Client(m))
+                if m.contains("[mfa_required]") || m.contains("[mfa_failed]") =>
+            {
+                report.skipped.push(format!(
+                    "{what}: reading it takes an MFA code; run `bbk --mfa CODE share sync`"
+                ));
+            }
+            Err(AppError::Client(m)) if m.contains("[approval_pending]") => {
+                report.skipped.push(format!(
+                    "{what}: reading it takes K-of-N approval; once you have an advance grant for it, run `bbk share sync`"
+                ));
+            }
+            Err(e) => report.skipped.push(format!("{what}: {e}")),
+        }
+    }
+    report
+}
+
+fn print_rotations_done(report: &RotateReport) {
+    for s in &report.rotated {
+        eprintln!("rotated the key of {s}");
+    }
+    for s in &report.skipped {
+        eprintln!("not rotated yet: {s}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -579,19 +790,21 @@ pub enum ShareCmd {
     /// Show this client's share identity fingerprint, for others to check
     /// against what they pinned. Also publishes it.
     Whoami,
-    /// List the key requests waiting on you: others who may read items you
-    /// sealed and need their keys.
+    /// List what's waiting on you: items you sealed whose keys must be
+    /// rotated, or whose passphrases changed, because who may read them
+    /// changed; and others who may read items you sealed and need their keys.
     Ls,
-    /// Send the keys others asked for, for items you sealed. Asks before
-    /// sending unless --yes.
+    /// Rotate the keys that are due, then send the keys others asked for, for
+    /// items you sealed. Asks first unless --yes.
     Sync {
-        /// Only requests from this client.
+        /// Only requests from this client. Every rotation that's due is
+        /// still made.
         #[arg(long)]
         to: Option<String>,
         /// Don't ask for confirmation.
         #[arg(short = 'y', long)]
         yes: bool,
-        /// Only show what would be sent.
+        /// Only show what would be rotated and sent.
         #[arg(long)]
         dry_run: bool,
     },
@@ -600,6 +813,51 @@ pub enum ShareCmd {
     /// Accept a new share identity for CLIENT, after checking FINGERPRINT with
     /// them out of band. Needed when a client set up its profile again.
     Trust { client: String, fingerprint: String },
+}
+
+/// Why a rotation is due: "bob lost access; new reader: carol".
+fn why(r: &RotationView) -> String {
+    let mut parts = Vec::new();
+    if !r.revoked.is_empty() {
+        parts.push(format!("{} lost access", people(&r.revoked)));
+    }
+    if !r.granted.is_empty() {
+        let label = if r.granted.len() == 1 {
+            "new reader"
+        } else {
+            "new readers"
+        };
+        parts.push(format!("{label}: {}", people(&r.granted)));
+    }
+    parts.join("; ")
+}
+
+fn print_rotations(rotations: &[RotationView]) {
+    let (keys, phrases): (Vec<&RotationView>, Vec<&RotationView>) =
+        rotations.iter().partition(|r| r.key_id.is_some());
+    let line = |r: &RotationView| {
+        let note = match &r.blocked {
+            Some(reason) => format!("  [blocked: {reason}]"),
+            None => String::new(),
+        };
+        println!(
+            "  {} {}/{}  ({}){note}",
+            r.kind.as_str(),
+            r.domain,
+            r.name,
+            why(r)
+        );
+    };
+    if !keys.is_empty() {
+        println!("key rotations due (`bbk share sync` rotates them):");
+        keys.into_iter().for_each(line);
+    }
+    if !phrases.is_empty() {
+        println!(
+            "passphrases to change (`bbk rekey NAME` or `bbk file rekey NAME`, then give the new one to those who still read it):"
+        );
+        phrases.into_iter().for_each(line);
+    }
 }
 
 fn print_requests(requests: &[RequestView]) {
@@ -629,7 +887,7 @@ fn confirm(question: &str) -> Result<bool> {
     use std::io::IsTerminal;
     if crate::credstore::prompts_suppressed() || !std::io::stdin().is_terminal() {
         return Err(AppError::Config(
-            "not sending keys without confirmation: pass --yes".into(),
+            "not rotating or sending keys without confirmation: pass --yes".into(),
         ));
     }
     eprint!("{question} [y/N] ");
@@ -637,7 +895,7 @@ fn confirm(question: &str) -> Result<bool> {
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
-pub async fn cmd_share(cmd: ShareCmd) -> Result<()> {
+pub async fn cmd_share(cmd: ShareCmd, mfa: Option<String>) -> Result<()> {
     let session = Session::load()?;
     let bb = crate::build_client(&session, None, None)?;
     match cmd {
@@ -647,36 +905,62 @@ pub async fn cmd_share(cmd: ShareCmd) -> Result<()> {
             let fp = me.identity().fingerprint().map_err(crypto_err)?;
             println!("{name}: {}", share_crypto::display_fingerprint(&fp));
         }
-        ShareCmd::Ls => print_requests(&bb.share_requests().await?),
+        ShareCmd::Ls => {
+            print_rotations(&bb.share_rotations().await?);
+            print_requests(&bb.share_requests().await?);
+        }
         ShareCmd::Sync { to, yes, dry_run } => {
+            let rotations = bb.share_rotations().await?;
             let requests: Vec<RequestView> = bb
                 .share_requests()
                 .await?
                 .into_iter()
                 .filter(|r| to.as_deref().map_or(true, |t| r.recipient == t))
                 .collect();
+            print_rotations(&rotations);
             print_requests(&requests);
-            if requests.is_empty() || dry_run {
+            // Passphrase changes are listed, but only their owner can make them.
+            let due: Vec<&RotationView> = rotations.iter().filter(|r| r.key_id.is_some()).collect();
+            if (due.is_empty() && requests.is_empty()) || dry_run {
                 return Ok(());
             }
             let recipients: std::collections::BTreeSet<&str> =
                 requests.iter().map(|r| r.recipient.as_str()).collect();
-            if !yes
-                && !confirm(&format!(
-                    "Send {} {} to {}?",
-                    requests.len(),
-                    if requests.len() == 1 { "key" } else { "keys" },
-                    recipients.into_iter().collect::<Vec<_>>().join(", ")
-                ))?
-            {
-                println!("nothing sent");
+            let rotate_what = count(due.len(), "one key", "keys");
+            let send_what = format!(
+                "{} to {}",
+                count(requests.len(), "one key", "keys"),
+                recipients.into_iter().collect::<Vec<_>>().join(", ")
+            );
+            let question = match (due.is_empty(), requests.is_empty()) {
+                (false, false) => format!("Rotate {rotate_what}, then send {send_what}?"),
+                (false, true) => format!("Rotate {rotate_what}?"),
+                _ => format!("Send {send_what}?"),
+            };
+            if !yes && !confirm(&question)? {
+                println!("nothing rotated or sent");
                 return Ok(());
             }
+            // Rotations first: no key goes out while one is due on it. Each
+            // rotation sends its new key to the clients that held the old one.
+            let rotated = rotate(&session, mfa, &due).await;
+            print_rotations_done(&rotated);
+            deliver_now(&bb, &session, &rotated.requests).await;
+            // Then the requests confirmed above, as they are now: a rotated
+            // item's request names its new key.
+            let ids: Vec<&str> = requests.iter().map(|r| r.id.as_str()).collect();
+            let requests: Vec<RequestView> = bb
+                .share_requests()
+                .await?
+                .into_iter()
+                .filter(|r| ids.contains(&r.id.as_str()))
+                .collect();
             let mut store = KeyStore::open(&session)?;
             let report = deliver(&bb, &session, &mut store, &requests).await?;
             print_report(&report);
-            if !report.skipped.is_empty() && report.sent.is_empty() {
-                return Err(AppError::Client("no keys were sent".into()));
+            let failed = !rotated.skipped.is_empty() || !report.skipped.is_empty();
+            if failed && rotated.rotated.is_empty() && report.sent.is_empty() {
+                return Err(AppError::Client("no keys were rotated or sent".into()));
             }
         }
         ShareCmd::Reject { id } => {
@@ -707,4 +991,37 @@ pub async fn cmd_share(cmd: ShareCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn report_wording() {
+        assert_eq!(people(&names(&["bob"])), "bob");
+        assert_eq!(people(&names(&["bob", "carol"])), "bob and carol");
+        assert_eq!(people(&names(&["a", "b", "c"])), "a, b and c");
+        assert_eq!(people(&names(&["a", "b", "c", "d"])), "a, b and 2 others");
+        assert_eq!(count(1, "one key", "keys"), "one key");
+        assert_eq!(count(3, "one key", "keys"), "3 keys");
+        let mut r = RotationView {
+            domain: "team".into(),
+            kind: ItemKind::Secret,
+            name: "db-password".into(),
+            key_id: None,
+            granted: names(&["carol"]),
+            revoked: names(&["bob"]),
+            created_at: String::new(),
+            blocked: None,
+        };
+        assert_eq!(why(&r), "bob lost access; new reader: carol");
+        r.revoked.clear();
+        r.granted = names(&["carol", "dave"]);
+        assert_eq!(why(&r), "new readers: carol and dave");
+    }
 }

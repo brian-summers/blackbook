@@ -57,6 +57,13 @@ reads() {
 }
 # says NAME WHAT CMD...: CMD succeeds, and its output matches the regex WHAT.
 says() { local name=$1 what=$2 out; shift 2; if out=$("$@" 2>&1) && [[ $out =~ $what ]]; then ok "$name"; else bad "$name" "$out"; fi; }
+# says_both NAME WHAT1 WHAT2 CMD...: CMD succeeds, and its output matches both regexes.
+says_both() {
+    local name=$1 a=$2 b=$3 out; shift 3
+    if out=$("$@" 2>&1) && [[ $out =~ $a ]] && [[ $out =~ $b ]]; then ok "$name"; else bad "$name" "$out"; fi
+}
+# lacks NAME WHAT CMD...: CMD succeeds, and its output doesn't match the regex WHAT.
+lacks() { local name=$1 what=$2 out; shift 2; if out=$("$@" 2>&1) && ! [[ $out =~ $what ]]; then ok "$name"; else bad "$name" "$out"; fi; }
 # status NAME WANT PATH [CURL-ARGS...]: the HTTP status is one of WANT (a
 # regex). curl runs in a container on the stack's network and offers only
 # classical key exchange, standing in for any non-bbk TLS client.
@@ -197,6 +204,7 @@ if [ -n "$want" ] && [ "$got" = "$want" ]; then ok "1 MiB through the tunnel, un
 echo "== sharing the key of an item encrypted client-side"
 SHARED="shared-value-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 CHANGED="changed-value-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+NEWPHRASE="new e2e passphrase $$"
 expect "admin adds bob to e2e" bbk admin domain add-member e2e bob
 expect "admin lets alice store shared-* in e2e" \
     bbk admin acl grant -D e2e alice 'shared-*' --create --read --update
@@ -219,15 +227,26 @@ refuse "nor shared-once, and trying doesn't use up its one read" 'Asked alice fo
 refuse "the server can't read it either: admin passes the ACL, but has no key" 'Asked alice for it' \
     bbk admin get -D e2e shared-token
 says "alice sees bob's requests" 'e2e/shared-token → bob' bbk alice share ls
+says "and that shared-once, bob being a new reader, needs a new key first" \
+    'secret e2e/shared-once  \(new reader: bob\)' bbk alice share ls
+says "and that shared-phrase needs a new passphrase" \
+    'secret e2e/shared-phrase  \(new reader: bob\)' bbk alice share ls
 refuse "share sync sends nothing from a script without --yes" 'pass --yes' bbk alice share sync
-says "alice sends the keys bob asked for" "shared the key to 'shared-once' to bob" \
+says_both "alice rotates the keys, then sends bob the new ones" \
+    "rotated the key of 'shared-once'" "shared the key to 'shared-once' to bob" \
     bbk alice share sync --yes --to bob
 reads "bob reads shared-token with the key alice sent" "$SHARED" bbk bob get -D e2e shared-token
 reads "and again, from his own key store" "$SHARED" bbk bob get -D e2e shared-token
-reads "bob reads shared-once" "$SHARED" bbk bob get -D e2e shared-once
+reads "bob reads shared-once: rotating it didn't use up its one read" "$SHARED" \
+    bbk bob get -D e2e shared-once
 refuse "and that read used it up" 'not_found' bbk bob get -D e2e shared-once
 reads "bob reads shared-phrase with the passphrase alice told him" "$SHARED" \
     bbk bob get -D e2e shared-phrase --external-passphrase "$PASSPHRASE"
+expect "alice changes shared-phrase's passphrase, as asked" bbk alice rekey -D e2e shared-phrase \
+    --old-external-passphrase "$PASSPHRASE" --external-passphrase "$NEWPHRASE"
+lacks "which clears the reminder" 'shared-phrase' bbk alice share ls
+reads "bob reads shared-phrase with the new passphrase alice told him" "$SHARED" \
+    bbk bob get -D e2e shared-phrase --external-passphrase "$NEWPHRASE"
 says "a new value from alice sends its new key to bob, who held the old one" \
     "shared the key to 'shared-token' to bob" \
     bbk alice put -D e2e shared-token "$CHANGED" --external-key --overwrite
@@ -240,9 +259,21 @@ refuse "so bob can't read it" 'Asked alice for it' bbk bob get -D e2e shared-tok
 expect "alice trusts bob's real fingerprint, checked with him" bbk alice share trust bob "$BOB_FP"
 says "and sends the key" "shared the key to 'shared-token' to bob" bbk alice share sync --yes --to bob
 reads "bob reads it" "$SHARED" bbk bob get -D e2e shared-token
-expect "admin removes bob from e2e" bbk admin domain rm-member e2e bob
+says_both "removing bob from e2e makes alice rotate the key he held, and change a passphrase" \
+    'one key must be rotated by alice' 'one item alice sealed with a passphrase needs a new one' \
+    bbk admin domain rm-member e2e bob
 refuse "bob, no longer a member, can't read it: holding the key isn't enough" '\[not_member\]' \
     bbk bob get -D e2e shared-token
+says "alice sees why shared-token needs a new key" 'secret e2e/shared-token  \(bob lost access\)' \
+    bbk alice share ls
+says "alice rotates it" "rotated the key of 'shared-token'" bbk alice share sync --yes --to bob
+expect "admin adds bob back to e2e" bbk admin domain add-member e2e bob
+refuse "the key bob kept no longer opens shared-token, so he asks for the new one" \
+    'Asked alice for it' bbk bob get -D e2e shared-token
+says_both "bob being a new reader again, alice rotates once more before sending" \
+    "rotated the key of 'shared-token'" "shared the key to 'shared-token' to bob" \
+    bbk alice share sync --yes --to bob
+reads "bob reads it" "$SHARED" bbk bob get -D e2e shared-token
 
 echo "== audit and persistence"
 expect "audit log hash chain verifies" bbk admin audit --verify

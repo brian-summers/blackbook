@@ -58,6 +58,11 @@ pub struct StoreRequest {
     /// key shares. Ignored for any other value.
     #[serde(default)]
     pub key_id: Option<String>,
+    /// A rotation of an external secret's key by its sealer: the id of the
+    /// key the new envelope replaces. The store must overwrite the secret as
+    /// it is now (see [`share_api::check_rotation_store`]).
+    #[serde(default)]
+    pub rotates: Option<String>,
 }
 
 /// K-of-N approval policy attached to a resource.
@@ -540,6 +545,9 @@ pub struct FilePolicyQuery {
     /// key: its data key's id (see [`StoreRequest::key_id`]).
     #[serde(default)]
     pub key_id: Option<String>,
+    /// A rotation of an external file's key (see [`StoreRequest::rotates`]).
+    #[serde(default)]
+    pub rotates: Option<String>,
 }
 
 impl FilePolicyQuery {
@@ -981,15 +989,38 @@ pub async fn store_data(
         Ok(k) => k,
         Err(msg) => return Ok(err(StatusCode::BAD_REQUEST, "validation_error", msg)),
     };
+    if let Some(rotates) = req.rotates.as_deref() {
+        let current: Option<(bool, Option<String>, Option<String>)> = match &existed {
+            Some((id, _)) => sqlx::query_as(
+                "SELECT is_external, sealed_by, key_id FROM blackbook_secrets WHERE resource_id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?,
+            None => None,
+        };
+        if let Some(resp) = share_api::check_rotation_store(
+            &req.resource_name,
+            &client,
+            current,
+            rotates,
+            key_id.as_deref(),
+        ) {
+            return Ok(resp);
+        }
+    }
 
     let now = chrono::Utc::now();
     let mut response = if let Some((existing_id, _)) = existed {
-        sqlx::query(
+        // A rotation replaces the key it names and no other: `$11` makes the
+        // update a compare-and-swap against a store that raced it.
+        let updated = sqlx::query(
             "UPDATE blackbook_secrets
              SET data_layer1 = $1, data_layer2 = $2, wrapped_key = $3,
                  is_external = $4, external_envelope = $5, encryption_method = $6, updated_at = $7,
                  sealed_by = $9, key_id = $10
-             WHERE resource_id = $8",
+             WHERE resource_id = $8 AND ($11::text IS NULL OR key_id = $11)",
         )
         .bind(&layer1)
         .bind(&layer2)
@@ -1001,9 +1032,21 @@ pub async fn store_data(
         .bind(&existing_id)
         .bind(sealed_by)
         .bind(&key_id)
+        .bind(req.rotates.as_deref())
         .execute(&state.db)
         .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+        .map_err(actix_web::error::ErrorInternalServerError)?
+        .rows_affected();
+        if updated == 0 {
+            return Ok(err(
+                StatusCode::CONFLICT,
+                "key_changed",
+                format!(
+                    "'{}' was stored again while it was being rotated; run `bbk share sync` again",
+                    req.resource_name
+                ),
+            ));
+        }
         StoreResponse {
             resource_id: existing_id,
             resource_name: req.resource_name.clone(),
@@ -1120,7 +1163,7 @@ pub async fn store_data(
         action_name(action),
         Some(&req.resource_name),
         AuditStatus::Ok,
-        None,
+        req.rotates.as_ref().map(|_| "key rotation"),
     )
     .await;
     Ok(HttpResponse::Created().json(response))
@@ -1261,6 +1304,14 @@ pub async fn retrieve_data(
     // current one is told so here, before any gate runs or the read counts.
     // Clients that don't send the header get the envelope as before.
     let mut served_key_id: Option<String> = None;
+    // The sealer fetching the secret to rotate its key (share_api::
+    // rotation_read): every gate below still applies, but the read isn't
+    // counted against the secret's read limits.
+    let rotate_hdr = http_req
+        .headers()
+        .get(share_api::ROTATE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let mut rotating = false;
     if is_external {
         let (sealed_by, key_id): (Option<String>, Option<String>) = sqlx::query_as(
             "SELECT sealed_by, key_id FROM blackbook_secrets WHERE resource_id = $1",
@@ -1287,13 +1338,31 @@ pub async fn retrieve_data(
                 .await;
             }
         }
+        if let Some(r) = rotate_hdr {
+            rotating = share_api::rotation_read(
+                &state,
+                share_api::ItemKind::Secret,
+                &res_id,
+                &client,
+                sealed_by.as_deref(),
+                key_id.as_deref(),
+                r,
+            )
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+            if !rotating {
+                return Ok(share_api::not_rotating(&res_name));
+            }
+        }
         served_key_id = key_id;
+    } else if rotate_hdr.is_some() {
+        return Ok(share_api::not_rotating(&res_name));
     }
 
     // Fast soft-reject if the stale snapshot already shows the limit reached
     // — avoids consuming a K-of-N approval / advance-grant use for a read that
     // the atomic claim below would refuse anyway. Not the enforcement point.
-    if let Some(max) = flags.max_reads {
+    if let Some(max) = flags.max_reads.filter(|_| !rotating) {
         if read_count >= max {
             audit(
                 &state.db,
@@ -1402,7 +1471,9 @@ pub async fn retrieve_data(
         (None, true) => Some(1),
         (None, false) => None,
     };
-    let new_count: Option<i64> = if let Some(cap) = cap {
+    let new_count: Option<i64> = if rotating {
+        None
+    } else if let Some(cap) = cap {
         let claimed: Option<(i64,)> = sqlx::query_as(
             "UPDATE blackbook_secrets SET read_count = read_count + 1
              WHERE resource_id = $1 AND exhausted_at IS NULL AND read_count < $2
@@ -1484,7 +1555,9 @@ pub async fn retrieve_data(
         .max_reads
         .map(|m| new_count.map(|c| c >= m).unwrap_or(false))
         .unwrap_or(false);
-    let post_note: Option<&'static str> = if flags.delete_on_read {
+    let post_note: Option<&'static str> = if rotating {
+        Some("read to rotate its key (not counted as a read)")
+    } else if flags.delete_on_read {
         let _ = sqlx::query("DELETE FROM blackbook_secrets WHERE resource_id = $1")
             .bind(&res_id)
             .execute(&state.db)
@@ -2163,6 +2236,24 @@ pub async fn upload_file(
         Ok(k) => k,
         Err(msg) => return Ok(err(StatusCode::BAD_REQUEST, "validation_error", msg)),
     };
+    if let Some(rotates) = pol.rotates.as_deref() {
+        let current: Option<(bool, Option<String>, Option<String>)> = match &existing {
+            Some((id, _, _)) => sqlx::query_as(
+                "SELECT is_external AND external_kind = 1, sealed_by, key_id
+                 FROM blackbook_pages WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?,
+            None => None,
+        };
+        if let Some(resp) =
+            share_api::check_rotation_store(&name, &client, current, rotates, key_id.as_deref())
+        {
+            return Ok(resp);
+        }
+    }
 
     // Update DB. Replace-or-insert with old-blob cleanup.
     let now = chrono::Utc::now();
@@ -2188,14 +2279,15 @@ pub async fn upload_file(
         let size_enc = enc_field(&state.metadata_enc_key, &plaintext_size.to_be_bytes())
             .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
         let hash_id = file_hash_id_hex(&state.name_index_key, &plaintext_hash);
-        sqlx::query(
+        // As for secrets, `$15` makes a rotation a compare-and-swap.
+        let updated = sqlx::query(
             "UPDATE blackbook_pages
              SET content_id = $1, wrapped_dek = $2, plaintext_hash_id = $3,
                  plaintext_size_enc = $4, mime_type_enc = $5,
                  is_external = $6, external_meta = $7,
                  external_kind = $8, server_key_component = $9, has_server_copy = $10,
                  updated_at = $11, sealed_by = $13, key_id = $14
-             WHERE id = $12",
+             WHERE id = $12 AND ($15::text IS NULL OR key_id = $15)",
         )
         .bind(&new_content_id)
         .bind(&wrapped_dek)
@@ -2211,9 +2303,20 @@ pub async fn upload_file(
         .bind(&page_id)
         .bind(sealed_by)
         .bind(&key_id)
+        .bind(pol.rotates.as_deref())
         .execute(&mut *tx)
         .await
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+        .map_err(actix_web::error::ErrorInternalServerError)?
+        .rows_affected();
+        if updated == 0 {
+            drop(tx);
+            let _ = tokio::fs::remove_file(&storage_full).await;
+            return Ok(err(
+                StatusCode::CONFLICT,
+                "key_changed",
+                format!("'{name}' was stored again while it was being rotated; run `bbk share sync` again"),
+            ));
+        }
         sqlx::query("DELETE FROM blackbook_contents WHERE id = $1")
             .bind(&old_content_id)
             .execute(&mut *tx)
@@ -2344,6 +2447,11 @@ pub async fn upload_file(
             .map_err(actix_web::error::ErrorInternalServerError)?;
 
     acl_record_use(&state.db, &decision).await;
+    let note = if pol.rotates.is_some() {
+        format!("{plaintext_size}b, key rotation")
+    } else {
+        format!("{plaintext_size}b")
+    };
     audit(
         &state.db,
         &state.audit_hmac_key,
@@ -2352,7 +2460,7 @@ pub async fn upload_file(
         &format!("file.{}", action_name(action)),
         Some(&name),
         AuditStatus::Ok,
-        Some(&format!("{}b", plaintext_size)),
+        Some(&note),
     )
     .await;
     Ok(HttpResponse::Created().json(response))
@@ -2505,6 +2613,12 @@ pub async fn download_file(
     // and a reader that holds an older key or none, is answered here, before
     // any gate runs or the read counts.
     let mut served_key_id: Option<String> = None;
+    // And a rotation read, as there: not counted against the read limits.
+    let rotate_hdr = http_req
+        .headers()
+        .get(share_api::ROTATE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let mut rotating = false;
     if is_external && external_kind == 1 {
         let (sealed_by, key_id): (Option<String>, Option<String>) =
             sqlx::query_as("SELECT sealed_by, key_id FROM blackbook_pages WHERE id = $1")
@@ -2530,10 +2644,28 @@ pub async fn download_file(
                 .await;
             }
         }
+        if let Some(r) = rotate_hdr {
+            rotating = share_api::rotation_read(
+                &state,
+                share_api::ItemKind::File,
+                &page_id,
+                &client,
+                sealed_by.as_deref(),
+                key_id.as_deref(),
+                r,
+            )
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+            if !rotating {
+                return Ok(share_api::not_rotating(&name));
+            }
+        }
         served_key_id = key_id;
+    } else if rotate_hdr.is_some() {
+        return Ok(share_api::not_rotating(&name));
     }
     // Fast soft-reject (not the enforcement point — the atomic claim below is).
-    if let Some(max) = flags.max_reads {
+    if let Some(max) = flags.max_reads.filter(|_| !rotating) {
         if read_count >= max {
             audit(
                 &state.db,
@@ -2639,7 +2771,9 @@ pub async fn download_file(
         (None, true) => Some(1),
         (None, false) => None,
     };
-    let new_count: Option<i64> = if let Some(cap) = cap {
+    let new_count: Option<i64> = if rotating {
+        None
+    } else if let Some(cap) = cap {
         let claimed: Option<(i64,)> = sqlx::query_as(
             "UPDATE blackbook_pages SET read_count = read_count + 1
              WHERE id = $1 AND exhausted_at IS NULL AND read_count < $2
@@ -2853,7 +2987,9 @@ pub async fn download_file(
         .max_reads
         .map(|m| new_count.map(|c| c >= m).unwrap_or(false))
         .unwrap_or(false);
-    let post_note: Option<&'static str> = if flags.delete_on_read {
+    let post_note: Option<&'static str> = if rotating {
+        Some("read to rotate its key (not counted as a read)")
+    } else if flags.delete_on_read {
         // Deleting the content row CASCADE-deletes the page row; then drop the blob.
         let _ = sqlx::query("DELETE FROM blackbook_contents WHERE id = $1")
             .bind(&content_id)
@@ -3504,11 +3640,30 @@ pub async fn revoke_client_endpoint(
         ));
     }
     let name_id = client_name_id_hex(&state.name_index_key, &name);
-    let affected = sqlx::query(
-        "UPDATE blackbook_clients SET revoked_at = NOW()
-         WHERE name_id = $1 AND revoked_at IS NULL",
+    let target: Option<(String,)> = sqlx::query_as(
+        "SELECT id FROM blackbook_clients WHERE name_id = $1 AND revoked_at IS NULL",
     )
     .bind(&name_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+    let Some((target_id,)) = target else {
+        return Ok(err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("no active client named '{name}'"),
+        ));
+    };
+    // The client loses access to everything: keys it holds must be rotated.
+    let scope = share_api::Scope::client(&state, &target_id)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let before = access_before(&state, Some(&scope)).await?;
+    let affected = sqlx::query(
+        "UPDATE blackbook_clients SET revoked_at = NOW()
+         WHERE id = $1 AND revoked_at IS NULL",
+    )
+    .bind(&target_id)
     .execute(&state.db)
     .await
     .map_err(actix_web::error::ErrorInternalServerError)?
@@ -3520,6 +3675,7 @@ pub async fn revoke_client_endpoint(
             format!("no active client named '{name}'"),
         ));
     }
+    let sharing = access_after(&state, &caller, Some(&scope), before).await?;
     audit(
         &state.db,
         &state.audit_hmac_key,
@@ -3531,7 +3687,8 @@ pub async fn revoke_client_endpoint(
         None,
     )
     .await;
-    Ok(HttpResponse::Ok().json(serde_json::json!({"revoked": true, "name": name})))
+    Ok(HttpResponse::Ok()
+        .json(serde_json::json!({"revoked": true, "name": name, "sharing": sharing})))
 }
 
 pub async fn grant_acl(
@@ -3645,6 +3802,28 @@ pub async fn grant_acl(
         }
     }
 
+    // A read rule changes who may read the external items it covers: note
+    // who could before, to find what it changed (share_api.rs).
+    let grants_read = mask & auth::action_bit(AclAction::Read) != 0;
+    let scope = share_api::Scope::rule(
+        &state,
+        &domain_id,
+        client_id.as_deref(),
+        group_domain_id.as_deref(),
+    )
+    .await
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+    let before = if grants_read {
+        Some(
+            scope
+                .access(&state)
+                .await
+                .map_err(actix_web::error::ErrorInternalServerError)?,
+        )
+    } else {
+        None
+    };
+
     let id = Id::new(12).encode();
     let pattern_enc = enc_str(&state.metadata_enc_key, &req.resource_pattern)
         .map_err(|e| actix_web::error::ErrorInternalServerError(e))?;
@@ -3696,23 +3875,55 @@ pub async fn grant_acl(
     .await;
     // A read rule over external items: the clients it covers need the items'
     // keys, which only each item's sealer holds. Ask the sealers.
-    let sharing = if mask & auth::action_bit(AclAction::Read) != 0 {
-        Some(
+    let sharing = match before {
+        Some(before) => Some(
             share_api::after_grant(
                 &state,
                 &caller,
                 &domain_id,
                 &req.resource_pattern,
-                client_id.as_deref(),
-                group_domain_id.as_deref(),
+                &scope,
+                before,
             )
             .await
             .map_err(actix_web::error::ErrorInternalServerError)?,
-        )
-    } else {
-        None
+        ),
+        None => None,
     };
     Ok(HttpResponse::Created().json(serde_json::json!({"id": id, "sharing": sharing})))
+}
+
+/// Who may read which external items within `scope`, taken just before an
+/// access change: `None` when the change can't affect reading.
+async fn access_before(
+    state: &AppState,
+    scope: Option<&share_api::Scope>,
+) -> Result<Option<share_api::Access>> {
+    match scope {
+        Some(s) => Ok(Some(
+            s.access(state)
+                .await
+                .map_err(actix_web::error::ErrorInternalServerError)?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// The rotations an access change calls for (share_api::after_access_change).
+async fn access_after(
+    state: &AppState,
+    actor: &AuthenticatedClient,
+    scope: Option<&share_api::Scope>,
+    before: Option<share_api::Access>,
+) -> Result<Option<share_api::AccessChange>> {
+    match (scope, before) {
+        (Some(s), Some(b)) => Ok(Some(
+            share_api::after_access_change(state, actor, s, b)
+                .await
+                .map_err(actix_web::error::ErrorInternalServerError)?,
+        )),
+        _ => Ok(None),
+    }
 }
 
 fn parse_rfc3339_opt(
@@ -3828,13 +4039,14 @@ pub async fn revoke_acl(
     let id = path.into_inner();
     // Authorize against the *rule's own domain* so a domain admin can only
     // revoke rules in domains they administer (and can't reach across domains).
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT domain_id FROM blackbook_acl WHERE id = $1")
-            .bind(&id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(actix_web::error::ErrorInternalServerError)?;
-    let Some((domain_id,)) = row else {
+    let row: Option<(String, Option<String>, Option<String>, i32)> = sqlx::query_as(
+        "SELECT domain_id, client_id, group_domain_id, actions FROM blackbook_acl WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(actix_web::error::ErrorInternalServerError)?;
+    let Some((domain_id, rule_client, rule_group, actions)) = row else {
         return Ok(err(StatusCode::NOT_FOUND, "not_found", "no such acl entry"));
     };
     if let Err(resp) = require_domain_admin(&state.db, &caller, &domain_id).await {
@@ -3851,6 +4063,21 @@ pub async fn revoke_acl(
         .await;
         return Ok(resp);
     }
+    let scope = if actions & auth::action_bit(AclAction::Read) != 0 {
+        Some(
+            share_api::Scope::rule(
+                &state,
+                &domain_id,
+                rule_client.as_deref(),
+                rule_group.as_deref(),
+            )
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?,
+        )
+    } else {
+        None
+    };
+    let before = access_before(&state, scope.as_ref()).await?;
     let affected = sqlx::query("DELETE FROM blackbook_acl WHERE id = $1")
         .bind(&id)
         .execute(&state.db)
@@ -3860,6 +4087,7 @@ pub async fn revoke_acl(
     if affected == 0 {
         return Ok(err(StatusCode::NOT_FOUND, "not_found", "no such acl entry"));
     }
+    let sharing = access_after(&state, &caller, scope.as_ref(), before).await?;
     audit(
         &state.db,
         &state.audit_hmac_key,
@@ -3871,7 +4099,7 @@ pub async fn revoke_acl(
         None,
     )
     .await;
-    Ok(HttpResponse::Ok().json(serde_json::json!({"revoked": true})))
+    Ok(HttpResponse::Ok().json(serde_json::json!({"revoked": true, "sharing": sharing})))
 }
 
 // ---------------------------------------------------------------------------
@@ -4043,6 +4271,12 @@ pub async fn add_domain_member(
             format!("no active client named '{}'", req.client_name),
         ));
     };
+    // Joining (or a new role) can give the client read access to external
+    // items, or take it away; see share_api::after_access_change.
+    let scope = share_api::Scope::membership(&state, &domain_id, &client_id)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let before = access_before(&state, Some(&scope)).await?;
     sqlx::query(
         "INSERT INTO blackbook_domain_members (domain_id, client_id, role)
          VALUES ($1, $2, $3)
@@ -4054,6 +4288,7 @@ pub async fn add_domain_member(
     .execute(&state.db)
     .await
     .map_err(actix_web::error::ErrorInternalServerError)?;
+    let sharing = access_after(&state, &caller, Some(&scope), before).await?;
     audit(
         &state.db,
         &state.audit_hmac_key,
@@ -4067,6 +4302,7 @@ pub async fn add_domain_member(
     .await;
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "added": true, "domain": domain_name, "client": req.client_name, "role": req.role,
+        "sharing": sharing,
     })))
 }
 
@@ -4104,17 +4340,31 @@ pub async fn remove_domain_member(
         return Ok(resp);
     }
     let client_nid = client_name_id_hex(&state.name_index_key, &client_name);
-    let affected = sqlx::query(
-        "DELETE FROM blackbook_domain_members
-         WHERE domain_id  = $1
-           AND client_id  = (SELECT id FROM blackbook_clients WHERE name_id = $2)",
-    )
-    .bind(&domain_id)
-    .bind(&client_nid)
-    .execute(&state.db)
-    .await
-    .map_err(actix_web::error::ErrorInternalServerError)?
-    .rows_affected();
+    let member: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM blackbook_clients WHERE name_id = $1")
+            .bind(&client_nid)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?;
+    let Some((member_id,)) = member else {
+        return Ok(err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such membership",
+        ));
+    };
+    let scope = share_api::Scope::membership(&state, &domain_id, &member_id)
+        .await
+        .map_err(actix_web::error::ErrorInternalServerError)?;
+    let before = access_before(&state, Some(&scope)).await?;
+    let affected =
+        sqlx::query("DELETE FROM blackbook_domain_members WHERE domain_id = $1 AND client_id = $2")
+            .bind(&domain_id)
+            .bind(&member_id)
+            .execute(&state.db)
+            .await
+            .map_err(actix_web::error::ErrorInternalServerError)?
+            .rows_affected();
     if affected == 0 {
         return Ok(err(
             StatusCode::NOT_FOUND,
@@ -4122,6 +4372,7 @@ pub async fn remove_domain_member(
             "no such membership",
         ));
     }
+    let sharing = access_after(&state, &caller, Some(&scope), before).await?;
     audit(
         &state.db,
         &state.audit_hmac_key,
@@ -4133,7 +4384,7 @@ pub async fn remove_domain_member(
         Some(&format!("client={client_name}")),
     )
     .await;
-    Ok(HttpResponse::Ok().json(serde_json::json!({"removed": true})))
+    Ok(HttpResponse::Ok().json(serde_json::json!({"removed": true, "sharing": sharing})))
 }
 
 // ---------------------------------------------------------------------------
@@ -6313,6 +6564,10 @@ pub async fn run_server(
             .route(
                 "/api/v1/share/requests",
                 web::get().to(share_api::list_requests),
+            )
+            .route(
+                "/api/v1/share/rotations",
+                web::get().to(share_api::list_rotations),
             )
             .route("/api/v1/share/deliver", web::post().to(share_api::deliver))
             .route("/api/v1/share/reject", web::post().to(share_api::reject))
