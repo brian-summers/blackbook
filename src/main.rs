@@ -24,6 +24,7 @@ mod server;
 mod share_api;
 mod share_cli;
 mod share_crypto;
+mod sync_cli;
 pub mod tls;
 mod tunnel_client;
 mod tunnel_crypto;
@@ -338,6 +339,13 @@ enum Commands {
     /// with clients granted read on them, and check who you share with.
     #[command(subcommand)]
     Share(share_cli::ShareCmd),
+
+    /// Do what this client does to keep in step with the server: publish
+    /// its share identity, rotate the keys of items you sealed whose readers
+    /// changed, and send the keys others asked for. Asks first unless --yes.
+    /// `--watch` keeps it running; `--auto on` makes it follow your other
+    /// commands.
+    Sync(sync_cli::SyncArgs),
 
     /// Manage API clients (admin only).
     #[command(subcommand)]
@@ -1126,7 +1134,7 @@ impl Database {
         //
         // A request: `recipient` wants the item's current key. It's addressed
         // to whoever sealed the item now (its `sealed_by`), who fulfils it
-        // with `bbk share sync`.
+        // with `bbk sync`.
         sqlx::query(
             r#"CREATE TABLE IF NOT EXISTS blackbook_share_requests (
                 id           TEXT PRIMARY KEY,
@@ -1745,7 +1753,7 @@ where
                 share_cli::KeyOutcome::Received => Ok(read(held()).await),
                 share_cli::KeyOutcome::Requested { sealer } => Err(AppError::Client(format!(
                     "'{name}' is encrypted client-side by {sealer}, and you don't have its key yet. \
-                     Asked {sealer} for it: once they run `bbk share sync`, read it again."
+                     Asked {sealer} for it: once they run `bbk sync`, read it again."
                 ))),
             }
         }
@@ -2144,9 +2152,13 @@ async fn cmd_login(
             "Carried the existing client master key forward — external data stays decryptable."
         );
     }
+    // The saved profile is now the active one, for this process too.
+    client::set_active_profile(profile.clone());
     // Publish this profile's share identity now, so that the owners of
     // external items can share their keys with it before it first asks.
+    // Then sync, if auto sync is on for the profile.
     share_cli::publish_after_login(&bb, &session, &profile).await;
+    sync_cli::after_login(&bb, &session).await;
     // Default this profile to the identity's private user domain, so commands
     // land in the user's own namespace without needing -D. Only set it if the
     // user hasn't already chosen a default via `domain use` (explicit wins).
@@ -4513,6 +4525,27 @@ fn server_sans(bind: &str) -> Vec<String> {
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)] // the crate denies unsafe_code; this block is the audited exception
 fn harden_process() {
+    no_core_dumps();
+    // SAFETY: a plain libc call with valid arguments; we only read its return
+    // code.
+    unsafe {
+        if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) != 0 {
+            log::warn!(
+                "hardening: mlockall() failed (RLIMIT_MEMLOCK too low under this \
+                        container/cgroup?) — secret pages may be swappable. Raise the \
+                        memlock limit or disable swap on the host for full protection."
+            );
+        } else {
+            log::info!("hardening: core dumps disabled and process memory locked (no swap).");
+        }
+    }
+}
+
+/// Step 1 of [`harden_process`] on its own: no core dumps, and no same-uid
+/// `ptrace`. Also for `bbk sync --watch`, which keeps a profile open.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)] // the crate denies unsafe_code; this block is the audited exception
+fn no_core_dumps() {
     // SAFETY: plain libc calls with valid arguments; we only read their return
     // codes and never dereference anything we didn't allocate on the stack.
     unsafe {
@@ -4526,15 +4559,6 @@ fn harden_process() {
         if libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) != 0 {
             log::warn!("hardening: could not set PR_SET_DUMPABLE=0");
         }
-        if libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) != 0 {
-            log::warn!(
-                "hardening: mlockall() failed (RLIMIT_MEMLOCK too low under this \
-                        container/cgroup?) — secret pages may be swappable. Raise the \
-                        memlock limit or disable swap on the host for full protection."
-            );
-        } else {
-            log::info!("hardening: core dumps disabled and process memory locked (no swap).");
-        }
     }
 }
 
@@ -4544,6 +4568,9 @@ fn harden_process() {
 fn harden_process() {
     log::info!("hardening: core-dump/swap locking is Linux-only; skipped on this platform.");
 }
+
+#[cfg(not(target_os = "linux"))]
+fn no_core_dumps() {}
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -4576,6 +4603,69 @@ async fn main() -> Result<()> {
         .clone()
         .or_else(|| client::Session::read_domain_pref(&resolved_profile));
 
+    let then_sync = sync_after(&cli.command);
+    run(cli, effective_domain).await?;
+    match then_sync {
+        SyncAfter::Never => {}
+        SyncAfter::IfOpened if !client::profile_opened() => {}
+        SyncAfter::IfOpened => sync_cli::after_command(false).await,
+        SyncAfter::Always => sync_cli::after_command(true).await,
+    }
+    Ok(())
+}
+
+/// Whether auto sync (`bbk sync --auto on`) may follow a command that
+/// succeeded. Every command is listed, so a new one has to decide.
+enum SyncAfter {
+    /// Long-running, plumbing, about the profile itself, or a sync already.
+    Never,
+    /// If it opened the active profile.
+    IfOpened,
+    /// Whatever the interval: it just unlocked the profile.
+    Always,
+}
+
+fn sync_after(command: &Commands) -> SyncAfter {
+    match command {
+        Commands::Server { .. }
+        | Commands::Web { .. }
+        | Commands::Mcp { .. }
+        | Commands::Health
+        | Commands::RekeyDek
+        | Commands::Completions { .. }
+        | Commands::Complete { .. }
+        | Commands::Tunnel(_)
+        | Commands::Sync(_)
+        // A login syncs itself, once it has made its profile active.
+        | Commands::Login { .. }
+        | Commands::Logout
+        | Commands::Lock
+        | Commands::Passphrase { .. }
+        | Commands::Profile(_) => SyncAfter::Never,
+        Commands::Unlock { .. } => SyncAfter::Always,
+        Commands::Whoami
+        | Commands::Put { .. }
+        | Commands::Get { .. }
+        | Commands::Ls { .. }
+        | Commands::Rm { .. }
+        | Commands::Rekey { .. }
+        | Commands::File(_)
+        | Commands::Key(_)
+        | Commands::Crypto(_)
+        | Commands::Share(_)
+        | Commands::Client(_)
+        | Commands::Acl(_)
+        | Commands::Domain(_)
+        | Commands::Mfa(_)
+        | Commands::Approve { .. }
+        | Commands::Requests { .. }
+        | Commands::Grants(_)
+        | Commands::Audit { .. }
+        | Commands::Cleanup => SyncAfter::IfOpened,
+    }
+}
+
+async fn run(cli: Cli, effective_domain: Option<String>) -> Result<()> {
     match cli.command {
         Commands::Health => {
             let db_url = cli
@@ -4931,7 +5021,8 @@ async fn main() -> Result<()> {
             crypto_cli::cmd_crypto(cmd, effective_domain.clone(), cli.mfa.clone()).await?
         }
         Commands::Tunnel(cmd) => cmd_tunnel(cmd).await?,
-        Commands::Share(cmd) => share_cli::cmd_share(cmd, cli.mfa.clone()).await?,
+        Commands::Share(cmd) => share_cli::cmd_share(cmd).await?,
+        Commands::Sync(args) => sync_cli::cmd_sync(args, cli.mfa.clone()).await?,
         Commands::Client(cmd) => cmd_client(cmd).await?,
         Commands::Acl(cmd) => cmd_acl(cmd, effective_domain.clone()).await?,
         Commands::Domain(cmd) => cmd_domain(cmd).await?,

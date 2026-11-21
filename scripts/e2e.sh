@@ -89,9 +89,9 @@ cleanup() {
     local rc=$?
     if [ "$failures" -gt 0 ] || [ "$rc" -ne 0 ]; then
         echo; echo "== logs"; compose logs --no-color --tail 60 2>&1 || true
-        for c in bob alice web; do dock logs --tail 20 "$PROJECT-$c" 2>&1 | sed "s/^/$c: /" || true; done
+        for c in bob alice web sync; do dock logs --tail 20 "$PROJECT-$c" 2>&1 | sed "s/^/$c: /" || true; done
     fi
-    dock rm -f "$PROJECT-bob" "$PROJECT-alice" "$PROJECT-web" >/dev/null 2>&1 || true
+    dock rm -f "$PROJECT-bob" "$PROJECT-alice" "$PROJECT-web" "$PROJECT-sync" >/dev/null 2>&1 || true
     compose down -v --remove-orphans >/dev/null 2>&1 || true
     dock volume ls -q --filter "name=$PROJECT-" | while read -r v; do dock volume rm "$v" >/dev/null; done
     rm -rf "$WORK"
@@ -231,10 +231,10 @@ says "and that shared-once, bob being a new reader, needs a new key first" \
     'secret e2e/shared-once  \(new reader: bob\)' bbk alice share ls
 says "and that shared-phrase needs a new passphrase" \
     'secret e2e/shared-phrase  \(new reader: bob\)' bbk alice share ls
-refuse "share sync sends nothing from a script without --yes" 'pass --yes' bbk alice share sync
+refuse "sync sends nothing from a script without --yes" 'pass --yes' bbk alice sync
 says_both "alice rotates the keys, then sends bob the new ones" \
     "rotated the key of 'shared-once'" "shared the key to 'shared-once' to bob" \
-    bbk alice share sync --yes --to bob
+    bbk alice sync --yes --to bob
 reads "bob reads shared-token with the key alice sent" "$SHARED" bbk bob get -D e2e shared-token
 reads "and again, from his own key store" "$SHARED" bbk bob get -D e2e shared-token
 reads "bob reads shared-once: rotating it didn't use up its one read" "$SHARED" \
@@ -257,7 +257,7 @@ says "then her next value isn't sent to the identity she doesn't trust" 'has cha
     bbk alice put -D e2e shared-token "$SHARED" --external-key --overwrite
 refuse "so bob can't read it" 'Asked alice for it' bbk bob get -D e2e shared-token
 expect "alice trusts bob's real fingerprint, checked with him" bbk alice share trust bob "$BOB_FP"
-says "and sends the key" "shared the key to 'shared-token' to bob" bbk alice share sync --yes --to bob
+says "and sends the key" "shared the key to 'shared-token' to bob" bbk alice sync --yes --to bob
 reads "bob reads it" "$SHARED" bbk bob get -D e2e shared-token
 says_both "removing bob from e2e makes alice rotate the key he held, and change a passphrase" \
     'one key must be rotated by alice' 'one item alice sealed with a passphrase needs a new one' \
@@ -266,14 +266,39 @@ refuse "bob, no longer a member, can't read it: holding the key isn't enough" '\
     bbk bob get -D e2e shared-token
 says "alice sees why shared-token needs a new key" 'secret e2e/shared-token  \(bob lost access\)' \
     bbk alice share ls
-says "alice rotates it" "rotated the key of 'shared-token'" bbk alice share sync --yes --to bob
+says "alice rotates it" "rotated the key of 'shared-token'" bbk alice sync --yes --to bob
 expect "admin adds bob back to e2e" bbk admin domain add-member e2e bob
 refuse "the key bob kept no longer opens shared-token, so he asks for the new one" \
     'Asked alice for it' bbk bob get -D e2e shared-token
 says_both "bob being a new reader again, alice rotates once more before sending" \
     "rotated the key of 'shared-token'" "shared the key to 'shared-token' to bob" \
-    bbk alice share sync --yes --to bob
+    bbk alice sync --yes --to bob
 reads "bob reads it" "$SHARED" bbk bob get -D e2e shared-token
+
+echo "== syncing on its own"
+expect "alice turns auto sync on, to follow every command" bbk alice sync --auto on --every 0
+expect "alice seals shared-auto" bbk alice put -D e2e shared-auto "$SHARED" --external-key
+refuse "bob asks alice for its key" 'Asked alice for it' bbk bob get -D e2e shared-auto
+says_both "alice's next command rotates it and sends bob the new key, without asking" \
+    "sync: rotated the key of 'shared-auto'" "sync: shared the key to 'shared-auto' to bob" \
+    bbk alice ls -D e2e
+reads "bob reads shared-auto" "$SHARED" bbk bob get -D e2e shared-auto
+lacks "a command with nothing new to sync says nothing more" 'sync:' bbk alice ls -D e2e
+expect "alice turns auto sync off" bbk alice sync --auto off
+expect "alice seals shared-watch" bbk alice put -D e2e shared-watch "$SHARED" --external-key
+refuse "bob asks alice for its key" 'Asked alice for it' bbk bob get -D e2e shared-watch
+lacks "with auto sync off, alice's commands don't sync" 'sync:' bbk alice ls -D e2e
+mapfile -t A < <(cli_args alice)
+dock run -d --name "$PROJECT-sync" "${A[@]}" "$IMAGE" sync --watch --every 2s >/dev/null
+got=""
+for _ in $(seq 30); do
+    got=$(bbk bob get -D e2e shared-watch 2>/dev/null) && [ "$got" = "$SHARED" ] && break
+    sleep 1
+done
+if [ "$got" = "$SHARED" ]; then ok "a watcher alice leaves running sends bob the key, and he reads it"
+else bad "a watcher alice leaves running sends bob the key, and he reads it" "$(dock logs "$PROJECT-sync" 2>&1)"; fi
+says "the watcher says what it did" "rotated the key of 'shared-watch'" dock logs "$PROJECT-sync"
+dock rm -f "$PROJECT-sync" >/dev/null
 
 echo "== audit and persistence"
 expect "audit log hash chain verifies" bbk admin audit --verify
