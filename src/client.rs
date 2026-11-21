@@ -818,6 +818,9 @@ pub struct FilePutOpts<'a> {
     pub server_copy: bool,
     /// For an external file sealed under the CMK: its data key's id.
     pub key_id: Option<String>,
+    /// A rotation: the id of the key this upload replaces (see
+    /// [`BlackbookClient::store_rotated`]).
+    pub rotates: Option<String>,
 }
 
 /// Full result of a file download. `bytes` is the body (client ciphertext for
@@ -1154,6 +1157,7 @@ impl BlackbookClient {
             overwrite,
             None,
             None,
+            None,
         )
         .await
     }
@@ -1180,6 +1184,31 @@ impl BlackbookClient {
             overwrite,
             Some(envelope_b64),
             key_id,
+            None,
+        )
+        .await
+    }
+
+    /// Store an external secret's new envelope as the rotation of the key
+    /// `rotates`, which it replaces. Overwrites only if the secret still has
+    /// that key.
+    pub async fn store_rotated(
+        &self,
+        name: &str,
+        envelope_b64: &str,
+        key_id: &str,
+        rotates: &str,
+    ) -> Result<StoreResponse> {
+        self.store_inner(
+            name,
+            "",
+            None,
+            None,
+            None,
+            true,
+            Some(envelope_b64),
+            Some(key_id),
+            Some(rotates),
         )
         .await
     }
@@ -1195,6 +1224,7 @@ impl BlackbookClient {
         overwrite: bool,
         external: Option<&str>,
         key_id: Option<&str>,
+        rotates: Option<&str>,
     ) -> Result<StoreResponse> {
         let body = serde_json::json!({
             "resource_name": name,
@@ -1205,6 +1235,7 @@ impl BlackbookClient {
             "overwrite": overwrite,
             "external": external,
             "key_id": key_id,
+            "rotates": rotates,
         });
         let resp = self
             .req_in_domain(reqwest::Method::POST, "/api/v1/store")
@@ -1247,7 +1278,33 @@ impl BlackbookClient {
         self.handle(resp).await
     }
 
+    /// Retrieve an external secret this client sealed, to rotate its key
+    /// `key_id`: a read the server doesn't count against the secret's limits.
+    pub async fn retrieve_rotating(&self, name: &str, key_id: &str) -> Result<RetrieveResponse> {
+        let resp = self
+            .req_in_domain(reqwest::Method::POST, "/api/v1/retrieve")
+            .json(&serde_json::json!({"resource_id": name}))
+            .header(crate::share_api::ROTATE_HEADER, key_id)
+            .send()
+            .await?;
+        self.handle(resp).await
+    }
+
     // --- key sharing (share_api.rs) ------------------------------------------
+
+    /// The rotations due on items this client sealed.
+    pub async fn share_rotations(&self) -> Result<Vec<crate::share_api::RotationView>> {
+        let resp = self
+            .req(reqwest::Method::GET, "/api/v1/share/rotations")
+            .send()
+            .await?;
+        #[derive(Deserialize)]
+        struct List {
+            rotations: Vec<crate::share_api::RotationView>,
+        }
+        let l: List = self.handle(resp).await?;
+        Ok(l.rotations)
+    }
 
     /// Publishes this client's share identity, signed with its certificate.
     pub async fn share_publish_identity(
@@ -1526,6 +1583,9 @@ impl BlackbookClient {
         if let Some(k) = &opts.key_id {
             qs.push(("key_id".into(), k.clone()));
         }
+        if let Some(k) = &opts.rotates {
+            qs.push(("rotates".into(), k.clone()));
+        }
         let mut rb = self.req(reqwest::Method::PUT, &url).query(&qs).body(body);
         if let Some(m) = opts.mime {
             rb = rb.header(reqwest::header::CONTENT_TYPE, m);
@@ -1554,6 +1614,18 @@ impl BlackbookClient {
             rb = rb.header(crate::share_api::HELD_KEY_HEADER, k);
         }
         let resp = rb.send().await?;
+        self.handle_download(resp).await
+    }
+
+    /// Download an external file this client sealed, to rotate its key
+    /// `key_id`: a read the server doesn't count against the file's limits.
+    pub async fn file_get_rotating(&self, name: &str, key_id: &str) -> Result<FileDownload> {
+        let url = format!("/api/v1/files/{}", urlencoding_simple(name));
+        let resp = self
+            .req_in_domain(reqwest::Method::GET, &url)
+            .header(crate::share_api::ROTATE_HEADER, key_id)
+            .send()
+            .await?;
         self.handle_download(resp).await
     }
 

@@ -393,11 +393,13 @@ There's a lot of flexibility here (managed keys vs. your own passphrase; keeping
 
 ```powershell
 bbk -P admin acl grant -D team bob 'db-*' --read   # alice's external db-* items: their keys are requested
-bbk -P alice share sync                            # alice sends the keys bob may have
+bbk -P alice share sync                            # alice rotates their keys, then sends bob the new ones
 bbk -P bob get -D team db-password                 # bob collects the key once, then reads normally
 ```
 
-When alice stores a new value, its new key goes to everyone who held the old one, without another `share sync`. Items sealed with `--external-passphrase` are the exception: readers need the passphrase, which alice gives them herself. Details are in [Sharing an external item's key](https://brian-summers.github.io/blackbook/security/architecture/#sharing-an-external-items-key).
+Every change to who may read an item gets it a new key. A new reader is sent a key made after they were granted access. When someone loses access, the key they kept stops opening anything the server holds. `share sync` makes these rotations, and the server won't pass on a key until its rotation is done. When alice stores a new value, its new key goes to everyone who held the old one, without another `share sync`.
+
+Items sealed with `--external-passphrase` are the exception: readers need the passphrase, which alice gives them herself. When who may read one changes, `share ls` reminds alice to change its passphrase (`bbk rekey`) until she does. Details are in [Sharing an external item's key](https://brian-summers.github.io/blackbook/security/architecture/#sharing-an-external-items-key).
 
 <!-- --8<-- [end:protection] -->
 
@@ -568,7 +570,7 @@ Three flags are **global** — valid on any subcommand, before or after it:
 | `domain ls` / `members NAME` | List domains / a domain's members. |
 | `domain add-member D C [-r role]` / `rm-member D C` | **Admin or domain-admin.** Manage a domain's members. |
 | `acl grant SUBJECT PATTERN [action flags] [bounds]` | **Admin or domain-admin.** Grant permission. `@name` = group. A read rule over external items asks their owners for the keys, and reports what it found. |
-| `acl ls` / `acl revoke ID` | List / revoke permission rules. |
+| `acl ls` / `acl revoke ID` | List / revoke permission rules. Revoking a rule, a membership or a client reports the external items whose keys must now be rotated. |
 | `mfa enroll` / `mfa verify CODE` | Set up two-factor for yourself. |
 | `approve REQUEST_ID` | Approve someone's K-of-N request. |
 | `requests [ID] [-v]` | See requests you can act on — who can approve and who already has. |
@@ -577,7 +579,7 @@ Three flags are **global** — valid on any subcommand, before or after it:
 | `cleanup` | **Admin.** Purge self-destructed (tombstoned) secrets and files in the current domain. |
 | `web [-b ADDR]` | Launch the local web console (default `127.0.0.1:8088`). |
 | `tunnel forward PEER ...` / `tunnel accept ...` / `tunnel ls` | Open / accept / list end-to-end-encrypted tunnels. |
-| `share sync [--to CLIENT] [-y] [--dry-run]` / `share ls` / `share reject ID` | Send the keys of external items you sealed to the clients who may read them and asked / list those requests / decline one. `sync` asks first unless `-y`. |
+| `share sync [--to CLIENT] [-y] [--dry-run]` / `share ls` / `share reject ID` | For external items you sealed: rotate the keys that are due, then send keys to the clients who may read them and asked / list the rotations, passphrase changes and requests waiting on you / decline a request. `sync` asks first unless `-y`. |
 | `share whoami` / `share trust CLIENT FINGERPRINT` | Show your share-identity fingerprint / accept a client's new one after checking it with them. |
 | `key create NAME [-t TYPE] [-M] [--import PATH]` | Create a managed key (`aes256-gcm`, `ed25519`, or `hmac`) in the current domain, or import your own. |
 | `key ls` / `key show NAME` / `key jwks NAME` | List keys / show versions and public key / print an Ed25519 key's JWK Set. |
@@ -632,12 +634,18 @@ An item sealed under a CMK can be read only with that CMK, which never leaves th
 - **Share identities.** Each profile has its own key pair for receiving keys: X25519 and ML-KEM-768 for encryption, and Ed25519 for signing what it sends. The private keys live in the profile's local key store (`~/.bbk/share/<profile>.json`), which is sealed under a subkey of the CMK. It also holds the keys received from others. The public half is published signed with the client's certificate key, and the server checks that signature before storing it.
 - **What the server records.** Each external item records the client that sealed it (`sealed_by`) and its key's id: SHA3-256 of a label and the data key, which names the key without revealing it.
 - **Asking.** Granting a read rule over external items creates a request to each item's sealer, for each client the rule covers. A read also says which key the reader holds. If it's not the current one, the server answers `key_needed` before any gate runs or the read counts, so a reader without the key can't use up a `--delete-on-read` or `--max-reads` item. The reader's client then collects a waiting share, or asks the sealer for one.
-- **Sending.** `bbk share sync` lists the requests and asks before sending. For each request it unwraps the data key with the CMK and encrypts it to the recipient.
+- **Sending.** `bbk share sync` lists the rotations due and the requests, and asks before acting. It rotates first (see below). Then, for each request, it unwraps the data key with the CMK and encrypts it to the recipient.
   - The encryption is a hybrid KEM: X25519 and ML-KEM-768, combined with SHA3-256 over both shared secrets, both ciphertexts and the recipient's keys. The result stays secret if either holds.
   - The key itself is sealed with AES-256-GCM. Its associated data covers the domain, the item's kind and name, the key id, and both clients' names and identity fingerprints.
   - The whole share is signed with the sealer's Ed25519 key.
 - **Receiving.** The recipient checks the signature against the sealer's pinned identity. It then opens the share and checks that the key matches the key id. It stores the key under its own CMK and confirms receipt, and the server deletes the share.
 - **New values.** Every `put`, `rekey` or upload makes a new data key. The server asks everyone who held the previous key for the new one, and the sealer's client sends it as part of the same command.
+- **Rotation on every change of access.** Whenever who may read an item changes, its key is rotated: re-encrypted under a new data key, which goes to everyone who still reads it.
+  - **A new reader** gets a key made after it was granted access. When a client that holds no key for the item asks for one, a rotation of the current key becomes due. That covers a client a rule was just granted to, and one that joined a domain or group a rule already covered.
+  - **A client that loses access** keeps the key it had, which no longer opens anything the server holds. Revoking a rule, removing a membership or a role, and revoking a client all make a rotation due on every item whose current key the client held. A rule that expires or runs out of uses has the same effect: holders are checked again whenever the sealer lists its rotations, and before any key is delivered. A client counts as holding a key from the moment it collects the share, whether or not it confirms storing it.
+  - **The server enforces it.** It won't deliver an item's key while a rotation of that key is due, so `share sync` rotates first. The rotation reads the item with a header naming the key it's rotating. That read passes every gate a read does, including MFA and K-of-N approval, but isn't counted against the item's read limits, so rotating a `--delete-on-read` item doesn't use it up. The new envelope then replaces the old one only if the item still has the old key, so a rotation can't overwrite a value someone stored meanwhile. A client that granted or revoked access on items it sealed itself rotates them as part of the same command.
+  - **Passphrase-sealed items** can't be rotated by the client, since a new passphrase has to reach their readers by hand. The change makes a reminder due instead, listed by `share ls`, until the owner stores the item again: `bbk rekey NAME --external-passphrase NEW` changes the passphrase.
+  - **Immutable items** (`--no-overwrite`) can't be stored again, so their keys can't be rotated. A grant reports them, and their keys are shared as they are.
 - **What the server enforces.** Only an item's sealer can deliver its key, and only while it can still read the item. A recipient must be a member of the domain with a read rule for the item, both when the key is delivered and when it's collected. Collecting needs only the read rule, not the item's MFA or K-of-N gates: a key is useless without the ciphertext, and only a read that passes every gate serves that. Requests and uncollected shares expire after 30 days. Shares are sealed again under the server's metadata key at rest.
 
 What a malicious or compromised server can and can't do:
@@ -647,7 +655,7 @@ What a malicious or compromised server can and can't do:
 - **It can swap a client's identity only before first contact.** Each client pins the identity it first sees for a name, like SSH host keys, and refuses a different one later. The user then checks the new fingerprint with its owner (`bbk share whoami`) and accepts it with `bbk share trust`.
 - **It can withhold or delay keys, and serve an older version of an item** together with that version's genuinely signed share. Neither breaks confidentiality, and the owner's own reads have the same exposure.
 
-Revoking a rule or a membership stops the server from serving the ciphertext and from delivering new keys. A client that already received a key keeps it, though, so whatever it read or copied before stays readable to it. Store a new value to retire the old key.
+Revoking a rule or a membership stops the server from serving the ciphertext and from delivering new keys, and the rotation it calls for means the key the client kept opens nothing the server holds. Rotation re-encrypts the same value, though. Whatever the client read or copied while it had access stays known to it, so if that matters, store a new value, such as a changed password.
 
 Passphrase-sealed items aren't shared: readers need the passphrase. Resident files can't be shared through the server either, since their ciphertext is only on the owner's disk.
 
@@ -686,6 +694,7 @@ The server authenticates each connection's client certificate (Common Name + fin
 | `blackbook_share_requests` | a client asking for an external item's current key, routed to its sealer |
 | `blackbook_key_shares` | a key encrypted to its recipient, waiting to be collected (`share_enc`, sealed again at rest) |
 | `blackbook_share_holders` | who received which key of an item, so a new value's key reaches them |
+| `blackbook_key_rotations` | an item whose key (or passphrase) must be rotated because who may read it changed: the key to retire, and the client ids that gained or lost access |
 | `blackbook_contents` | references to encrypted blobs on the data volume |
 | `blackbook_access_requests` | K-of-N requests: signatories + approvers + `consumed_at` |
 | `blackbook_access_grants` | advance (pre-)approvals |
@@ -748,6 +757,7 @@ The CLI reads a few variables of its own:
     - Resident files can't be shared yet, because their ciphertext is only on the owner's disk. Sending it over an end-to-end tunnel while both clients are online is the planned next step.
     - Identities are trusted on first use: the server could substitute one for a client nobody has exchanged keys with yet.
     - A received key is held only in one profile's local store. If that store is lost, or another profile is used, the key is asked for again.
+    - Rotation waits for the sealer. The server makes it due and stops the old key from going any further, but only the sealer's client can re-encrypt the item, at its next `share sync` (or its next grant or revocation). Until then, a client that lost access still holds a key that opens the stored ciphertext, though the server no longer serves that ciphertext to it.
 - **Audit verification cost is linear** in the number of *live* rows. Archival bounds that set, but a single `audit --verify` still recomputes the whole live chain; there is no incremental/checkpointed verifier yet.
 
 <!-- --8<-- [end:limitations] -->
