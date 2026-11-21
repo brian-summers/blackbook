@@ -8,7 +8,7 @@
 //!   checking that the client's registered certificate signed it.
 //! - **Requests.** A client that may read an external item, but doesn't hold
 //!   its current key, asks for it. The request goes to whoever sealed the
-//!   item (its `sealed_by`), who fulfils it with `bbk share sync`. Granting a
+//!   item (its `sealed_by`), who fulfils it with `bbk sync`. Granting a
 //!   read rule creates requests for every external item the rule covers.
 //! - **Shares.** The sealer delivers the key encrypted to the recipient. The
 //!   server holds it, sealed again under its metadata key at rest, until the
@@ -22,7 +22,7 @@
 //!
 //!   The server can't make a new key itself, so it records the rotation as
 //!   due and refuses to deliver the old key. The sealer's client rotates the
-//!   item with `bbk share sync`, re-encrypting it under a new key that is
+//!   item with `bbk sync`, re-encrypting it under a new key that is
 //!   then delivered to everyone who still reads it. A passphrase-sealed item
 //!   is rotated by hand: its owner changes the passphrase, and the record
 //!   reminds them until the item is stored again.
@@ -731,7 +731,9 @@ fn rotation_store_refusal(
     if key_id.as_deref() != Some(rotates) {
         return Some((
             "key_changed",
-            format!("'{name}' was stored again since its rotation was listed; run `bbk share sync` again"),
+            format!(
+                "'{name}' was stored again since its rotation was listed; run `bbk sync` again"
+            ),
         ));
     }
     if new_key_id.is_none() {
@@ -879,7 +881,7 @@ pub struct AccessChange {
     /// them right away: making the change was the decision.
     #[serde(default)]
     pub yours: Vec<ItemName>,
-    /// Keys other sealers must rotate, with `bbk share sync`.
+    /// Keys other sealers must rotate, with `bbk sync`.
     #[serde(default)]
     pub waiting: Vec<SealerCount>,
     /// Passphrase-sealed items, by owner, whose passphrase must be changed by
@@ -1128,7 +1130,7 @@ pub struct GrantSharing {
     /// Requests for items the granting client sealed. Its client delivers
     /// them right away: granting the rule was the decision to share.
     pub yours: Vec<String>,
-    /// Requests waiting on other sealers, who run `bbk share sync`.
+    /// Requests waiting on other sealers, who run `bbk sync`.
     pub waiting: Vec<SealerRequests>,
     /// Recipient and item pairs where the recipient already holds the key.
     pub already: usize,
@@ -1811,9 +1813,7 @@ pub async fn deliver(
         return Ok(err(
             StatusCode::CONFLICT,
             "key_changed",
-            format!(
-                "'{name}' has a new key since this request was listed; run `bbk share sync` again"
-            ),
+            format!("'{name}' has a new key since this request was listed; run `bbk sync` again"),
         ));
     }
     if !can_read_now(&state, &client, &item)
@@ -1880,7 +1880,7 @@ pub async fn deliver(
             StatusCode::CONFLICT,
             "rotation_due",
             format!(
-                "'{name}' needs a new key first: who may read it has changed. Run `bbk share sync`, which rotates its key, then sends it"
+                "'{name}' needs a new key first: who may read it has changed. Run `bbk sync`, which rotates its key, then sends it"
             ),
         ));
     }

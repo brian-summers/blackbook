@@ -441,7 +441,7 @@ fn aad_json(aad: &[u8]) -> Value {
 }
 
 /// Seconds from `30`, `90s`, `15m`, `1h`, `7d`, `2w`.
-fn parse_duration(s: &str) -> Result<i64> {
+pub(crate) fn parse_duration(s: &str) -> Result<i64> {
     let s = s.trim();
     let bad = || {
         cfg(format!(

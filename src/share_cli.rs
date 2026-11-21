@@ -1,5 +1,6 @@
 //! Key sharing, client side: the local key store, the flows that send an
-//! external item's key to another client or receive one, and `bbk share`.
+//! external item's key to another client or receive one, the key checks of
+//! `bbk sync` ([`KeyWork`]), and `bbk share`.
 //! The cryptography is in [`crate::share_crypto`], the server's part in
 //! [`crate::share_api`].
 //!
@@ -299,8 +300,7 @@ async fn ensure_published(
 }
 
 /// Publishes this profile's share identity, best effort: called after login so
-/// that others can share keys with this client before it first asks. Then
-/// says what's waiting on this client, if anything.
+/// that others can share keys with this client before it first asks.
 pub async fn publish_after_login(bb: &BlackbookClient, session: &Session, profile: &str) {
     let result = async {
         let mut store = KeyStore::open_named(session, profile)?;
@@ -310,6 +310,19 @@ pub async fn publish_after_login(bb: &BlackbookClient, session: &Session, profil
     if let Err(e) = result {
         eprintln!("note: couldn't publish a share identity yet ({e}); it will be published when first needed");
     }
+}
+
+/// Publishes this profile's share identity (`force`: even if it was
+/// published before), for `bbk sync`.
+pub async fn publish(bb: &BlackbookClient, session: &Session, force: bool) -> Result<()> {
+    let mut store = KeyStore::open(session)?;
+    ensure_published(bb, session, &mut store, force).await?;
+    Ok(())
+}
+
+/// Says what's waiting on this client, if anything: after a login, when it
+/// doesn't sync on its own.
+pub async fn print_waiting(bb: &BlackbookClient) {
     let rotations = bb.share_rotations().await.unwrap_or_default();
     let requests = bb.share_requests().await.unwrap_or_default();
     let keys = rotations.iter().filter(|r| r.key_id.is_some()).count();
@@ -329,7 +342,12 @@ pub async fn publish_after_login(bb: &BlackbookClient, session: &Session, profil
         ));
     }
     if !waiting.is_empty() {
-        eprintln!("waiting on you: {}. See `bbk share ls`", waiting.join(", "));
+        let next = if keys > 0 || !requests.is_empty() {
+            "Run `bbk sync`"
+        } else {
+            "See `bbk share ls`"
+        };
+        eprintln!("waiting on you: {}. {next}", waiting.join(", "));
     }
 }
 
@@ -541,7 +559,7 @@ fn print_report(report: &DeliverReport) {
 
 /// After a store or a grant: delivers the requests the server says this
 /// client should fulfil now. Failures are reported, not returned: the store
-/// or grant itself succeeded, and `bbk share sync` can finish the job.
+/// or grant itself succeeded, and `bbk sync` can finish the job.
 pub async fn deliver_now(bb: &BlackbookClient, session: &Session, ids: &[String]) {
     if ids.is_empty() {
         return;
@@ -559,7 +577,7 @@ pub async fn deliver_now(bb: &BlackbookClient, session: &Session, ids: &[String]
     .await;
     match result {
         Ok(report) => print_report(&report),
-        Err(e) => eprintln!("couldn't share the key yet ({e}); run `bbk share sync` to retry"),
+        Err(e) => eprintln!("couldn't share the key yet ({e}); run `bbk sync` to retry"),
     }
 }
 
@@ -579,7 +597,7 @@ pub async fn after_grant(bb: &BlackbookClient, session: &Session, sharing: &serd
     }
     for w in &s.waiting {
         eprintln!(
-            "external items: {} waiting on {}, who runs `bbk share sync` to rotate {} and send {}",
+            "external items: {} waiting on {}, who runs `bbk sync` to rotate {} and send {}",
             n(w.requests, "one key request is", "key requests are"),
             w.sealer,
             if w.requests == 1 {
@@ -665,7 +683,7 @@ pub async fn after_access_change(
     };
     for w in &c.waiting {
         eprintln!(
-            "external items: {} must be rotated by {}, who runs `bbk share sync`",
+            "external items: {} must be rotated by {}, who runs `bbk sync`",
             count(w.count, "one key", "keys"),
             w.sealer
         );
@@ -706,7 +724,7 @@ pub async fn after_access_change(
 
 /// Rotates the keys due on the named items, which this client sealed, and
 /// delivers the new keys to the clients that held the old ones. Failures are
-/// reported: `bbk share sync` finishes the job.
+/// reported: `bbk sync` finishes the job.
 async fn rotate_now(bb: &BlackbookClient, session: &Session, items: &[ItemName]) {
     if items.is_empty() {
         return;
@@ -714,7 +732,7 @@ async fn rotate_now(bb: &BlackbookClient, session: &Session, items: &[ItemName])
     let rotations = match bb.share_rotations().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("couldn't rotate the keys yet ({e}); run `bbk share sync` to retry");
+            eprintln!("couldn't rotate the keys yet ({e}); run `bbk sync` to retry");
             return;
         }
     };
@@ -758,12 +776,12 @@ async fn rotate(session: &Session, mfa: Option<String>, due: &[&RotationView]) -
                 if m.contains("[mfa_required]") || m.contains("[mfa_failed]") =>
             {
                 report.skipped.push(format!(
-                    "{what}: reading it takes an MFA code; run `bbk --mfa CODE share sync`"
+                    "{what}: reading it takes an MFA code; run `bbk --mfa CODE sync`"
                 ));
             }
             Err(AppError::Client(m)) if m.contains("[approval_pending]") => {
                 report.skipped.push(format!(
-                    "{what}: reading it takes K-of-N approval; once you have an advance grant for it, run `bbk share sync`"
+                    "{what}: reading it takes K-of-N approval; once you have an advance grant for it, run `bbk sync`"
                 ));
             }
             Err(e) => report.skipped.push(format!("{what}: {e}")),
@@ -782,6 +800,162 @@ fn print_rotations_done(report: &RotateReport) {
 }
 
 // ---------------------------------------------------------------------------
+// The key checks of `bbk sync`
+// ---------------------------------------------------------------------------
+
+/// What the key checks found waiting on this client: rotations due on items
+/// it sealed, and other clients' requests for their keys.
+pub struct KeyWork {
+    rotations: Vec<RotationView>,
+    requests: Vec<RequestView>,
+}
+
+/// What running the key checks did, one line each.
+#[derive(Default)]
+pub struct KeyReport {
+    /// "rotated the key of 'x'", "shared the key to 'x' to bob".
+    pub done: Vec<String>,
+    /// "not rotated yet: …", "not shared yet: …".
+    pub not_yet: Vec<String>,
+}
+
+impl KeyWork {
+    /// Lists the work. `to` keeps only the requests from that client: every
+    /// rotation that's due is still made.
+    pub async fn list(bb: &BlackbookClient, to: Option<&str>) -> Result<Self> {
+        let rotations = bb.share_rotations().await?;
+        let requests = bb
+            .share_requests()
+            .await?
+            .into_iter()
+            .filter(|r| to.map_or(true, |t| r.recipient == t))
+            .collect();
+        Ok(Self {
+            rotations,
+            requests,
+        })
+    }
+
+    /// The rotations this client makes. Passphrase changes are listed too,
+    /// but only their owner can make them.
+    fn due(&self) -> Vec<&RotationView> {
+        self.rotations
+            .iter()
+            .filter(|r| r.key_id.is_some())
+            .collect()
+    }
+
+    /// Whether there's nothing to rotate or send.
+    pub fn is_empty(&self) -> bool {
+        self.due().is_empty() && self.requests.is_empty()
+    }
+
+    /// Lists the rotations, passphrase changes and requests.
+    pub fn print(&self) {
+        print_rotations(&self.rotations);
+        print_requests(&self.requests);
+    }
+
+    /// The confirmation to ask for: "Rotate 2 keys, then send one key to bob?".
+    pub fn question(&self) -> String {
+        let due = self.due();
+        let recipients: std::collections::BTreeSet<&str> =
+            self.requests.iter().map(|r| r.recipient.as_str()).collect();
+        let rotate_what = count(due.len(), "one key", "keys");
+        let send_what = format!(
+            "{} to {}",
+            count(self.requests.len(), "one key", "keys"),
+            recipients.into_iter().collect::<Vec<_>>().join(", ")
+        );
+        match (due.is_empty(), self.requests.is_empty()) {
+            (false, false) => format!("Rotate {rotate_what}, then send {send_what}?"),
+            (false, true) => format!("Rotate {rotate_what}?"),
+            _ => format!("Send {send_what}?"),
+        }
+    }
+
+    /// The passphrase changes waiting on the owner, one line each, for a sync
+    /// that runs on its own and so doesn't list them.
+    pub fn by_hand(&self) -> Vec<String> {
+        self.rotations
+            .iter()
+            .filter(|r| r.key_id.is_none())
+            .map(|r| {
+                format!(
+                    "change the passphrase of {} {}/{} ({}), then give the new one to those who still read it",
+                    r.kind.as_str(),
+                    r.domain,
+                    r.name,
+                    why(r)
+                )
+            })
+            .collect()
+    }
+
+    /// Rotates the keys that are due, then sends the keys asked for: those of
+    /// the requests listed, and those of the clients that held a rotated key.
+    pub async fn run(
+        &self,
+        bb: &BlackbookClient,
+        session: &Session,
+        mfa: Option<String>,
+    ) -> KeyReport {
+        // Rotations first: no key goes out while one is due on it.
+        let rotated = rotate(session, mfa, &self.due()).await;
+        let mut report = KeyReport::default();
+        report.done.extend(
+            rotated
+                .rotated
+                .iter()
+                .map(|s| format!("rotated the key of {s}")),
+        );
+        report.not_yet.extend(
+            rotated
+                .skipped
+                .iter()
+                .map(|s| format!("not rotated yet: {s}")),
+        );
+        // Then the requests, as they are now: a rotated item's request names
+        // its new key.
+        let ids: Vec<&str> = rotated
+            .requests
+            .iter()
+            .map(String::as_str)
+            .chain(self.requests.iter().map(|r| r.id.as_str()))
+            .collect();
+        if ids.is_empty() {
+            return report;
+        }
+        let sent = async {
+            let pending: Vec<RequestView> = bb
+                .share_requests()
+                .await?
+                .into_iter()
+                .filter(|r| ids.contains(&r.id.as_str()))
+                .collect();
+            if pending.is_empty() {
+                return Ok(DeliverReport::default());
+            }
+            let mut store = KeyStore::open(session)?;
+            deliver(bb, session, &mut store, &pending).await
+        }
+        .await;
+        match sent {
+            Ok(d) => {
+                report
+                    .done
+                    .extend(d.sent.iter().map(|s| format!("shared the key to {s}")));
+                report
+                    .not_yet
+                    .extend(d.skipped.iter().map(|s| format!("not shared yet: {s}")));
+            }
+            Err(e) => report.not_yet.push(format!("couldn't send the keys: {e}")),
+        }
+        report
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `bbk share`
 // ---------------------------------------------------------------------------
 
@@ -793,21 +967,8 @@ pub enum ShareCmd {
     /// List what's waiting on you: items you sealed whose keys must be
     /// rotated, or whose passphrases changed, because who may read them
     /// changed; and others who may read items you sealed and need their keys.
+    /// `bbk sync` rotates and sends them.
     Ls,
-    /// Rotate the keys that are due, then send the keys others asked for, for
-    /// items you sealed. Asks first unless --yes.
-    Sync {
-        /// Only requests from this client. Every rotation that's due is
-        /// still made.
-        #[arg(long)]
-        to: Option<String>,
-        /// Don't ask for confirmation.
-        #[arg(short = 'y', long)]
-        yes: bool,
-        /// Only show what would be rotated and sent.
-        #[arg(long)]
-        dry_run: bool,
-    },
     /// Decline a key request (its id is in `bbk share ls`).
     Reject { id: String },
     /// Accept a new share identity for CLIENT, after checking FINGERPRINT with
@@ -849,7 +1010,7 @@ fn print_rotations(rotations: &[RotationView]) {
         );
     };
     if !keys.is_empty() {
-        println!("key rotations due (`bbk share sync` rotates them):");
+        println!("key rotations due (`bbk sync` rotates them):");
         keys.into_iter().for_each(line);
     }
     if !phrases.is_empty() {
@@ -883,19 +1044,7 @@ fn print_requests(requests: &[RequestView]) {
     }
 }
 
-fn confirm(question: &str) -> Result<bool> {
-    use std::io::IsTerminal;
-    if crate::credstore::prompts_suppressed() || !std::io::stdin().is_terminal() {
-        return Err(AppError::Config(
-            "not rotating or sending keys without confirmation: pass --yes".into(),
-        ));
-    }
-    eprint!("{question} [y/N] ");
-    let answer = crate::read_stdin_line();
-    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
-}
-
-pub async fn cmd_share(cmd: ShareCmd, mfa: Option<String>) -> Result<()> {
+pub async fn cmd_share(cmd: ShareCmd) -> Result<()> {
     let session = Session::load()?;
     let bb = crate::build_client(&session, None, None)?;
     match cmd {
@@ -908,60 +1057,6 @@ pub async fn cmd_share(cmd: ShareCmd, mfa: Option<String>) -> Result<()> {
         ShareCmd::Ls => {
             print_rotations(&bb.share_rotations().await?);
             print_requests(&bb.share_requests().await?);
-        }
-        ShareCmd::Sync { to, yes, dry_run } => {
-            let rotations = bb.share_rotations().await?;
-            let requests: Vec<RequestView> = bb
-                .share_requests()
-                .await?
-                .into_iter()
-                .filter(|r| to.as_deref().map_or(true, |t| r.recipient == t))
-                .collect();
-            print_rotations(&rotations);
-            print_requests(&requests);
-            // Passphrase changes are listed, but only their owner can make them.
-            let due: Vec<&RotationView> = rotations.iter().filter(|r| r.key_id.is_some()).collect();
-            if (due.is_empty() && requests.is_empty()) || dry_run {
-                return Ok(());
-            }
-            let recipients: std::collections::BTreeSet<&str> =
-                requests.iter().map(|r| r.recipient.as_str()).collect();
-            let rotate_what = count(due.len(), "one key", "keys");
-            let send_what = format!(
-                "{} to {}",
-                count(requests.len(), "one key", "keys"),
-                recipients.into_iter().collect::<Vec<_>>().join(", ")
-            );
-            let question = match (due.is_empty(), requests.is_empty()) {
-                (false, false) => format!("Rotate {rotate_what}, then send {send_what}?"),
-                (false, true) => format!("Rotate {rotate_what}?"),
-                _ => format!("Send {send_what}?"),
-            };
-            if !yes && !confirm(&question)? {
-                println!("nothing rotated or sent");
-                return Ok(());
-            }
-            // Rotations first: no key goes out while one is due on it. Each
-            // rotation sends its new key to the clients that held the old one.
-            let rotated = rotate(&session, mfa, &due).await;
-            print_rotations_done(&rotated);
-            deliver_now(&bb, &session, &rotated.requests).await;
-            // Then the requests confirmed above, as they are now: a rotated
-            // item's request names its new key.
-            let ids: Vec<&str> = requests.iter().map(|r| r.id.as_str()).collect();
-            let requests: Vec<RequestView> = bb
-                .share_requests()
-                .await?
-                .into_iter()
-                .filter(|r| ids.contains(&r.id.as_str()))
-                .collect();
-            let mut store = KeyStore::open(&session)?;
-            let report = deliver(&bb, &session, &mut store, &requests).await?;
-            print_report(&report);
-            let failed = !rotated.skipped.is_empty() || !report.skipped.is_empty();
-            if failed && rotated.rotated.is_empty() && report.sent.is_empty() {
-                return Err(AppError::Client("no keys were rotated or sent".into()));
-            }
         }
         ShareCmd::Reject { id } => {
             bb.share_reject(&id).await?;

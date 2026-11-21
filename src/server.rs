@@ -1042,7 +1042,7 @@ pub async fn store_data(
                 StatusCode::CONFLICT,
                 "key_changed",
                 format!(
-                    "'{}' was stored again while it was being rotated; run `bbk share sync` again",
+                    "'{}' was stored again while it was being rotated; run `bbk sync` again",
                     req.resource_name
                 ),
             ));
@@ -2314,7 +2314,9 @@ pub async fn upload_file(
             return Ok(err(
                 StatusCode::CONFLICT,
                 "key_changed",
-                format!("'{name}' was stored again while it was being rotated; run `bbk share sync` again"),
+                format!(
+                    "'{name}' was stored again while it was being rotated; run `bbk sync` again"
+                ),
             ));
         }
         sqlx::query("DELETE FROM blackbook_contents WHERE id = $1")

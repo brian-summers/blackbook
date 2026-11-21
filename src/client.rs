@@ -10,8 +10,9 @@
 //!
 //! `~/.bbk/active` records which profile is used when no `--profile`/`-P`
 //! flag or `$BLACKBOOK_PROFILE` is given. The active profile for the current
-//! process is resolved once in `main()` and stashed via
-//! [`set_active_profile`]; every [`Session::load`] then targets it.
+//! process is resolved in `main()` and stashed via [`set_active_profile`]
+//! (and changed by a login, which makes its profile active); every
+//! [`Session::load`] then targets it.
 //!
 //! A legacy single-session file at `~/.bbk/session.json` is still read as the
 //! `default` profile if no `profiles/default.json` exists yet.
@@ -25,25 +26,38 @@ use zeroize::Zeroize;
 /// client (client cert + pinned CA) for the upgrade, so no separate TLS config.
 pub type TunnelWs = reqwest_websocket::WebSocket;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
-/// Active profile name for this process, resolved once in `main()`.
-static ACTIVE_PROFILE: OnceLock<String> = OnceLock::new();
+/// Active profile name for this process, resolved in `main()`.
+static ACTIVE_PROFILE: RwLock<Option<String>> = RwLock::new(None);
 
-/// Record the profile this invocation should use. Called once from `main()`
-/// after resolving `--profile`/`-P`, `$BLACKBOOK_PROFILE`, the `~/.bbk/active`
-/// pointer, and the `default` fallback, in that order.
+/// Record the profile this invocation should use. Called from `main()` after
+/// resolving `--profile`/`-P`, `$BLACKBOOK_PROFILE`, the `~/.bbk/active`
+/// pointer, and the `default` fallback, in that order; and by a login, once
+/// it has made its profile the active one.
 pub fn set_active_profile(name: String) {
-    let _ = ACTIVE_PROFILE.set(name);
+    if let Ok(mut p) = ACTIVE_PROFILE.write() {
+        *p = Some(name);
+    }
 }
 
 /// The active profile name (or `"default"` if `set_active_profile` was never
 /// called — e.g. very early errors).
 pub fn active_profile() -> String {
     ACTIVE_PROFILE
-        .get()
-        .cloned()
+        .read()
+        .ok()
+        .and_then(|p| p.clone())
         .unwrap_or_else(|| "default".to_string())
+}
+
+/// Set once this process has opened the active profile: the command it ran
+/// used the profile, so a sync may follow it (see `sync_cli::after_command`).
+static PROFILE_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process has opened the active profile.
+pub fn profile_opened() -> bool {
+    PROFILE_OPENED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -364,13 +378,29 @@ impl Session {
     /// from (in order) the unlock agent's cached KEK, then `$BLACKBOOK_PASSPHRASE`
     /// or an interactive prompt — see [`credstore`].
     pub fn load_named(profile: &str) -> Result<Self> {
+        let session = Self::load_from_disk(profile, true)?;
+        if profile == active_profile() {
+            PROFILE_OPENED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(session)
+    }
+
+    /// Like [`Session::load_named`], but never prompts: an encrypted profile
+    /// opens only with the unlock agent's cached key or `$BLACKBOOK_PASSPHRASE`,
+    /// and is otherwise [`CredError::Locked`](crate::credstore::CredError::Locked).
+    /// For work that runs on its own, which mustn't stop to ask.
+    pub fn load_unattended(profile: &str) -> Result<Self> {
+        Self::load_from_disk(profile, false)
+    }
+
+    fn load_from_disk(profile: &str, prompt: bool) -> Result<Self> {
         let path = Self::path_for(profile)?;
         if path.exists() {
             let bytes = fs::read(&path).map_err(|e| ClientError::SessionIo {
                 path: path.display().to_string(),
                 detail: e.to_string(),
             })?;
-            return Self::from_profile_bytes(profile, &bytes);
+            return Self::from_profile_bytes(profile, &bytes, prompt);
         }
         if profile == "default" {
             let legacy = Self::legacy_path()?;
@@ -379,7 +409,7 @@ impl Session {
                     path: legacy.display().to_string(),
                     detail: e.to_string(),
                 })?;
-                return Self::from_profile_bytes(profile, &bytes);
+                return Self::from_profile_bytes(profile, &bytes, prompt);
             }
         }
         Err(ClientError::NoSession)
@@ -387,8 +417,9 @@ impl Session {
 
     /// Parse raw profile bytes that may be either a `v2` encrypted envelope
     /// or a legacy plaintext `Session`. Encrypted profiles are decrypted using
-    /// the unlock agent or an available passphrase.
-    fn from_profile_bytes(profile: &str, bytes: &[u8]) -> Result<Self> {
+    /// the unlock agent or an available passphrase, prompted for only if
+    /// `prompt`.
+    fn from_profile_bytes(profile: &str, bytes: &[u8], prompt: bool) -> Result<Self> {
         // Try the encrypted envelope first; fall back to plaintext.
         if let Ok(env) = serde_json::from_slice::<crate::credstore::EncryptedProfile>(bytes) {
             if env.v >= 2 {
@@ -401,6 +432,10 @@ impl Session {
                 }
                 // 2) passphrase (env var or interactive prompt). Refresh the
                 //    agent so subsequent commands in the TTL don't re-prompt.
+                let from_env = std::env::var("BLACKBOOK_PASSPHRASE").is_ok_and(|p| !p.is_empty());
+                if !prompt && !from_env {
+                    return Err(crate::credstore::CredError::Locked.into());
+                }
                 let pass = crate::credstore::resolve_passphrase(
                     None,
                     &format!("Passphrase for profile '{profile}': "),
