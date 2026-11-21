@@ -885,7 +885,7 @@ pub struct AccessChange {
     /// Passphrase-sealed items, by owner, whose passphrase must be changed by
     /// hand.
     #[serde(default)]
-    pub passphrases: Vec<SealerCount>,
+    pub by_hand: Vec<SealerCount>,
     /// Immutable items, which can't be stored again, so keep their keys.
     #[serde(default)]
     pub immutable: usize,
@@ -940,7 +940,7 @@ pub(crate) async fn after_access_change(
     let changed: BTreeSet<&str> = lost.keys().chain(gained.keys()).copied().collect();
     let mut out = AccessChange::default();
     let mut waiting: BTreeMap<String, usize> = BTreeMap::new();
-    let mut passphrases: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_hand: BTreeMap<String, usize> = BTreeMap::new();
     let none = Vec::new();
     for k in changed {
         let Some(item) = after.items.get(k).or_else(|| before.items.get(k)) else {
@@ -990,13 +990,13 @@ pub(crate) async fn after_access_change(
                     continue;
                 }
                 mark_rotation(state, item, gained_here, lost_here).await?;
-                *passphrases.entry(sealer).or_default() += 1;
+                *by_hand.entry(sealer).or_default() += 1;
             }
             _ => {}
         }
     }
     out.waiting = by_sealer(state, waiting).await;
-    out.passphrases = by_sealer(state, passphrases).await;
+    out.by_hand = by_sealer(state, by_hand).await;
     Ok(out)
 }
 

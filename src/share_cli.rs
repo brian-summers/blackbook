@@ -670,7 +670,7 @@ pub async fn after_access_change(
             w.sealer
         );
     }
-    for p in &c.passphrases {
+    for p in &c.by_hand {
         let one = p.count == 1;
         eprintln!(
             "external items: {} {} sealed with a passphrase {} a new one; {} changes {} (`bbk rekey NAME`) and gives the new {} to those who still read {}",
