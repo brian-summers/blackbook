@@ -7,7 +7,7 @@
 # Stage 1: build. The Rust version matches rust-toolchain.toml (CI checks), and
 # the builder and runtime are both Debian trixie, so the binary links against
 # the glibc the runtime has.
-FROM rust:1.100.0-trixie@sha256:e19840879045c951c905d0eaa9887f3439c62000e429963371b376bac8d38c31 AS builder
+FROM rust:1.100.0-trixie@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS builder
 
 # A failure anywhere in a pipeline fails the step.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
