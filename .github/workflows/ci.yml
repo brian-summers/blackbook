@@ -72,6 +72,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: bash scripts/check.sh msrv
 
+  package:
+    # The crate as release.yml publishes it to crates.io, built on its own.
+    name: crate (cargo package)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: bash scripts/check.sh package
+
   coverage:
     name: coverage
     runs-on: ubuntu-24.04
@@ -132,6 +143,9 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: day
+        name: today, for the package upgrade (APT_DAY in the Dockerfile)
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
       - name: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -139,6 +153,7 @@ jobs:
           load: true
           push: false
           tags: blackbook:check
+          build-args: APT_DAY=${{ steps.day.outputs.day }}
           cache-from: type=gha,scope=docker-amd64
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=docker-amd64' || '' }}
       - name: scan (Grype), end-to-end test
@@ -147,7 +162,7 @@ jobs:
   result:
     name: CI result
     if: always()
-    needs: [lint, test, msrv, coverage, deny, dependency-review, docker]
+    needs: [lint, test, msrv, package, coverage, deny, dependency-review, docker]
     runs-on: ubuntu-24.04
     steps:
       - name: every job passed

@@ -50,6 +50,11 @@ In production, deploy by digest (`ghcr.io/brian-summers/blackbook@sha256:…`,
 as printed in the release notes) rather than by a tag, so the image can't
 change underneath you.
 
+The `blackbook` crate on crates.io is published by the same workflow, after
+the same checks, through crates.io's trusted publishing: crates.io accepts it
+only from that workflow on this repository. Install it with `--locked` to
+build with the dependency versions those checks ran on.
+
 ## Scope
 
 In scope: the Blackbook server and CLI, the cryptographic envelopes, the

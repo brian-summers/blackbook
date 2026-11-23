@@ -148,7 +148,7 @@ Copy-Item scripts\bbk.ps1, scripts\bbk.cmd "$HOME\bin"
 [Environment]::SetEnvironmentVariable('Path', "$([Environment]::GetEnvironmentVariable('Path', 'User'));$HOME\bin", 'User')
 ```
 
-Then open a new terminal. Prefer a native binary? `cargo install --path .` builds one instead (on Windows it also needs `perl`, for the bundled OpenSSL), and every step below is the same.
+Then open a new terminal. Prefer a native binary? `cargo install blackbook --locked` builds one from crates.io instead, or `cargo install --path .` from a checkout (on Windows either needs `perl`, for the bundled OpenSSL), and every step below is the same.
 
 **4. Log in.** On first start the server writes an admin "bundle" (server address, token, certificate, key, and CA) to its volume. It's the only place the admin token ever appears; it's never logged. Copy it out, log in, and delete the copy:
 

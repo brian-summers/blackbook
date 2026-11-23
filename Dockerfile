@@ -51,8 +51,17 @@ LABEL org.opencontainers.image.title="Blackbook" \
 # Runtime packages: CA certificates only. OpenSSL and aws-lc are linked in
 # statically and the app talks to Postgres through sqlx, so libssl and the
 # Postgres client tools would only add attack surface (and CVEs to patch).
+#
+# Debian publishes fixes between base images, so the upgrade matters. Without
+# APT_DAY, a build would reuse this layer from its cache until the base image
+# digest changed, and miss those fixes. CI, release.yml and
+# `scripts/check.sh docker` pass today's date (UTC), so the layer is rebuilt
+# once a day. Within one build it stays cached, so a release pushes the image
+# it tested.
+ARG APT_DAY=
 # hadolint ignore=DL3008
-RUN apt-get update && apt-get upgrade -y \
+RUN echo "packages as of ${APT_DAY:-the cached day}" \
+    && apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
