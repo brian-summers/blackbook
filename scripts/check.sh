@@ -183,7 +183,8 @@ step_gitleaks() {
 step_docker() {
     note "docker build: $BBK_IMAGE"
     need docker "https://docs.docker.com/get-docker/" || return 0
-    dock build -t "$BBK_IMAGE" .
+    # Today's packages, as CI builds it (see APT_DAY in the Dockerfile).
+    dock build --build-arg "APT_DAY=$(date -u +%F)" -t "$BBK_IMAGE" .
 }
 
 # Scans an exported copy of the image, so the scanner never gets the Docker
