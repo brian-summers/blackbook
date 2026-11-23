@@ -10,6 +10,11 @@ readme = "README.md"
 rust-version = "1.94"
 keywords = ["secrets", "vault", "encryption", "mtls", "cryptography"]
 categories = ["cryptography", "command-line-utilities"]
+# What `cargo publish` uploads: the source and what crates.io shows (Cargo.toml
+# and Cargo.lock go in on their own). A file src/ embeds at compile time has to
+# be under src/, or the published crate won't build. `scripts/check.sh package`,
+# which CI runs, builds the crate on its own to catch that.
+include = ["/src/**", "/README.md", "/LICENSE"]
 
 # The CLI ships as `bbk` (matching the ~/.bbk home dir). The package/project
 # keeps the name `blackbook`; only the invoked command is the short `bbk`.

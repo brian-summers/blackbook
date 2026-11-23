@@ -72,6 +72,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: bash scripts/check.sh msrv
 
+  package:
+    # The crate as release.yml publishes it to crates.io, built on its own.
+    name: crate (cargo package)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: bash scripts/check.sh package
+
   coverage:
     name: coverage
     runs-on: ubuntu-24.04
@@ -147,7 +158,7 @@ jobs:
   result:
     name: CI result
     if: always()
-    needs: [lint, test, msrv, coverage, deny, dependency-review, docker]
+    needs: [lint, test, msrv, package, coverage, deny, dependency-review, docker]
     runs-on: ubuntu-24.04
     steps:
       - name: every job passed

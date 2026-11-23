@@ -28,7 +28,7 @@ bbk get api-key                        # read it back
 bbk file put ./id_rsa --name ssh-key   # save a file
 ```
 
-All you need is Docker: `bbk` runs from the same image, with nothing to compile ([Quick start](getting-started/quick-start.md)). Prefer a native binary? `cargo install blackbook`.
+All you need is Docker: `bbk` runs from the same image, with nothing to compile ([Quick start](getting-started/quick-start.md)). Prefer a native binary? `cargo install blackbook --locked`.
 
 ## Secure by default, not by configuration
 

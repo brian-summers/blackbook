@@ -161,7 +161,8 @@ It then:
 2. builds the `linux/amd64` and `linux/arm64` images, scans and end-to-end
    tests each one, and uploads them to GHCR by digest, untagged;
 3. waits for a maintainer to approve the `release` environment (*Actions →
-   the Release run → Review deployments*);
+   the Release run → Review deployments*). One approval covers both of the
+   next two steps;
 4. tags the images on `ghcr.io/brian-summers/blackbook`, and on Docker Hub if
    that's configured. The tags are `X.Y.Z`, `vX.Y.Z`, `X.Y`, `X` (from 1.0
    on) and `latest`. It also attaches an SBOM and a signed build-provenance
@@ -169,11 +170,16 @@ It then:
 5. creates the GitHub release, with the pull commands, the digest and the
    attestation check above GitHub's generated notes. If the release already
    exists, it adds that section to the existing notes, and publishes the
-   release if it's a draft.
+   release if it's a draft;
+6. at the same time as 4 and 5, publishes the crate to crates.io. CI has
+   already built the crate as crates.io will get it (`scripts/check.sh
+   package`). A version on crates.io can be yanked but never replaced, so if
+   the version is there already, this step skips it.
 
 A tag like `v0.4.0-rc.1` publishes a prerelease: it doesn't move `latest`,
-and the GitHub release is marked *Pre-release*. Any other tag moves `latest`
-on both registries and marks the release *Latest*.
+the GitHub release is marked *Pre-release*, and crates.io lists the version
+as a prerelease, which `cargo install` skips unless asked for it. Any other
+tag moves `latest` on both registries and marks the release *Latest*.
 
 Repository settings this relies on (configured for brian-summers/blackbook; a
 fork needs its own):
@@ -193,6 +199,14 @@ fork needs its own):
   If the repository isn't `<user>/blackbook`, set `DOCKERHUB_REPOSITORY`
   (for example `myorg/blackbook`) the same way. Without these, the workflow
   publishes to GHCR only.
+- **crates.io:** the crate's trusted publisher (crates.io → the crate →
+  *Settings* → *Trusted Publishing* → *Add*): GitHub, owner `brian-summers`,
+  repository `blackbook`, workflow `release.yml`, environment `release`.
+  crates.io matches the workflow by its file name, and that's the file the tag
+  push started: `release.yml`, not `ci.yml`, which only runs inside it. The
+  release then needs no crates.io token. Once a release has gone out this
+  way, you can also set the crate to accept trusted publishing only, so that
+  an API token can't publish it.
 - **After the first release:** the GHCR package starts private. Make it
   public under the package's settings, so users can pull without logging in.
 

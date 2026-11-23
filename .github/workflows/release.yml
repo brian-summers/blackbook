@@ -3,15 +3,19 @@ name: Release
 # Publishes a version when a tag vX.Y.Z (or vX.Y.Z-rc.N) is pushed:
 #
 #   1. verify     the tag matches Cargo.toml's version and is on main
-#   2. ci         the full CI suite on the tagged commit
+#   2. ci         the full CI suite on the tagged commit, which also builds
+#                 the crate as crates.io will get it
 #   3. image      builds linux/amd64 and linux/arm64 on native runners, scans
 #                 each with Grype and runs the end-to-end test on it, then
 #                 pushes it to GHCR by digest (no tag yet)
 #   4. publish    tags the multi-platform image on GHCR (and on Docker Hub when
 #                 configured), signs a SLSA build-provenance attestation for it,
 #                 and creates the GitHub release
+#      crate      at the same time, publishes the crate to crates.io through
+#                 trusted publishing, so no crates.io token is stored anywhere
 #
-# Nothing is tagged unless every step before it passed. Setup (once): see
+# Nothing is tagged or published unless every step before it passed, and
+# both of the last two wait for the same approval of the release environment. Setup (once): see
 # "Releasing" in CONTRIBUTING.md.
 
 on:
@@ -133,6 +137,57 @@ jobs:
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
+
+  crate:
+    name: crates.io
+    needs: [verify, image]
+    runs-on: ubuntu-24.04
+    # crates.io takes this job's OIDC token because the crate's trusted
+    # publisher names this repository, this workflow file (release.yml, the one
+    # the tag push started) and this environment.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # traded with crates.io for a publish token that lasts 30 minutes
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - id: index
+        name: is this version on crates.io already?
+        # A version can't be published twice, so a re-run of the whole release
+        # skips it instead of failing.
+        run: |
+          crate=$(sed -n 's/^name = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          crate=${crate,,}
+          # The sparse index has a file per crate listing every version, under
+          # the name's first two pairs of letters.
+          url="https://index.crates.io/${crate:0:2}/${crate:2:2}/$crate"
+          code=$(curl -sS -o "$RUNNER_TEMP/index" -w '%{http_code}' "$url")
+          case "$code" in
+            200) if jq -e --arg v "$VERSION" 'select(.vers == $v)' "$RUNNER_TEMP/index" >/dev/null; then published=true; else published=false; fi ;;
+            404) published=false ;;
+            *) echo "::error::crates.io's index answered $code for $url"; exit 1 ;;
+          esac
+          if [ "$published" = true ]; then
+            echo "::notice::$crate $VERSION is already on crates.io, so it wasn't published again"
+          fi
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+      - id: auth
+        if: steps.index.outputs.published == 'false'
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: cargo publish
+        if: steps.index.outputs.published == 'false'
+        # CI's package job has built this commit's crate already. --no-verify
+        # skips building it again here, so no dependency's build script runs
+        # while the token is in the environment. The action revokes the token
+        # when the job ends.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked --no-verify
 
   publish:
     name: publish

@@ -3,8 +3,9 @@
 # script, so a check that passes locally passes in CI.
 #
 #   scripts/check.sh              what the pre-push hook runs: pins fmt clippy test deny
-#   scripts/check.sh all          all of the above, plus msrv, workflows,
-#                                 dockerfile, gitleaks, docker, scan and e2e
+#   scripts/check.sh all          all of the above, plus msrv, package,
+#                                 workflows, dockerfile, gitleaks, docker, scan
+#                                 and e2e
 #   scripts/check.sh STEP...      any steps, in the order given
 #
 # Steps:
@@ -16,6 +17,7 @@
 #   test        the test suite
 #   deny        cargo-deny: advisories, licences, banned crates, sources
 #   msrv        builds with the minimum Rust version in Cargo.toml
+#   package     the crate as crates.io would get it, built on its own
 #   coverage    line coverage (cargo-llvm-cov), lcov written to target/lcov.info
 #   workflows   actionlint and zizmor on .github/workflows
 #   dockerfile  hadolint
@@ -130,6 +132,16 @@ step_msrv() {
     cargo "+$msrv" check --locked --all-targets
 }
 
+# The crate exactly as `cargo publish` would upload it, built from the package
+# alone. A file the build needs but `include` in Cargo.toml leaves out fails
+# here rather than in a release. Locally, uncommitted changes are packaged too.
+step_package() {
+    note "package: the crate as crates.io would get it"
+    local dirty=(--allow-dirty)
+    [ -n "${CI:-}" ] && dirty=()
+    cargo package --locked "${dirty[@]}"
+}
+
 step_coverage() {
     note "coverage"
     need cargo-llvm-cov "cargo install --locked cargo-llvm-cov" || return 0
@@ -200,7 +212,7 @@ step_e2e() {
 
 steps=("$@")
 [ ${#steps[@]} -gt 0 ] || steps=(pins fmt clippy test deny)
-[ "${steps[*]}" != all ] || steps=(pins fmt clippy test deny msrv workflows dockerfile gitleaks docker scan e2e)
+[ "${steps[*]}" != all ] || steps=(pins fmt clippy test deny msrv package workflows dockerfile gitleaks docker scan e2e)
 for s in "${steps[@]}"; do
     declare -F "step_$s" >/dev/null || die "unknown step '$s' (see the top of $0)"
 done
